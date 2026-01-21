@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .assets import get_asset_bbox
-from .constants import LANE_WIDTH_M, LATERAL_TO_M
+from .constants import LANE_WIDTH_M, LATERAL_TO_M, LATERAL_ALIASES
 from .geometry import (
     cumulative_dist,
     heading_deg_from_vec,
@@ -37,9 +37,28 @@ ALLOWED_DIST_BUCKETS = set(DIST_BUCKET_TO_M.keys())
 ALLOWED_GROUP_PATTERNS = {"across_lane", "along_lane", "scatter", "unknown"}
 
 AFTER_MERGE_CLEARANCE_M = 2.0
+LANE_DROP_AFTER_MERGE_OFFSET_M = 1.0
+LANE_DROP_AFTER_MERGE_WINDOW_M = 4.0
+LANE_DROP_CANDIDATE_STEP_M = 1.0
 MERGE_POINT_MAX_DIST_M = 6.0
 
 MIN_ACTOR_SEPARATION_M = 0.5
+
+
+def normalize_lateral(lat: str) -> str:
+    """Normalize lateral position string, handling aliases like 'side_of_road' -> 'sidewalk_right'."""
+    lat = str(lat or "unknown").strip().lower()
+    # Check aliases first (e.g., "side of the road" -> "sidewalk_right")
+    if lat in LATERAL_ALIASES:
+        return LATERAL_ALIASES[lat]
+    # Check if it's a known lateral position
+    if lat in LATERAL_TO_M:
+        return lat
+    # Handle natural language variations
+    lat_words = lat.replace("_", " ").replace("-", " ")
+    if lat_words in LATERAL_ALIASES:
+        return LATERAL_ALIASES[lat_words]
+    return lat  # return as-is, caller will handle unknown
 
 
 @dataclass
@@ -313,6 +332,11 @@ def build_stage2_constraints_prompt(
             "Do NOT invent constraints. If unsure, use 'unknown' or omit.",
             "If a Stage1 entity seems like map geometry (e.g., intersection/road/lane/sidewalk) or lacks a clear actor noun, OMIT it from actor_specs (do not force a placement).",
             
+            "ANCHOR TARGET_VEHICLE IS CRITICAL - COPY FROM stage1_entities 'affects_vehicle' FIELD:",
+            "  - If Stage1 has affects_vehicle='Vehicle X', set anchor.target_vehicle='Vehicle X'",
+            "  - DO NOT set anchor.target_vehicle to 'unknown' if Stage1 provides 'affects_vehicle'!",
+            "  - This field determines which ego vehicle the actor is intended to interact with.",
+            
             "PHASE IS CRITICAL - COPY FROM stage1_entities 'when' FIELD:",
             "  - If Stage1 has when='after_exit', set anchor.phase='after_exit'",
             "  - 'On Vehicle X's exit road' = phase='after_exit' (NOT on_approach!)",
@@ -433,7 +457,23 @@ def validate_actor_specs(
         qty = max(1, qty)
 
         anchor = raw.get("anchor", {}) if isinstance(raw.get("anchor", {}), dict) else {}
-        tv = anchor.get("target_vehicle", e.get("affects_vehicle", "unknown"))
+        # Priority: Stage2 anchor.target_vehicle -> Stage1 affects_vehicle -> "unknown"
+        stage2_tv = anchor.get("target_vehicle", "")
+        stage1_tv = e.get("affects_vehicle", "unknown")
+        
+        if stage2_tv and str(stage2_tv).lower() not in ("", "unknown", "none"):
+            tv = str(stage2_tv)
+        elif stage1_tv and str(stage1_tv).lower() not in ("", "unknown", "none"):
+            tv = str(stage1_tv)
+        else:
+            tv = "unknown"
+        
+        # DEBUG: Log when there's a mismatch
+        if str(stage2_tv).lower() not in ("", "unknown", "none") and str(stage2_tv) != str(stage1_tv):
+            print(f"[DEBUG] Anchor target_vehicle mismatch for {e.get('entity_id')}: stage2={stage2_tv} vs stage1={stage1_tv}, using={tv}", flush=True)
+        elif str(tv) != "unknown" and str(tv) != str(stage1_tv):
+            print(f"[DEBUG] Using Stage1 affects_vehicle for {e.get('entity_id')}: {tv}", flush=True)
+        
         # Phase fallback: Stage2 anchor.phase -> Stage1 when -> "unknown"
         # If Stage2 outputs "unknown" or empty, prefer Stage1's value
         stage2_phase = anchor.get("phase", "")
@@ -445,12 +485,12 @@ def validate_actor_specs(
         else:
             phase = "unknown"
         # For lateral preference, try: anchor.lateral_preference -> e.lateral_relation -> e.start_lateral
-        lat = str(anchor.get("lateral_preference", "unknown"))
+        lat = normalize_lateral(anchor.get("lateral_preference", "unknown"))
         if lat == "unknown":
-            lat = str(e.get("lateral_relation", "unknown"))
+            lat = normalize_lateral(e.get("lateral_relation", "unknown"))
         if lat == "unknown":
             # Fall back to start_lateral (e.g., "pedestrian appears to the left" -> start_lateral=left_edge)
-            lat = str(e.get("start_lateral") or "unknown")
+            lat = normalize_lateral(e.get("start_lateral") or "unknown")
 
         tvs = str(tv)
         if tvs not in ("none", "unknown") and _parse_vehicle_num(tvs) is None:
@@ -540,6 +580,18 @@ def validate_actor_specs(
         if sp == "unknown" and kind == "npc_vehicle":
             sp = "normal"
 
+        # NPC vehicles with distance triggers should keep a natural speed; spawn placement will
+        # be biased to keep them close enough for the trigger to fire without crawling.
+        trigger = e.get("trigger")
+        action = e.get("action")
+        if kind == "npc_vehicle" and mtype == "follow_lane":
+            trigger_type = trigger.get("type", "") if isinstance(trigger, dict) else ""
+            action_type = action.get("type", "") if isinstance(action, dict) else ""
+            # If waiting for ego to catch up and will perform an action
+            if trigger_type == "distance_to_vehicle" and action_type in ("hard_brake", "lane_change", "sudden_stop"):
+                sp = "normal"
+                print(f"[INFO] {sid}: NPC vehicle with distance trigger + {action_type} action -> using normal speed and trigger-distance spawn bias")
+
         conf = raw.get("confidence", 0.6)
         try:
             conf = float(conf)
@@ -551,29 +603,58 @@ def validate_actor_specs(
         if direction_relative_to is not None and not isinstance(direction_relative_to, dict):
             direction_relative_to = None
 
+        # trigger and action already extracted above (for speed profile adjustment)
+        if trigger is not None and not isinstance(trigger, dict):
+            trigger = None
+
+        if action is not None and not isinstance(action, dict):
+            action = None
+
         lat_pref = lat
 
-        # Cross direction: infer from lane where possible, then fallback
+        # Cross direction: FIRST check explicit stage1 crossing_direction, then infer from lane
         cross_dir = "unknown"
-        if mtype == "cross_perpendicular":
+        
+        # Priority 1: Use explicit crossing_direction from stage1 (e.g., "cross from right to left")
+        stage1_cross_dir = e.get("crossing_direction")
+        print(f"[DEBUG CSP] Entity {sid}: stage1_cross_dir = {stage1_cross_dir}")  # DEBUG
+        if stage1_cross_dir in ("left", "right"):
+            cross_dir = stage1_cross_dir
+        
+        # Priority 2: Use motion.cross_direction if set
+        if cross_dir == "unknown":
+            cross_dir = str(motion.get("cross_direction", "unknown"))
+        
+        # Priority 3: Infer from start_lateral (if starting on right, cross left; if starting on left, cross right)
+        if cross_dir == "unknown":
+            stage1_start_lat = normalize_lateral(e.get("start_lateral") or "unknown")
+            if "right" in stage1_start_lat:
+                cross_dir = "left"
+            elif "left" in stage1_start_lat:
+                cross_dir = "right"
+        
+        # Priority 4: Infer from lane_id (last resort)
+        if cross_dir == "unknown" and mtype == "cross_perpendicular":
             lane_id = _get_vehicle_lane_id(picked, tvs, phase)
             if lane_id is not None:
                 if lane_id < 0:
                     cross_dir = "left"
                 elif lane_id > 0:
                     cross_dir = "right"
-        if cross_dir == "unknown":
-            cross_dir = str(motion.get("cross_direction", "unknown"))
-        if cross_dir == "unknown":
-            stage1_cross_dir = e.get("crossing_direction")
-            if stage1_cross_dir in ("left", "right"):
-                cross_dir = stage1_cross_dir
 
-        if mtype == "cross_perpendicular" and lat_pref == "unknown":
-            if cross_dir == "left":
-                lat_pref = "right_edge"
-            elif cross_dir == "right":
-                lat_pref = "left_edge"
+        # For crossing motion, use start_lateral from stage1 if available
+        if mtype == "cross_perpendicular":
+            stage1_start_lat = normalize_lateral(e.get("start_lateral") or "unknown")
+            print(f"[DEBUG CSP] Entity {sid}: stage1_start_lat = {stage1_start_lat}, mtype = {mtype}, cross_dir = {cross_dir}")  # DEBUG
+            if stage1_start_lat != "unknown" and stage1_start_lat in LATERAL_TO_M:
+                lat_pref = stage1_start_lat
+            elif lat_pref == "unknown":
+                # Infer from cross_dir as fallback
+                if cross_dir == "left":
+                    lat_pref = "sidewalk_right"
+                elif cross_dir == "right":
+                    lat_pref = "sidewalk_left"
+            print(f"[DEBUG CSP] Entity {sid}: lat_pref = {lat_pref}")  # DEBUG
 
         clean.append({
             "id": sid,
@@ -589,9 +670,12 @@ def validate_actor_specs(
                 "type": mtype,
                 "speed_profile": sp,
                 "cross_direction": cross_dir,
+                "start_lateral": lat_pref,  # Pass lateral position to spawn.py for crossing motion
             },
             "confidence": conf,
             "direction_relative_to": direction_relative_to,
+            "trigger": trigger,
+            "action": action,
         })
 
     return clean, warnings
@@ -629,22 +713,6 @@ def _phase_score(segment_index: int, veh_info: Dict[str, Any], phase: str) -> fl
         mid = (nsegs + 1) / 2.0
         dist = abs(segment_index - mid)
         return 3.0 - 3.0 * dist
-
-
-def _s_along_centering_score(s_along: float, phase: str) -> float:
-    """Bonus for placing actors near the center of a segment for 'in_intersection' phase.
-    
-    Returns a score from 0.0 (at edges) to 2.0 (at center s_along=0.5).
-    This ensures that 'in_intersection' placements land in the middle of the junction,
-    not at the very start or end.
-    """
-    if phase not in ("in_intersection",):
-        return 0.0
-    # s_along ranges from 0.0 to 1.0; we want to prefer ~0.5
-    # Use a simple parabola: 2.0 * (1 - (2*s - 1)^2) = 2.0 - 2*(2s-1)^2
-    # At s=0.5: 2.0, at s=0 or s=1: 0.0
-    deviation = 2.0 * s_along - 1.0  # ranges from -1 to 1
-    return 2.0 * (1.0 - deviation * deviation)
 
     if phase == "after_turn":
         if exit_idx is not None:
@@ -690,10 +758,64 @@ def _s_along_centering_score(s_along: float, phase: str) -> float:
     return 0.0
 
 
+def _s_along_centering_score(s_along: float, phase: str) -> float:
+    """Bonus for placing actors near the center of a segment for 'in_intersection' phase.
+    
+    Returns a score from 0.0 (at edges) to 2.0 (at center s_along=0.5).
+    This ensures that 'in_intersection' placements land in the middle of the junction,
+    not at the very start or end.
+    """
+    if phase not in ("in_intersection",):
+        return 0.0
+    # s_along ranges from 0.0 to 1.0; we want to prefer ~0.5
+    # Use a simple parabola: 2.0 * (1 - (2*s - 1)^2) = 2.0 - 2*(2s-1)^2
+    # At s=0.5: 2.0, at s=0 or s=1: 0.0
+    deviation = 2.0 * s_along - 1.0  # ranges from -1 to 1
+    return 2.0 * (1.0 - deviation * deviation)
+
+
 def _lateral_score(lat: str, pref: str) -> float:
     if pref in ("unknown", None, ""):
         return 0.0
     return 1.0 if lat == pref else -0.2
+
+
+def _trigger_distance_bias(spec: Dict[str, Any], vehicle_num: int, path_s_m: float) -> float:
+    """
+    Soft bias to keep distance-trigger NPCs close to the referenced vehicle's start,
+    so triggers can fire without forcing unnaturally slow speeds.
+    """
+    if spec.get("actor_kind") != "npc_vehicle":
+        return 0.0
+    trigger = spec.get("trigger")
+    action = spec.get("action")
+    if not isinstance(trigger, dict) or trigger.get("type") != "distance_to_vehicle":
+        return 0.0
+    action_type = action.get("type") if isinstance(action, dict) else ""
+    if action_type not in ("hard_brake", "lane_change", "sudden_stop"):
+        return 0.0
+    trigger_vehicle = _parse_vehicle_num(trigger.get("vehicle"))
+    anchor_vehicle = _parse_vehicle_num((spec.get("anchor") or {}).get("target_vehicle"))
+    if trigger_vehicle is None or anchor_vehicle is None:
+        return 0.0
+    if trigger_vehicle != anchor_vehicle or trigger_vehicle != vehicle_num:
+        return 0.0
+    try:
+        dist = float(trigger.get("distance_m", 8.0))
+    except Exception:
+        dist = 8.0
+    dist = max(1.0, min(50.0, dist))
+    buffer_m = min(6.0, max(2.0, 0.3 * dist))
+    desired = dist + buffer_m
+    tol = max(4.0, 0.5 * buffer_m)
+    diff = abs(path_s_m - desired)
+    if diff <= tol:
+        bonus = 3.0
+    else:
+        bonus = max(-3.0, 3.0 - ((diff - tol) / max(tol, 1e-6)) * 3.0)
+    if path_s_m < dist:
+        bonus -= 1.0
+    return bonus
 
 
 def _relation_score(a: CandidatePlacement, b: CandidatePlacement, rel: Dict[str, Any]) -> float:
@@ -762,6 +884,7 @@ def generate_candidates_for_actor(
     max_candidates: int = 120,
     ds_m: float = 6.0,
     crop_margin_m: float = 1.0,
+    ego_spawns: Optional[List[Dict[str, Any]]] = None,
 ) -> List[CandidatePlacement]:
     anchor = spec.get("anchor", {})
     tv = str(anchor.get("target_vehicle", "unknown"))
@@ -789,6 +912,9 @@ def generate_candidates_for_actor(
     veh_domain = sorted(list(set(veh_domain)))
     if preferred is not None:
         veh_domain = [preferred]
+        print(f"[DEBUG] Actor {spec.get('id')} constrained to vehicle_domain={veh_domain} (preferred={preferred})", flush=True)
+    else:
+        print(f"[DEBUG] Actor {spec.get('id')} using all vehicles: vehicle_domain={veh_domain} (target_vehicle was '{tv}')", flush=True)
 
     cat = str(spec.get("category","static")).lower()
     if cat == "vehicle":
@@ -809,12 +935,27 @@ def generate_candidates_for_actor(
 
     cands: List[CandidatePlacement] = []
     fallback_cands: List[CandidatePlacement] = []
+    far_cands: List[CandidatePlacement] = []
+
+    gp = spec.get("group_pattern", {}) if isinstance(spec.get("group_pattern", {}), dict) else {}
+    group_pattern_name = str(gp.get("pattern", "unknown") if isinstance(gp, dict) else gp).lower()
+    pref_lat_norm = str(pref_lat).lower()
+    is_lane_drop_marker = (
+        pref_phase == "after_merge"
+        and group_pattern_name == "along_lane"
+        and pref_lat_norm in ("left_edge", "right_edge", "half_left", "half_right")
+    )
 
     merge_min_s_m = None
+    merge_max_s_m = None
     if pref_phase == "after_merge" and preferred is not None and merge_min_s_by_vehicle:
         base_merge_s = merge_min_s_by_vehicle.get(preferred)
         if base_merge_s is not None:
-            merge_min_s_m = float(base_merge_s) + AFTER_MERGE_CLEARANCE_M + _group_back_buffer_m(spec)
+            # Lane Drop markers should appear just after the merge point.
+            clearance = LANE_DROP_AFTER_MERGE_OFFSET_M if is_lane_drop_marker else AFTER_MERGE_CLEARANCE_M
+            merge_min_s_m = float(base_merge_s) + clearance + _group_back_buffer_m(spec)
+            if is_lane_drop_marker:
+                merge_max_s_m = merge_min_s_m + LANE_DROP_AFTER_MERGE_WINDOW_M
     
     # Special handling for NPC vehicles that travel in the OPPOSITE direction
     if is_opposite_npc and opposite_ref_vehicle is not None and all_segments:
@@ -895,7 +1036,10 @@ def generate_candidates_for_actor(
             seg_len = seg_lengths[idx0]
             if pts is None or seg_len < 2.0:
                 continue
-            step = max(2.0, float(ds_m))
+            if is_lane_drop_marker:
+                step = max(0.5, float(LANE_DROP_CANDIDATE_STEP_M))
+            else:
+                step = max(2.0, float(ds_m))
             s_values_m = list(np.arange(min(crop_margin_m, 0.2*seg_len), max(seg_len - crop_margin_m, 0.8*seg_len), step))
             if len(s_values_m) < 3:
                 s_values_m = [0.2*seg_len, 0.5*seg_len, 0.8*seg_len]
@@ -912,6 +1056,7 @@ def generate_candidates_for_actor(
                         continue
                     path_s_m = float(sum(seg_lengths[:idx0]) + float(s_m))
                     if merge_min_s_m is not None and path_s_m < merge_min_s_m:
+                        trigger_bias = _trigger_distance_bias(spec, int(veh_num), path_s_m)
                         fallback_cands.append(CandidatePlacement(
                             vehicle_num=int(veh_num),
                             segment_index=int(segment_index),
@@ -922,10 +1067,29 @@ def generate_candidates_for_actor(
                             y=float(spawn["y"]),
                             yaw_deg=float(spawn["yaw_deg"]),
                             path_s_m=float(path_s_m),
-                            base_score=float(phase_bonus + centering_bonus + _lateral_score(lat, pref_lat) + (1.0 if preferred is not None else 0.0)),
+                            base_score=float(phase_bonus + centering_bonus + _lateral_score(lat, pref_lat) + trigger_bias + (1.0 if preferred is not None else 0.0)),
+                        ))
+                        continue
+                    if merge_max_s_m is not None and path_s_m > merge_max_s_m:
+                        base = phase_bonus + centering_bonus + _lateral_score(lat, pref_lat)
+                        base += _trigger_distance_bias(spec, int(veh_num), path_s_m)
+                        if preferred is not None:
+                            base += 1.0
+                        far_cands.append(CandidatePlacement(
+                            vehicle_num=int(veh_num),
+                            segment_index=int(segment_index),
+                            seg_id=int(seg_id_raw),
+                            s_along=float(s_along),
+                            lateral_relation=str(lat),
+                            x=float(spawn["x"]),
+                            y=float(spawn["y"]),
+                            yaw_deg=float(spawn["yaw_deg"]),
+                            path_s_m=float(path_s_m),
+                            base_score=float(base),
                         ))
                         continue
                     base = phase_bonus + centering_bonus + _lateral_score(lat, pref_lat)
+                    base += _trigger_distance_bias(spec, int(veh_num), path_s_m)
                     if preferred is not None:
                         base += 1.0
                     cands.append(CandidatePlacement(
@@ -940,9 +1104,41 @@ def generate_candidates_for_actor(
                         path_s_m=float(path_s_m),
                         base_score=float(base),
                     ))
-    if merge_min_s_m is not None and not cands and fallback_cands:
+    if merge_max_s_m is not None and not cands:
+        if far_cands:
+            cands = far_cands
+        elif fallback_cands:
+            cands = fallback_cands
+    elif merge_min_s_m is not None and not cands and fallback_cands:
         cands = fallback_cands
     cands.sort(key=lambda c: c.base_score, reverse=True)
+    
+    # Filter candidates to maintain minimum buffer from ego vehicle spawns
+    MIN_BUFFER_TO_EGO_M = 15.0
+    if ego_spawns:
+        filtered_cands = []
+        for cand in cands:
+            violates_buffer = False
+            for ego_spawn_info in ego_spawns:
+                ego_spawn = ego_spawn_info.get("spawn", {})
+                if not isinstance(ego_spawn, dict):
+                    continue
+                ego_x = ego_spawn.get("x")
+                ego_y = ego_spawn.get("y")
+                if ego_x is None or ego_y is None:
+                    continue
+                
+                # Check distance from this candidate to ego spawn
+                dist = math.hypot(float(cand.x) - float(ego_x), float(cand.y) - float(ego_y))
+                if dist < MIN_BUFFER_TO_EGO_M:
+                    violates_buffer = True
+                    break
+            
+            if not violates_buffer:
+                filtered_cands.append(cand)
+        
+        cands = filtered_cands
+    
     return cands[:max_candidates]
 
 
@@ -955,6 +1151,7 @@ def solve_weighted_csp(
     merge_min_s_by_vehicle: Optional[Dict[int, float]] = None,
     min_sep_scale: float = 1.0,
     max_backtrack: int = 30000,
+    ego_spawns: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, CandidatePlacement], Dict[str, Any]]:
     veh_info = _infer_vehicle_turn_exit_indices(picked_list, seg_by_id)
     domains: Dict[str, List[CandidatePlacement]] = {}
@@ -968,6 +1165,7 @@ def solve_weighted_csp(
             veh_info,
             merge_min_s_by_vehicle=merge_min_s_by_vehicle,
             all_segments=all_segments,
+            ego_spawns=ego_spawns,
         )
 
     # Build dependency graph: if A has relation to B, B should be placed before A
@@ -1245,6 +1443,7 @@ def solve_weighted_csp_with_extension(
     min_sep_scale: float = 1.0,
     max_backtrack: int = 30000,
     max_extension_iterations: int = 3,
+    ego_spawns: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, CandidatePlacement], Dict[str, Any], Any]:
     """
     Solve CSP with iterative path extension.
@@ -1274,6 +1473,7 @@ def solve_weighted_csp_with_extension(
             merge_min_s_by_vehicle=merge_min_s_by_vehicle,
             min_sep_scale=min_sep_scale,
             max_backtrack=max_backtrack,
+            ego_spawns=ego_spawns,
         )
         
         # Check if distance constraints are satisfied
@@ -1441,7 +1641,14 @@ def expand_group_to_actors(
     category = spec.get("category", "static")
     actor_kind = spec.get("actor_kind", "static_prop")
     asset_id = spec.get("asset_id")
-    spacing_m = _spacing_bucket_to_m(gp.get("spacing_bucket", "auto"), category=category, actor_kind=actor_kind, asset_id=asset_id)
+    
+    # Lane Drop scenarios need tight spacing for visual lane markers
+    bucket = gp.get("spacing_bucket", "auto")
+    if pattern == "along_lane" and actor_kind == "static_prop":
+        # Traffic cones along lane edges should be tightly spaced for visual effect
+        bucket = "tight"
+    
+    spacing_m = _spacing_bucket_to_m(bucket, category=category, actor_kind=actor_kind, asset_id=asset_id)
 
     pts = seg_by_id.get(int(chosen.seg_id))
     if pts is None or len(pts) < 2:
@@ -1503,6 +1710,9 @@ def expand_group_to_actors(
 
 __all__ = [
     "AFTER_MERGE_CLEARANCE_M",
+    "LANE_DROP_AFTER_MERGE_OFFSET_M",
+    "LANE_DROP_AFTER_MERGE_WINDOW_M",
+    "LANE_DROP_CANDIDATE_STEP_M",
     "ALLOWED_DIST_BUCKETS",
     "ALLOWED_GROUP_PATTERNS",
     "ALLOWED_PHASES",

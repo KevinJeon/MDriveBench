@@ -23,6 +23,7 @@ TRIGGER_THRESHOLD = 2.0  # Threshold to say if a trigger position is new or repe
 TRIGGER_ANGLE_THRESHOLD = 10  # Threshold to say if two angles can be considering matching when matching transforms.
 
 _CUSTOM_ACTOR_MANIFEST_CACHE = None
+_CUSTOM_ACTOR_BEHAVIOR_CACHE = None
 _EGO_VEHICLE_MODELS_CACHE = None  # Cache for ego vehicle models from manifest
 ROLE_DEFAULTS: Dict[str, Dict[str, object]] = {
     "npc": {"model": "vehicle.tesla.model3", "speed": 8.0},
@@ -120,6 +121,70 @@ def _load_custom_actor_manifest() -> Dict[str, List[Dict[str, object]]]:
 
     _CUSTOM_ACTOR_MANIFEST_CACHE = actor_entries
     return _CUSTOM_ACTOR_MANIFEST_CACHE
+
+
+def _load_custom_actor_behaviors() -> Dict[str, List[Dict[str, object]]]:
+    """
+    Load and cache optional behavior specs for custom actors.
+    Returns a mapping of route_id -> list of behavior entries.
+    """
+    global _CUSTOM_ACTOR_BEHAVIOR_CACHE  # pylint: disable=global-statement
+
+    if _CUSTOM_ACTOR_BEHAVIOR_CACHE is not None:
+        return _CUSTOM_ACTOR_BEHAVIOR_CACHE
+
+    behavior_path = None
+    env_path = os.environ.get("CUSTOM_ACTOR_BEHAVIORS")
+    if env_path:
+        behavior_path = Path(env_path).expanduser().resolve()
+
+    if not behavior_path or not behavior_path.exists():
+        manifest_env = os.environ.get("CUSTOM_ACTOR_MANIFEST")
+        if manifest_env:
+            cand = Path(manifest_env).expanduser().resolve().parent / "actors_behavior.json"
+            if cand.exists():
+                behavior_path = cand
+
+    if not behavior_path or not behavior_path.exists():
+        candidates = [
+            Path.cwd() / "routes" / "actors_behavior.json",
+            Path.cwd() / "scenario_builder_api" / "routes" / "actors_behavior.json",
+        ]
+        for routes_dir in [Path.cwd() / "routes", Path.cwd() / "scenario_builder_api" / "routes"]:
+            if routes_dir.exists():
+                for subdir_behavior in routes_dir.glob("*/actors_behavior.json"):
+                    candidates.append(subdir_behavior)
+        for candidate in candidates:
+            if candidate.exists():
+                behavior_path = candidate
+                break
+
+    if not behavior_path or not behavior_path.exists():
+        _CUSTOM_ACTOR_BEHAVIOR_CACHE = {}
+        return _CUSTOM_ACTOR_BEHAVIOR_CACHE
+
+    try:
+        data = json.loads(behavior_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _CUSTOM_ACTOR_BEHAVIOR_CACHE = {}
+        return _CUSTOM_ACTOR_BEHAVIOR_CACHE
+
+    if isinstance(data, dict) and isinstance(data.get("behaviors"), list):
+        entries = data["behaviors"]
+    elif isinstance(data, list):
+        entries = data
+    else:
+        entries = []
+
+    by_route: Dict[str, List[Dict[str, object]]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        route_id = entry.get("route_id") or entry.get("route") or "*"
+        by_route.setdefault(str(route_id), []).append(entry)
+
+    _CUSTOM_ACTOR_BEHAVIOR_CACHE = by_route
+    return _CUSTOM_ACTOR_BEHAVIOR_CACHE
 
 
 def _load_ego_vehicle_models() -> Dict[int, str]:
@@ -358,6 +423,10 @@ class RouteParser(object):
 
             new_config.trajectory = waypoint_list
             new_config.custom_actors = _build_custom_actor_configs(route_id, new_config.town)
+            behaviors_map = _load_custom_actor_behaviors()
+            route_behaviors = list(behaviors_map.get(str(route_id), []))
+            route_behaviors += list(behaviors_map.get("*", []))
+            new_config.custom_actor_behaviors = route_behaviors
 
             list_route_descriptions.append(new_config)
 

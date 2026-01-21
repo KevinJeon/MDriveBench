@@ -10,7 +10,12 @@ def _maneuver_needed_count(spec: GeometrySpec, man: str) -> int:
 
 
 def crop_satisfies_spec(spec: GeometrySpec, crop: CropFeatures) -> bool:
-    if spec.topology == "t_junction":
+    if spec.topology == "highway":
+        if not crop.is_highway:
+            return False
+        if crop.lane_count_est < 3:  # Highways must have 3+ lanes
+            return False
+    elif spec.topology == "t_junction":
         if not crop.is_t_junction:
             return False
         if spec.degree == 3 and len(crop.dirs) < 3:
@@ -26,6 +31,8 @@ def crop_satisfies_spec(spec: GeometrySpec, crop: CropFeatures) -> bool:
     for man in ["straight", "left", "right"]:
         need = _maneuver_needed_count(spec, man)
         if need > 0:
+            if spec.needs_on_ramp and man == "straight":
+                continue
             if crop.maneuver_stats.get(man, {}).get("count", 0.0) < 1.0:
                 return False
 
@@ -37,6 +44,9 @@ def crop_satisfies_spec(spec: GeometrySpec, crop: CropFeatures) -> bool:
 
     if spec.needs_on_ramp and not crop.has_on_ramp:
         return False
+    if spec.needs_on_ramp and spec.topology == "highway":
+        if crop.ramp_entry_max_lanes != 1:
+            return False
 
     if spec.needs_multi_lane:
         if crop.lane_count_est < max(2, spec.min_lane_count):
@@ -49,6 +59,8 @@ def crop_satisfies_spec(spec: GeometrySpec, crop: CropFeatures) -> bool:
     for man in ["straight", "left", "right"]:
         need = _maneuver_needed_count(spec, man)
         if need > 0:
+            if spec.needs_on_ramp and man == "straight":
+                continue
             st = crop.maneuver_stats.get(man, {})
             if float(st.get("max_entry_dist", 0.0)) < float(spec.min_entry_runup_m):
                 return False
@@ -63,6 +75,8 @@ def crop_base_cost(spec: GeometrySpec, crop: CropFeatures, junction_penalty: flo
     if spec.avoid_extra_intersections:
         cost += junction_penalty * max(0, crop.junction_count - 1)
 
+    if spec.topology == "highway" and crop.is_highway:
+        cost *= 0.95  # Prefer highways when explicitly requested
     if spec.topology == "t_junction" and crop.is_t_junction:
         cost *= 0.97
     if spec.needs_multi_lane and crop.has_multi_lane:
@@ -71,6 +85,12 @@ def crop_base_cost(spec: GeometrySpec, crop: CropFeatures, junction_penalty: flo
         cost *= 0.98
     if spec.needs_on_ramp and crop.has_on_ramp:
         cost *= 0.98
+        if crop.ramp_entry_max_lanes == 1 and crop.ramp_main_lanes >= 3:
+            cost *= 0.92
+        elif crop.ramp_entry_min_lanes == 1:
+            cost *= 0.96
+        elif crop.ramp_entry_min_lanes == 2:
+            cost *= 0.98
     if spec.topology == "intersection" and spec.degree == 0 and crop.is_four_way:
         cost *= 0.98
     return float(cost)

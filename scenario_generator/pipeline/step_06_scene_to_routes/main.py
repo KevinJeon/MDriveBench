@@ -357,6 +357,29 @@ def convert_scene_to_routes(
         json.dump(manifest, f, indent=2, sort_keys=True)
     
     print(f"\n[OK] Created actors_manifest.json")
+
+    # Write actors_behavior.json (optional)
+    behavior_entries = []
+    for actor in actors:
+        trigger = actor.get("trigger")
+        action = actor.get("action")
+        if trigger is None and action is None:
+            continue
+        actor_name = actor.get("id", "unknown")
+        behavior_entries.append(
+            {
+                "route_id": route_id_base,
+                "actor_name": actor_name,
+                "trigger": trigger,
+                "action": action,
+            }
+        )
+
+    if behavior_entries:
+        behavior_path = output_path / "actors_behavior.json"
+        with open(behavior_path, "w", encoding="utf-8") as f:
+            json.dump({"behaviors": behavior_entries}, f, indent=2)
+        print(f"[OK] Created actors_behavior.json ({len(behavior_entries)} entries)")
     
     # Align routes using CARLA GlobalRoutePlanner (if requested)
     if align_routes:

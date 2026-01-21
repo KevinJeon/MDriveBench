@@ -1470,6 +1470,7 @@ class WaypointFollower(AtomicBehavior):
             Blackboard variable name, if additional actors should be created on-the-fly. Defaults to None.
         avoid_collision (bool, optional):
             Enable/Disable(=default) collision avoidance for vehicles/bikes. Defaults to False.
+        speed_callback (callable, optional): Callback returning target speed in m/s for dynamic updates.
         name (str, optional): Name of the behavior. Defaults to "FollowWaypoints".
 
     Attributes:
@@ -1486,6 +1487,7 @@ class WaypointFollower(AtomicBehavior):
             Either "Walker" for pedestrians, or a carla.agent.navigation.LocalPlanner for other actors.
         _args_lateral_dict: Parameters for the PID of the used carla.agent.navigation.LocalPlanner.
         _unique_id: Unique ID of the behavior based on timestamp in nanoseconds.
+        _speed_callback: Optional callback that returns target speed in m/s.
 
     Note:
         OpenScenario:
@@ -1496,7 +1498,7 @@ class WaypointFollower(AtomicBehavior):
     """
 
     def __init__(self, actor, target_speed=None, plan=None, blackboard_queue_name=None,
-                 avoid_collision=False, name="FollowWaypoints"):
+                 avoid_collision=False, speed_callback=None, name="FollowWaypoints"):
         """
         Set up actor and local planner
         """
@@ -1512,6 +1514,7 @@ class WaypointFollower(AtomicBehavior):
             self._queue = Blackboard().get(blackboard_queue_name)
         self._args_lateral_dict = {'K_P': 1.0, 'K_D': 0.01, 'K_I': 0.0, 'dt': 0.05}
         self._avoid_collision = avoid_collision
+        self._speed_callback = speed_callback
         self._unique_id = 0
 
     def initialise(self):
@@ -1617,6 +1620,15 @@ class WaypointFollower(AtomicBehavior):
             if actor is not None and actor.is_alive and local_planner is not None:
                 # Check if the actor is a vehicle/bike
                 if not isinstance(actor, carla.Walker):
+                    if self._speed_callback is not None:
+                        try:
+                            cb_speed = float(self._speed_callback(actor))
+                        except Exception:
+                            cb_speed = None
+                        if cb_speed is not None and math.isfinite(cb_speed):
+                            if cb_speed < 0.0:
+                                cb_speed = 0.0
+                            local_planner.set_speed(cb_speed * 3.6)
                     control = local_planner.run_step(debug=False)
                     if self._avoid_collision and detect_lane_obstacle(actor):
                         control.throttle = 0.0
@@ -1673,6 +1685,36 @@ class WaypointFollower(AtomicBehavior):
         super(WaypointFollower, self).terminate(new_status)
 
 
+class TerminateWaypointFollower(AtomicBehavior):
+
+    """
+    This behavior terminates any active WaypointFollower for the given actor
+    by writing to the blackboard termination list.
+    """
+
+    def __init__(self, actor, name="TerminateWaypointFollower"):
+        super(TerminateWaypointFollower, self).__init__(name, actor)
+
+    def update(self):
+        bb = py_trees.blackboard.Blackboard()
+        run_key = "running_WF_actor_{}".format(self._actor.id)
+        term_key = "terminate_WF_actor_{}".format(self._actor.id)
+        try:
+            running = getattr(bb, run_key)
+        except AttributeError:
+            running = []
+        if running is None:
+            running = []
+        if not isinstance(running, list):
+            try:
+                running = list(running)
+            except Exception:
+                running = []
+        print(f"[TERMINATE_WF] Terminating WaypointFollowers for actor {self._actor.id}: {running}")
+        bb.set(term_key, list(running), overwrite=True)
+        return py_trees.common.Status.SUCCESS
+
+
 class LaneChange(WaypointFollower):
 
     """
@@ -1715,11 +1757,20 @@ class LaneChange(WaypointFollower):
 
         # get start position
         position_actor = CarlaDataProvider.get_map().get_waypoint(self._actor.get_location())
+        print(f"[LANE_CHANGE] Initializing lane change: direction={self._direction}, actor_lane={position_actor.lane_id if position_actor else None}")
+        print(f"[LANE_CHANGE] Actor location: {self._actor.get_location()}")
 
         # calculate plan with scenario_helper function
-        self._plan, self._target_lane_id = generate_target_waypoint_list_multilane(
+        result = generate_target_waypoint_list_multilane(
             position_actor, self._direction, self._distance_same_lane,
             self._distance_other_lane, self._distance_lane_change, check='true')
+        if result is None or result[0] is None:
+            print(f"[LANE_CHANGE] ERROR: Could not generate lane change plan!")
+            self._plan = []
+            self._target_lane_id = None
+        else:
+            self._plan, self._target_lane_id = result
+            print(f"[LANE_CHANGE] Plan generated: {len(self._plan) if self._plan else 0} waypoints, target_lane={self._target_lane_id}")
         super(LaneChange, self).initialise()
 
     def update(self):
@@ -1734,6 +1785,7 @@ class LaneChange(WaypointFollower):
 
             if distance > self._distance_other_lane:
                 # long enough distance on new lane --> SUCCESS
+                print(f"[LANE_CHANGE] Lane change SUCCESS - completed distance on new lane")
                 status = py_trees.common.Status.SUCCESS
         else:
             # no lane change yet

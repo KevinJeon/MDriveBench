@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from .constants import LANE_WIDTH_M, LATERAL_TO_M
+from .constants import LANE_WIDTH_M, LATERAL_TO_M, SIDEWALK_OFFSET_M
 from .geometry import (
     cumulative_dist,
     heading_deg_from_vec,
@@ -155,16 +155,20 @@ def build_motion_waypoints(
 
     if mtype == "cross_perpendicular":
         # For crossing motion, the pedestrian should:
-        # 1. Start from the sidewalk (off-road), not just lane edge
+        # 1. ALWAYS start from the sidewalk (off-road), not lane edge or center
         # 2. Cross the entire road width to the opposite sidewalk
+        
+        # CRITICAL FIX: For pedestrian crosswalks, ALWAYS use sidewalk offsets
+        # Never spawn pedestrians in the middle of lanes or at lane edges
         
         # Determine normal from segment tangent at anchor
         _, t = point_and_tangent_at_s(seg_points, float(motion.get("anchor_s_along", 0.5)))
         
         # Cross direction: use explicit direction, or infer from start lateral
         side = str(motion.get("cross_direction", "unknown")).lower()
+        start_lat = str(motion.get("start_lateral", "")).lower()
+        
         if side not in ("left", "right"):
-            start_lat = str(motion.get("start_lateral", "")).lower()
             if "right" in start_lat:
                 side = "left"  # starting on right side, cross to left
             elif "left" in start_lat:
@@ -172,20 +176,18 @@ def build_motion_waypoints(
             else:
                 side = "left"  # default to crossing left
         
+        # ALWAYS use SIDEWALK_OFFSET_M for pedestrians crossing the road
+        # This ensures pedestrians spawn from sidewalks, not from the middle of adjacent lanes
+        start_offset_m = SIDEWALK_OFFSET_M
+        
         # Calculate road crossing geometry
-        # Assume a typical 2-lane road per direction = 4 lanes total ≈ 14m road width
-        # Plus sidewalk offset on each side ≈ 2m each = 18m total crossing
-        # For a simpler 2-lane road, use ~10m crossing
-        # We'll use a default that spans from sidewalk to sidewalk across a typical road
-        default_road_crossing_m = 12.0  # Enough to cross a 2-lane road from curb to curb
+        # Crossing distance: from sidewalk to opposite sidewalk across the entire road
+        # Need to cross: sidewalk + all lanes + opposite sidewalk
+        # For multi-lane roads, use a larger crossing distance
+        default_road_crossing_m = 2 * SIDEWALK_OFFSET_M + 2 * LANE_WIDTH_M
         dist = float(motion.get("cross_distance_m", default_road_crossing_m))
         
-        # IMPORTANT: Start from OFF-ROAD position, not from the lane
-        # The anchor_spawn is at the lane position; we need to offset to the sidewalk
-        # Move the start point outward by offroad offset (about 1 lane width from lane center)
-        offroad_offset_m = 1.1 * LANE_WIDTH_M  # ~3.85m from lane center to sidewalk
-        
-        # Get base point from lane center
+        # Get base point from lane center of the anchor segment
         center_spawn = compute_spawn_from_anchor(seg_points, float(motion.get("anchor_s_along", 0.5)), "center")
         p_center = np.array([center_spawn["x"], center_spawn["y"]], dtype=float)
         
@@ -202,10 +204,9 @@ def build_motion_waypoints(
             cross_normal = right_normal_world(t)
         
         # Calculate start point on the sidewalk (off-road)
-        p0 = p_center + offroad_offset_m * start_normal
+        p0 = p_center + start_offset_m * start_normal
         
         # Calculate end point on the opposite sidewalk
-        # Total crossing = 2 * offroad_offset + road width
         p1 = p0 + dist * cross_normal
         
         yaw = wrap180(heading_deg_from_vec(cross_normal))

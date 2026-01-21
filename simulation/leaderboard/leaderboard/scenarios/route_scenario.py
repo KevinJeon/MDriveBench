@@ -13,6 +13,7 @@ from __future__ import print_function
 
 import math
 import os
+import re
 import xml.etree.ElementTree as ET
 import numpy.random as random
 import torch
@@ -29,7 +30,16 @@ from agents.navigation.global_route_planner_dao import GlobalRoutePlannerDAO
 # pylint: disable=line-too-long
 from srunner.scenarioconfigs.scenario_configuration import ScenarioConfiguration, ActorConfigurationData
 # pylint: enable=line-too-long
-from srunner.scenariomanager.scenarioatomics.atomic_behaviors import Idle, ScenarioTriggerer, WaypointFollower
+from srunner.scenariomanager.scenarioatomics.atomic_behaviors import (
+    Idle,
+    ScenarioTriggerer,
+    WaypointFollower,
+    StopVehicle,
+    LaneChange,
+    HandBrakeVehicle,
+    TerminateWaypointFollower,
+)
+from srunner.scenariomanager.scenarioatomics.atomic_trigger_conditions import InTriggerDistanceToVehicle
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenarios.basic_scenario import BasicScenario
 from srunner.scenarios.control_loss import ControlLoss
@@ -249,6 +259,19 @@ class RouteScenario(BasicScenario):
         self.route_scenario_dic = {}
         self._custom_actor_configs = list(getattr(config, "custom_actors", []) or [])
         self._custom_actor_plans: List[dict] = []
+        self._custom_actor_behaviors = list(getattr(config, "custom_actor_behaviors", []) or [])
+        self._custom_actor_behavior_by_name = {}
+        for entry in self._custom_actor_behaviors:
+            if not isinstance(entry, dict):
+                continue
+            name = (
+                entry.get("actor_name")
+                or entry.get("name")
+                or entry.get("actor")
+                or entry.get("id")
+            )
+            if name:
+                self._custom_actor_behavior_by_name[str(name)] = entry
 
         # update waypoints and scenarios along the routes
         self._update_route(world, config, debug_mode>0)
@@ -1053,7 +1076,7 @@ class RouteScenario(BasicScenario):
                 ),
             )
 
-            should_snap_to_road = role not in ("static", "static_prop")  # keep static props at their authored pose
+            should_snap_to_road = role not in ("static", "static_prop", "pedestrian", "walker", "bicycle", "cyclist")  # keep static props and pedestrians at their authored pose
             if world_map is not None and should_snap_to_road:
                 snapped_wp = world_map.get_waypoint(
                     spawn_tf.location,
@@ -1097,21 +1120,28 @@ class RouteScenario(BasicScenario):
                     pass
                 continue
 
+            # For pedestrians and cyclists, use the authored plan directly without road snapping
+            is_non_vehicle = role in ("pedestrian", "walker", "bicycle", "cyclist")
+
             plan_locations = []
             for loc in actor_cfg["plan"]:
-                snapped_loc = carla.Location(x=loc.x, y=loc.y, z=loc.z)
-                if world_map is not None:
-                    wp = world_map.get_waypoint(
-                        loc,
-                        project_to_road=True,
-                        lane_type=carla.LaneType.Driving,
-                    )
-                    if wp is not None:
-                        snapped_loc = wp.transform.location
-                plan_locations.append(snapped_loc)
+                if is_non_vehicle:
+                    # Keep original waypoint for pedestrians/cyclists
+                    plan_locations.append(carla.Location(x=loc.x, y=loc.y, z=loc.z))
+                else:
+                    snapped_loc = carla.Location(x=loc.x, y=loc.y, z=loc.z)
+                    if world_map is not None:
+                        wp = world_map.get_waypoint(
+                            loc,
+                            project_to_road=True,
+                            lane_type=carla.LaneType.Driving,
+                        )
+                        if wp is not None:
+                            snapped_loc = wp.transform.location
+                    plan_locations.append(snapped_loc)
 
             dense_plan = []
-            if planner is not None and len(plan_locations) >= 2:
+            if not is_non_vehicle and planner is not None and len(plan_locations) >= 2:
                 route_plan = []
                 for idx in range(len(plan_locations) - 1):
                     start_loc = plan_locations[idx]
@@ -1146,8 +1176,360 @@ class RouteScenario(BasicScenario):
                     "plan": dense_plan,
                     "target_speed": actor_cfg["target_speed"],
                     "avoid_collision": actor_cfg.get("avoid_collision", False),
+                    "behavior": self._custom_actor_behavior_by_name.get(actor_cfg["name"]),
+                    "role": actor_cfg.get("role", "npc"),
                 }
             )
+
+    def _resolve_ego_vehicle(self, vehicle_name: str):
+        if not vehicle_name:
+            return None
+        name = str(vehicle_name).strip()
+        if name.lower() in ("ego", "ego_vehicle", "ego vehicle"):
+            return self.ego_vehicles[0] if self.ego_vehicles else None
+        match = re.search(r"(\d+)", name)
+        if not match:
+            return None
+        idx = int(match.group(1)) - 1
+        if idx < 0 or idx >= len(self.ego_vehicles):
+            return None
+        return self.ego_vehicles[idx]
+
+    def _build_trigger_condition(self, trigger_spec: dict, actor):
+        if not isinstance(trigger_spec, dict):
+            return None
+        ttype = str(trigger_spec.get("type", "")).strip()
+        if ttype != "distance_to_vehicle":
+            return None
+        ego_name = trigger_spec.get("vehicle")
+        ego_actor = self._resolve_ego_vehicle(ego_name)
+        if ego_actor is None:
+            return None
+        try:
+            dist = float(trigger_spec.get("distance_m", 8.0))
+        except Exception:
+            dist = 8.0
+        dist = max(1.0, min(50.0, dist))
+        return InTriggerDistanceToVehicle(ego_actor, actor, dist)
+
+    def _infer_lane_change_direction(self, actor, target_vehicle):
+        world_map = CarlaDataProvider.get_map()
+        if world_map is None:
+            return None
+        actor_wp = world_map.get_waypoint(
+            actor.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
+        )
+        target_wp = world_map.get_waypoint(
+            target_vehicle.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
+        )
+        if actor_wp is None or target_wp is None:
+            return None
+        left_wp = actor_wp.get_left_lane()
+        if left_wp is not None and left_wp.lane_id == target_wp.lane_id:
+            return "left"
+        right_wp = actor_wp.get_right_lane()
+        if right_wp is not None and right_wp.lane_id == target_wp.lane_id:
+            return "right"
+        return None
+
+    def _is_vehicle_actor(self, actor_plan: dict) -> bool:
+        """Check if this actor is a vehicle (not pedestrian/walker)."""
+        role = actor_plan.get("role", "npc")
+        name = actor_plan.get("name", "").lower()
+        # Check if it's a vehicle based on name or role
+        if "walker" in name or "pedestrian" in name:
+            return False
+        return True
+
+    def _build_custom_actor_behavior(self, actor_plan: dict):
+        behavior_spec = actor_plan.get("behavior")
+        if not isinstance(behavior_spec, dict):
+            print(f"[DEBUG] _build_custom_actor_behavior: No behavior_spec for {actor_plan.get('name')}")
+            return None
+        trigger_spec = behavior_spec.get("trigger")
+        action_spec = behavior_spec.get("action") or behavior_spec.get("behavior")
+        print(f"[DEBUG] _build_custom_actor_behavior: trigger_spec={trigger_spec}, action_spec={action_spec}")
+
+        actor = actor_plan.get("actor")
+        if actor is None:
+            print(f"[DEBUG] _build_custom_actor_behavior: No actor")
+            return None
+
+        trigger_cond = None
+        ego_actor = None
+        trigger_distance = None
+        if isinstance(trigger_spec, dict):
+            trigger_cond = self._build_trigger_condition(trigger_spec, actor)
+            print(f"[DEBUG] _build_custom_actor_behavior: trigger_cond={trigger_cond}")
+            # Get ego actor and trigger distance for smart speed calculation
+            if trigger_spec.get("type") == "distance_to_vehicle":
+                ego_actor = self._resolve_ego_vehicle(trigger_spec.get("vehicle"))
+                try:
+                    trigger_distance = float(trigger_spec.get("distance_m", 8.0))
+                except Exception:
+                    trigger_distance = 8.0
+                trigger_distance = max(1.0, min(50.0, trigger_distance))
+
+        if not isinstance(action_spec, dict):
+            action_spec = {}
+
+        action_type = str(action_spec.get("type", "")).strip()
+        if not action_type:
+            # Default action: start motion when trigger is present.
+            action_type = "start_motion"
+
+        target_speed = actor_plan.get("target_speed")
+        plan = actor_plan.get("plan")
+        avoid_collision = actor_plan.get("avoid_collision", False)
+        
+        # NPC distance-trigger pacing:
+        # - Compute a base speed from initial spawn distance.
+        # - While waiting for the trigger, pace off ego speed so the NPC never outruns.
+        
+        is_vehicle = self._is_vehicle_actor(actor_plan)
+        has_distance_trigger = (
+            isinstance(trigger_spec, dict) and 
+            trigger_spec.get("type") == "distance_to_vehicle"
+        )
+        needs_catchup = is_vehicle and has_distance_trigger and action_type != "start_motion"
+        
+        effective_speed = target_speed if target_speed is not None else 8.0
+        if needs_catchup and ego_actor is not None and actor is not None:
+            try:
+                ego_loc = CarlaDataProvider.get_location(ego_actor) or ego_actor.get_location()
+                npc_loc = CarlaDataProvider.get_location(actor) or actor.get_location()
+                spawn_distance = ego_loc.distance(npc_loc)
+            except Exception:
+                spawn_distance = 30.0
+
+            close_distance = max(12.0, float(trigger_distance or 8.0) + 4.0)
+            far_distance = max(60.0, close_distance + 30.0)
+            max_speed = max(0.0, float(effective_speed or 8.0))
+            min_speed = min(2.0, max_speed)
+
+            if spawn_distance >= far_distance:
+                effective_speed = min_speed
+            elif spawn_distance <= close_distance:
+                effective_speed = max_speed
+            else:
+                t = (spawn_distance - close_distance) / (far_distance - close_distance)
+                effective_speed = max_speed - t * (max_speed - min_speed)
+
+        speed_callback = None
+        _debug_counter = [0]  # Use list to allow mutation in closure
+        if needs_catchup and ego_actor is not None and trigger_distance is not None:
+            def speed_callback(_actor):
+                _debug_counter[0] += 1
+                try:
+                    ego_speed = CarlaDataProvider.get_velocity(ego_actor)
+                except Exception:
+                    ego_speed = None
+                if ego_speed is None:
+                    try:
+                        vel = ego_actor.get_velocity()
+                        ego_speed = math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z)
+                    except Exception:
+                        return effective_speed
+                try:
+                    ego_speed = float(ego_speed)
+                except Exception:
+                    return effective_speed
+                if ego_speed < 0.1:
+                    return 0.0
+                try:
+                    ego_loc = CarlaDataProvider.get_location(ego_actor) or ego_actor.get_location()
+                    npc_loc = CarlaDataProvider.get_location(_actor) or _actor.get_location()
+                    dist = ego_loc.distance(npc_loc)
+                except Exception:
+                    return min(effective_speed, ego_speed)
+                dist_gap = max(0.0, dist - float(trigger_distance or 8.0))
+                max_catchup_time = 10.0
+                max_speed = max(0.0, float(target_speed if target_speed is not None else effective_speed))
+                gap_norm = min(1.0, dist_gap / 25.0)
+                min_speed = 1.0 + (2.0 * (1.0 - gap_norm))
+                if max_speed > 0.0:
+                    min_speed = min(min_speed, max_speed)
+                else:
+                    min_speed = 0.0
+                desired = ego_speed - (dist_gap / max(1e-3, max_catchup_time))
+                desired = max(min_speed, min(max_speed, desired))
+                desired = min(desired, ego_speed * 0.98)
+                result_speed = max(0.0, desired)
+                # Debug: print every 20 ticks
+                if _debug_counter[0] % 20 == 0:
+                    print(f"[SPEED_CB] dist={dist:.1f}m, trigger_dist={trigger_distance}, gap={dist_gap:.1f}m, ego_spd={ego_speed:.1f}, npc_spd={result_speed:.1f}")
+                return result_speed
+
+        # MINIMUM DRIVE TIME: Ensure NPC drives naturally for a bit before trigger can fire
+        # This prevents immediate triggering if NPC spawns within trigger distance
+        min_drive_time = 3.0  # seconds
+
+        follow_plan = plan
+        resume_plan = plan
+        if needs_catchup and has_distance_trigger:
+            # Avoid short plans ending before the trigger fires.
+            follow_plan = None
+            resume_plan = None
+
+        if action_type == "start_motion":
+            if trigger_cond is None:
+                return WaypointFollower(
+                    actor,
+                    target_speed=target_speed,
+                    plan=plan,
+                    avoid_collision=avoid_collision,
+                    name=f"FollowWaypoints-{actor_plan.get('name')}",
+                )
+            seq = py_trees.composites.Sequence(name=f"TriggerStart-{actor_plan.get('name')}")
+            seq.add_child(trigger_cond)
+            seq.add_child(
+                WaypointFollower(
+                    actor,
+                    target_speed=target_speed,
+                    plan=plan,
+                    avoid_collision=avoid_collision,
+                    name=f"FollowWaypoints-{actor_plan.get('name')}",
+                )
+            )
+            return seq
+
+        if action_type == "hard_brake":
+            # HARD BRAKE BEHAVIOR:
+            # - NPC drives at effective_speed (distance-based pacing)
+            # - Must drive for minimum time before trigger can fire (prevents immediate trigger)
+            # - When trigger fires, NPC brakes hard
+            # - After 2 seconds, NPC releases handbrake and resumes driving at normal speed
+            
+            follow = WaypointFollower(
+                actor,
+                target_speed=effective_speed,
+                plan=follow_plan,
+                avoid_collision=avoid_collision,
+                speed_callback=speed_callback,
+                name=f"FollowWaypoints-{actor_plan.get('name')}",
+            )
+            
+            # Brake sequence: wait for combined trigger -> terminate follower -> brake -> handbrake
+            brake_seq = py_trees.composites.Sequence(name=f"TriggerBrake-{actor_plan.get('name')}")
+            
+            if trigger_cond is not None and needs_catchup:
+                # Combined trigger: BOTH minimum drive time AND distance trigger must be satisfied
+                # This prevents immediate triggering if NPC spawns within trigger distance
+                combined_trigger = py_trees.composites.Parallel(
+                    name=f"CombinedTrigger-{actor_plan.get('name')}",
+                    policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ALL,
+                )
+                combined_trigger.add_child(Idle(duration=min_drive_time, name=f"MinDriveTime-{actor_plan.get('name')}"))
+                combined_trigger.add_child(trigger_cond)
+                brake_seq.add_child(combined_trigger)
+            elif trigger_cond is not None:
+                brake_seq.add_child(trigger_cond)
+            # else: no trigger, brake immediately
+            
+            brake_seq.add_child(TerminateWaypointFollower(actor))
+            brake_seq.add_child(StopVehicle(actor, brake_value=1.0))
+            brake_seq.add_child(HandBrakeVehicle(actor, hand_brake_value=1.0))
+            
+            # Parallel: follow while waiting for brake trigger
+            # Ends when brake_seq completes (SUCCESS_ON_ONE)
+            par = py_trees.composites.Parallel(
+                name=f"BrakeParallel-{actor_plan.get('name')}",
+                policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE,
+            )
+            par.add_child(follow)
+            par.add_child(brake_seq)
+            
+            # Main sequence: parallel (drive+brake) -> wait -> release -> resume driving
+            main_seq = py_trees.composites.Sequence(name=f"HardBrakeBehavior-{actor_plan.get('name')}")
+            main_seq.add_child(par)
+            # Wait 2 seconds while stopped
+            main_seq.add_child(Idle(duration=2.0, name=f"BrakeWait-{actor_plan.get('name')}"))
+            # Release handbrake
+            main_seq.add_child(HandBrakeVehicle(actor, hand_brake_value=0.0))
+            # Resume driving with a fresh follower so the actor doesn't remain stationary.
+            resume_speed = target_speed if target_speed is not None else effective_speed
+            main_seq.add_child(
+                WaypointFollower(
+                    actor,
+                    target_speed=resume_speed,
+                    plan=resume_plan,
+                    avoid_collision=avoid_collision,
+                    name=f"FollowWaypoints-{actor_plan.get('name')}-resume",
+                )
+            )
+            return main_seq
+
+        if action_type == "lane_change":
+            direction = str(action_spec.get("direction") or "").strip().lower()
+            if direction not in ("left", "right"):
+                target_vehicle_name = action_spec.get("target_vehicle")
+                target_vehicle = self._resolve_ego_vehicle(target_vehicle_name)
+                if target_vehicle is not None:
+                    direction = self._infer_lane_change_direction(actor, target_vehicle) or direction
+            if direction not in ("left", "right"):
+                direction = "left"
+
+            # LANE CHANGE BEHAVIOR:
+            # - NPC drives at distance-based pacing
+            # - Must drive for minimum time before trigger can fire (prevents immediate trigger)
+            # - When trigger fires, NPC changes lanes
+            # - Then resumes driving at normal speed
+            
+            follow = WaypointFollower(
+                actor,
+                target_speed=effective_speed,
+                plan=follow_plan,
+                avoid_collision=avoid_collision,
+                speed_callback=speed_callback,
+                name=f"FollowWaypoints-{actor_plan.get('name')}",
+            )
+
+            action_seq = py_trees.composites.Sequence(name=f"TriggerLaneChange-{actor_plan.get('name')}")
+            
+            if trigger_cond is not None and needs_catchup:
+                # Combined trigger: BOTH minimum drive time AND distance trigger must be satisfied
+                combined_trigger = py_trees.composites.Parallel(
+                    name=f"CombinedTrigger-{actor_plan.get('name')}",
+                    policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ALL,
+                )
+                combined_trigger.add_child(Idle(duration=min_drive_time, name=f"MinDriveTime-{actor_plan.get('name')}"))
+                combined_trigger.add_child(trigger_cond)
+                action_seq.add_child(combined_trigger)
+            elif trigger_cond is not None:
+                action_seq.add_child(trigger_cond)
+            
+            # Terminate the parallel WaypointFollower before starting lane change
+            # This prevents two controllers from fighting over the actor
+            action_seq.add_child(TerminateWaypointFollower(actor))
+            
+            action_seq.add_child(
+                LaneChange(
+                    actor,
+                    speed=effective_speed,
+                    direction=direction,
+                )
+            )
+            # Resume at normal speed after lane change
+            resume_speed = target_speed if target_speed is not None else effective_speed
+            action_seq.add_child(
+                WaypointFollower(
+                    actor,
+                    target_speed=resume_speed,
+                    plan=resume_plan,
+                    avoid_collision=avoid_collision,
+                    name=f"FollowWaypoints-{actor_plan.get('name')}-resume",
+                )
+            )
+
+            par = py_trees.composites.Parallel(
+                name=f"LaneChangeParallel-{actor_plan.get('name')}",
+                policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE,
+            )
+            par.add_child(follow)
+            par.add_child(action_seq)
+            return par
+
+        return None
 
     def _create_behavior(self):
         """
@@ -1164,15 +1546,23 @@ class RouteScenario(BasicScenario):
 
             if ego_vehicle_id == 0 and self._custom_actor_plans:
                 for actor_plan in self._custom_actor_plans:
-                    subbehavior.add_child(
-                        WaypointFollower(
+                    print(f"[DEBUG] Building behavior for actor: {actor_plan.get('name')}")
+                    print(f"[DEBUG]   behavior spec: {actor_plan.get('behavior')}")
+                    print(f"[DEBUG]   target_speed: {actor_plan.get('target_speed')}")
+                    print(f"[DEBUG]   plan length: {len(actor_plan.get('plan') or [])}")
+                    custom_behavior = self._build_custom_actor_behavior(actor_plan)
+                    if custom_behavior is None:
+                        print(f"[DEBUG]   -> Behavior is None, using default WaypointFollower")
+                        custom_behavior = WaypointFollower(
                             actor_plan["actor"],
                             target_speed=actor_plan["target_speed"],
                             plan=actor_plan["plan"],
                             avoid_collision=actor_plan["avoid_collision"],
                             name=f"FollowWaypoints-{actor_plan['name']}",
                         )
-                    )
+                    else:
+                        print(f"[DEBUG]   -> Built custom behavior: {type(custom_behavior).__name__}")
+                    subbehavior.add_child(custom_behavior)
 
             scenario_behaviors = []
             blackboard_list = []

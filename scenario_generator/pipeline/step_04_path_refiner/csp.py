@@ -1,3 +1,4 @@
+import math
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -34,6 +35,17 @@ def _default_start_end_in_crop(segments_detailed: List[Dict[str, Any]], crop: Cr
     if se is None:
         return None
     s, e = se
+    cum = _polyline_cumdist(pts)
+    inside_len = cum[e] - cum[s]
+    total_len = cum[-1] if cum else 0.0
+    crop_w = max(0.0, crop.xmax - crop.xmin)
+    crop_h = max(0.0, crop.ymax - crop.ymin)
+    crop_diag = math.hypot(crop_w, crop_h)
+    min_inside = max(40.0, 0.6 * crop_diag)
+    # If the crop only captures a tiny slice of a long corridor, keep the full tail
+    # so routes are not truncated to a few dozen meters.
+    if inside_len < min_inside and total_len > 2.0 * crop_diag:
+        e = len(pts) - 1
     return s, e, pts
 
 

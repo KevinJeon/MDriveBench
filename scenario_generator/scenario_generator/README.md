@@ -1,81 +1,46 @@
-# Automated Scenario Generation Pipeline
+# Scenario Generator (Schema-First)
 
-## Overview
+This package is streamlined around JSON schema generation and the core scenario pipeline.
+It does not include the legacy natural-language auto-generation stack.
 
-This pipeline automatically generates diverse, valid driving scenarios for multi-agent coordination testing. It uses an LLM-based approach with:
+## Entry points
 
-1. **Creative Generation**: Produces varied scenario descriptions within pipeline capabilities
-2. **Constraint Validation**: Ensures scenarios are expressible in the IR format
-3. **Generation Loop**: Attempts generation with automatic retry on failure
-4. **Diversity Tracking**: Prevents duplicate or overly similar scenarios
+- Schema generation + pipeline:
+  - `python scenario_generator/generate_schema_scenarios.py --output-dir log_schema`
+  - `python scenario_generator/generate_schema_scenarios.py --categories "Unprotected Left Turn" --template-only`
 
-## Architecture
+- Direct pipeline run (existing scenario text files or single description):
+  - `python scenario_generator/run_scenario_pipeline.py --scenarios-file scenario_generator/scenarios.txt --out-dir log`
+  - `python scenario_generator/run_scenario_pipeline.py --town Town05 --description "Vehicle 1 ..." --out-dir log_single`
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    SCENARIO META-GENERATOR                       │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Category Selection (weighted by coverage gaps)              │
-│  2. Difficulty Sampling (1-5)                                   │
-│  3. Constraint Template Selection                               │
-│  4. Creative Variation Injection                                │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                 STRUCTURED PROMPT BUILDER                        │
-├─────────────────────────────────────────────────────────────────┤
-│  - Pipeline capability constraints                              │
-│  - Topology requirements                                        │
-│  - Actor type/count limits                                      │
-│  - Spatial arrangement vocabulary                               │
-│  - Timing vocabulary (spawn-relative)                           │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    LLM SCENARIO WRITER                           │
-├─────────────────────────────────────────────────────────────────┤
-│  Generates natural language scenario description                │
-│  that is expressive yet parseable                               │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                 CONSTRAINT VALIDATOR                             │
-├─────────────────────────────────────────────────────────────────┤
-│  Stage A: Structural validation (topology, actor types)         │
-│  Stage B: Semantic validation (no impossible arrangements)      │
-│  Stage C: Parse validation (heuristic extraction checks)        │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-               ┌───────────┴───────────┐
-               │                       │
-          [PASS]                  [FAIL + feedback]
-               │                       │
-               ▼                       ▼
-┌─────────────────────┐    ┌─────────────────────────┐
-│  Emit to batch      │    │  Retry with repairs     │
-│  (scenarios.json)   │    │  (up to N attempts)     │
-└─────────────────────┘    └─────────────────────────┘
-```
+## What the pipeline does
 
-## Usage
+1. Crop region selection from town nodes
+2. Legal path generation in the crop
+3. Path picking with the scenario description
+4. Path refinement (spawn points, lane changes, timing)
+5. Object placement (static props, pedestrians, etc.)
+6. Optional route conversion and CARLA alignment
 
-```bash
-# Generate 50 new scenarios across all categories
-python scenario_builder_api/generate_scenarios.py --count 50 --output-dir new_scenarios
+## Outputs
 
-# Generate scenarios for specific categories only
-python scenario_builder_api/generate_scenarios.py --categories "Highway On-Ramp Merge" --count 20
+Per scenario output directory contains:
+- `scenario_input.txt`
+- `legal_paths_prompt.txt`
+- `legal_paths_detailed.json`
+- `path_picker_prompt.txt`
+- `picked_paths_detailed.json`
+- `picked_paths_refined.json`
+- `scene_objects.json`
+- `scene_objects.png`
 
-# Validate existing scenarios.json
-python scenario_builder_api/scenario_generator/validator.py --input scenarios.json
+Schema generation additionally writes:
+- `scenario_spec.json`
+- `scenario_description.txt`
 
-# Generate with specific difficulty range
-python scenario_builder_api/generate_scenarios.py --difficulties 3 4 5 --count 30
-```
+## Programmatic usage
 
-## Supported Categories
+If you need to run the pipeline from Python, use:
+- `scenario_generator/scenario_generator/pipeline_runner.py`
 
-See `capabilities.py` for the full mapping of categories to pipeline features.
+This provides `PipelineRunner` (shared model, in-process run) and `GenerationLogger`.

@@ -96,6 +96,85 @@ def visualize(
         parts = asset_id.split(".")
         return ".".join(parts[-2:]) if len(parts) >= 2 else asset_id
 
+    def _format_distance_m(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            dist = float(value)
+        except Exception:
+            return None
+        if abs(dist - round(dist)) < 1e-6:
+            return f"{int(round(dist))}m"
+        return f"{dist:.1f}m"
+
+    def _format_trigger(trigger: Any) -> Optional[str]:
+        if not isinstance(trigger, dict):
+            return None
+        ttype = str(trigger.get("type", "")).strip()
+        if ttype != "distance_to_vehicle":
+            return None
+        vehicle = str(trigger.get("vehicle", "")).strip()
+        if not vehicle:
+            return None
+        dist_str = _format_distance_m(trigger.get("distance_m"))
+        if dist_str:
+            return f"trigger: {vehicle} <= {dist_str}"
+        return f"trigger: {vehicle} distance"
+
+    def _format_action(action: Any) -> Optional[str]:
+        if not isinstance(action, dict):
+            return None
+        atype = str(action.get("type", "")).strip()
+        if not atype:
+            return None
+        if atype == "hard_brake":
+            return "action: hard_brake"
+        if atype == "start_motion":
+            direction = str(action.get("direction") or "").strip()
+            if direction:
+                return f"action: start_motion {direction}"
+            return "action: start_motion"
+        if atype == "lane_change":
+            direction = str(action.get("direction") or "").strip()
+            target_vehicle = str(action.get("target_vehicle") or "").strip()
+            if direction:
+                return f"action: lane_change {direction}"
+            if target_vehicle:
+                return f"action: lane_change -> {target_vehicle} lane"
+            return "action: lane_change"
+        return f"action: {atype}"
+
+    def _format_behavior_label(a: Dict[str, Any]) -> Optional[str]:
+        lines = []
+        tline = _format_trigger(a.get("trigger"))
+        if tline:
+            lines.append(tline)
+        aline = _format_action(a.get("action"))
+        if aline:
+            lines.append(aline)
+        if not lines:
+            return None
+        return "\n".join(lines)
+
+    def _behavior_signature(a: Dict[str, Any]) -> str:
+        trigger = a.get("trigger")
+        action = a.get("action")
+        parts = []
+        if isinstance(trigger, dict):
+            ttype = str(trigger.get("type", "")).strip()
+            vehicle = str(trigger.get("vehicle", "")).strip()
+            dist_str = _format_distance_m(trigger.get("distance_m")) or ""
+            parts.append(f"t:{ttype}:{vehicle}:{dist_str}")
+        if isinstance(action, dict):
+            atype = str(action.get("type", "")).strip()
+            direction = str(action.get("direction") or "").strip()
+            target_vehicle = str(action.get("target_vehicle") or "").strip()
+            parts.append(f"a:{atype}:{direction}:{target_vehicle}")
+        return "|".join(parts) if parts else "none"
+
+    def _wrap_label(label: str, width: int = 32) -> str:
+        return "\n".join(textwrap.fill(line, width=width) for line in label.splitlines())
+
     def _actor_bbox_dims_from_actor_or_cache(a: Dict[str, Any]) -> Tuple[float, float]:
         """
         Returns (length,width) in meters, or (0,0) if unknown.
@@ -430,7 +509,7 @@ def visualize(
 
     # Cluster labels by approximate position + asset_short to avoid stacked cone labels.
     BUCKET_M = 1.2
-    clusters: Dict[Tuple[int, int, str], List[int]] = {}
+    clusters: Dict[Tuple[int, int, str, str], List[int]] = {}
 
     actor_pts = []
     for j, a in enumerate(actors_world):
@@ -442,7 +521,8 @@ def visualize(
         asset_short = _get_asset_short(str(a.get("asset_id", "")), str(a.get("category", "object")))
         bx = int(round(float(x) / BUCKET_M))
         by = int(round(float(y) / BUCKET_M))
-        key = (bx, by, asset_short)
+        behavior_sig = _behavior_signature(a)
+        key = (bx, by, asset_short, behavior_sig)
         clusters.setdefault(key, []).append(j)
         actor_pts.append((float(x), float(y), a))
 
@@ -517,7 +597,7 @@ def visualize(
     forbidden = _collect_forbidden_bboxes(fig, ax, forbidden_artists, pad_px=5.0)
 
     label_items = []
-    for (bx, by, asset_short), idxs in clusters.items():
+    for (bx, by, asset_short, behavior_sig), idxs in clusters.items():
         # centroid anchor (better than "first actor")
         xs = []
         ys = []
@@ -538,6 +618,11 @@ def visualize(
         else:
             actor_id = a0.get("id", "obj")
             label = f"{actor_id}: {asset_short}"
+
+        behavior_label = _format_behavior_label(a0)
+        if behavior_label:
+            label = f"{label}\n{behavior_label}"
+        label = _wrap_label(label, width=36)
 
         label_items.append({"x": x0, "y": y0, "label": label, "zorder": 10})
 

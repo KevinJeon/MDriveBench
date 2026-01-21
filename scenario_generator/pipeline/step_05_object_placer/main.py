@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,10 +17,12 @@ from .assets import get_asset_bbox, keyword_filter_assets, load_assets
 from .csp import (
     _compute_merge_min_s_by_vehicle,
     build_stage2_constraints_prompt,
+    CandidatePlacement,
     expand_group_to_actors,
     solve_weighted_csp_with_extension,
     validate_actor_specs,
 )
+from .constants import LATERAL_TO_M
 from .filters import _contains_exact_quote, _should_drop_stage1_entity
 from .guardrails import (
     apply_after_turn_segment_corrections,
@@ -42,6 +45,13 @@ def run_object_placer(args, model=None, tokenizer=None):
     Main pipeline body, optionally reusing a provided model/tokenizer.
     """
     t_obj_start = time.time()
+    stats = getattr(args, "stats", None)
+
+    def _bump(key: str, amount: int = 1) -> None:
+        if stats is None:
+            return
+        stats[key] = int(stats.get(key, 0)) + amount
+
     # Set default values for optional args that may not be provided by SimpleNamespace
     if not hasattr(args, 'placement_mode'):
         args.placement_mode = "csp"  # default to CSP-based placement
@@ -64,6 +74,19 @@ def run_object_placer(args, model=None, tokenizer=None):
     nodes_field = picked_payload.get("nodes")
     if not nodes_field:
         raise SystemExit("[ERROR] picked_paths_detailed.json missing 'nodes' field")
+
+    resolved_nodes_path = resolve_nodes_path(args.picked_paths, str(nodes_field), args.nodes_root)
+    if not os.path.exists(resolved_nodes_path):
+        raise SystemExit(f"[ERROR] nodes path not found: {resolved_nodes_path}\n"
+                         f"Tip: pass --nodes-root to resolve relative paths.")
+    nodes: Optional[Dict[str, Any]] = None
+    all_segments: List[Dict[str, Any]] = []
+    seg_by_id: Dict[int, np.ndarray] = {}
+    if args.placement_mode == "csp" or args.viz:
+        nodes = load_nodes(resolved_nodes_path)
+        all_segments = build_segments_from_nodes(nodes)
+        seg_by_id = {int(s["seg_id"]): s["points"] for s in all_segments}
+        seg_by_id = _override_seg_points_with_picked(picked, seg_by_id)
 
     all_assets = load_assets(args.carla_assets)
 
@@ -107,6 +130,7 @@ def run_object_placer(args, model=None, tokenizer=None):
     try:
         stage1_obj = parse_llm_json(stage1_text, required_top_keys=["entities"])
     except Exception:
+        _bump("object_stage1_json_repair")
         repair_prompt = (
             "Return JSON ONLY with top-level key 'entities' (a list). No prose.\n"
             "If you previously wrote anything else, convert it into the required JSON now.\n\n"
@@ -153,6 +177,7 @@ def run_object_placer(args, model=None, tokenizer=None):
 
         # One-shot repair: ask the model to point to an exact substring.
         try:
+            _bump("object_stage1_evidence_repair")
             prompt = (
                 "Return JSON ONLY: {\"evidence\": \"...\"}.\n"
                 "The evidence MUST be an EXACT substring (<=20 words) copied from DESCRIPTION that explicitly mentions the actor (not just a location).\n"
@@ -177,18 +202,229 @@ def run_object_placer(args, model=None, tokenizer=None):
         except Exception:
             return
 
+    def _sanitize_trigger_action(ent: Dict[str, Any]) -> None:
+        trigger = ent.get("trigger")
+        action = ent.get("action")
+
+        # Trigger sanitization
+        if not isinstance(trigger, dict):
+            ent["trigger"] = None
+        else:
+            ttype = str(trigger.get("type", "")).strip()
+            if ttype != "distance_to_vehicle":
+                ent["trigger"] = None
+            else:
+                vehicle = str(trigger.get("vehicle", "")).strip()
+                m = re.match(r"^(?:Vehicle|vehicle)\s+(\d+)$", vehicle)
+                if not m:
+                    ent["trigger"] = None
+                else:
+                    vehicle = f"Vehicle {m.group(1)}"
+                    try:
+                        distance_m = float(trigger.get("distance_m", 8.0))
+                    except Exception:
+                        distance_m = 8.0
+                    # Clamp to a sane range
+                    distance_m = max(1.0, min(50.0, distance_m))
+                    evidence = str(trigger.get("evidence", "")).strip()
+                    if evidence and not _contains_exact_quote(args.description, evidence):
+                        evidence = ""
+                    ent["trigger"] = {
+                        "type": "distance_to_vehicle",
+                        "vehicle": vehicle,
+                        "distance_m": distance_m,
+                        "evidence": evidence,
+                    }
+
+        # Action sanitization
+        if not isinstance(action, dict):
+            ent["action"] = None
+        else:
+            atype = str(action.get("type", "")).strip()
+            if atype not in ("start_motion", "hard_brake", "lane_change"):
+                ent["action"] = None
+            else:
+                direction = action.get("direction")
+                direction = str(direction).strip().lower() if direction is not None else ""
+                if direction not in ("left", "right"):
+                    direction = None
+                target_vehicle = action.get("target_vehicle")
+                target_vehicle = str(target_vehicle).strip() if target_vehicle else None
+                if target_vehicle and not re.match(r"^Vehicle\s+\d+$", target_vehicle):
+                    target_vehicle = None
+                ent["action"] = {
+                    "type": atype,
+                    "direction": direction,
+                    "target_vehicle": target_vehicle,
+                }
+
+    def _extract_trigger_candidates(description: str) -> List[Dict[str, Any]]:
+        patterns = [
+            re.compile(
+                r"(?i)\b(?:when|once|if)\s+(Vehicle\s+\d+)\s+(?:gets|is)\s+within\s+(\d+(?:\.\d+)?)\s*(?:m|meter|meters|metres)\b"
+            ),
+            re.compile(
+                r"(?i)\b(?:when|once|if)\s+(Vehicle\s+\d+)\s+gets\s+close\b"
+            ),
+            re.compile(
+                r"(?i)\b(?:when|once|if)\s+(Vehicle\s+\d+)\s+approaches\b"
+            ),
+        ]
+        candidates: List[Dict[str, Any]] = []
+        for pat in patterns:
+            for m in pat.finditer(description):
+                vehicle = m.group(1)
+                distance_m = 8.0
+                if m.lastindex and m.lastindex >= 2:
+                    try:
+                        distance_m = float(m.group(2))
+                    except Exception:
+                        distance_m = 8.0
+                candidates.append({
+                    "vehicle": vehicle,
+                    "distance_m": distance_m,
+                    "evidence": m.group(0).strip(),
+                    "span": m.span(),
+                })
+        return candidates
+
+    def _find_substring_span(text: str, sub: str) -> Optional[Tuple[int, int]]:
+        if not sub:
+            return None
+        idx = text.find(sub)
+        if idx == -1:
+            return None
+        return idx, idx + len(sub)
+
+    def _sentence_bounds(text: str, idx: int) -> Tuple[int, int]:
+        seps = ".!?"
+        start = -1
+        for sep in seps:
+            start = max(start, text.rfind(sep, 0, idx))
+        start = 0 if start == -1 else start + 1
+        end_positions = [text.find(sep, idx) for sep in seps if text.find(sep, idx) != -1]
+        end = min(end_positions) if end_positions else len(text)
+        return start, end
+
+    def _apply_trigger_fallback(entities: List[Dict[str, Any]], description: str) -> None:
+        candidates = _extract_trigger_candidates(description)
+        if not candidates:
+            return
+        used = set()
+
+        for ent in entities:
+            if ent.get("trigger") is not None:
+                continue
+            if ent.get("action") is None:
+                continue
+            mention = str(ent.get("mention") or "")
+            evidence = str(ent.get("evidence") or "")
+            anchor_span = _find_substring_span(description, mention) or _find_substring_span(description, evidence)
+            anchor_idx = anchor_span[0] if anchor_span else None
+
+            available = [(i, c) for i, c in enumerate(candidates) if i not in used]
+            if not available:
+                continue
+
+            picked = None
+            picked_idx = None
+            if anchor_idx is not None:
+                sent_start, sent_end = _sentence_bounds(description, anchor_idx)
+                in_sentence = []
+                for idx, cand in available:
+                    span = cand.get("span", (0, 0))
+                    if span[0] >= sent_start and span[1] <= sent_end:
+                        in_sentence.append((idx, cand))
+                if in_sentence:
+                    def _dist(c):
+                        span = c.get("span", (0, 0))
+                        mid = (span[0] + span[1]) / 2.0
+                        return abs(mid - anchor_idx)
+                    picked_idx, picked = min(in_sentence, key=lambda ic: _dist(ic[1]))
+                    used.add(picked_idx)
+                elif len(available) == 1:
+                    picked_idx, picked = available[0]
+                    used.add(picked_idx)
+                else:
+                    def _dist(c):
+                        span = c.get("span", (0, 0))
+                        mid = (span[0] + span[1]) / 2.0
+                        return abs(mid - anchor_idx)
+                    picked_idx, picked = min(available, key=lambda ic: _dist(ic[1]))
+                    used.add(picked_idx)
+            else:
+                if len(available) == 1 and len(entities) == 1:
+                    picked_idx, picked = available[0]
+                    used.add(picked_idx)
+
+            if picked:
+                ent["trigger"] = {
+                    "type": "distance_to_vehicle",
+                    "vehicle": picked["vehicle"],
+                    "distance_m": float(picked["distance_m"]),
+                    "evidence": picked["evidence"],
+                }
+                ent_id = ent.get("entity_id", "entity")
+                print(f"[INFO] Stage1 trigger fallback: {ent_id} -> {picked['vehicle']} @ {picked['distance_m']}m")
+
+    def _is_moving_entity(ent: Dict[str, Any]) -> bool:
+        kind = str(ent.get("actor_kind") or "").strip()
+        motion_hint = str(ent.get("motion_hint") or "").strip().lower()
+        speed_hint = str(ent.get("speed_hint") or "").strip().lower()
+        action = ent.get("action")
+        if isinstance(action, dict) and action.get("type") in ("start_motion", "hard_brake", "lane_change"):
+            return True
+        if motion_hint in ("crossing", "follow_lane"):
+            return True
+        if speed_hint in ("slow", "normal", "fast", "erratic"):
+            return True
+        if motion_hint == "static" or speed_hint == "stopped":
+            return False
+        return kind in ("walker", "cyclist", "npc_vehicle")
+
+    def _default_trigger_vehicle(ent: Dict[str, Any]) -> str:
+        vehicle = str(ent.get("affects_vehicle") or "").strip()
+        if vehicle.lower() in ("ego", "ego vehicle", "ego_vehicle"):
+            return "Vehicle 1"
+        match = re.search(r"(\d+)", vehicle)
+        if match:
+            return f"Vehicle {match.group(1)}"
+        return "Vehicle 1"
+
+    def _apply_default_movement_triggers(entities: List[Dict[str, Any]]) -> None:
+        for ent in entities:
+            if not _is_moving_entity(ent):
+                continue
+            if ent.get("trigger") is None:
+                ent["trigger"] = {
+                    "type": "distance_to_vehicle",
+                    "vehicle": _default_trigger_vehicle(ent),
+                    "distance_m": 8.0,
+                    "evidence": "",
+                }
+            if ent.get("action") is None:
+                ent["action"] = {
+                    "type": "start_motion",
+                    "direction": None,
+                    "target_vehicle": None,
+                }
+            _sanitize_trigger_action(ent)
+
     for e in entities:
         _repair_evidence_with_llm(e)
+        _sanitize_trigger_action(e)
 
         drop, reason = _should_drop_stage1_entity(e, args.description)
         if drop:
             dropped_stage1.append((str(e.get("entity_id")), reason, str(e.get("mention") or "")))
             continue
         filtered_entities.append(e)
+    _apply_trigger_fallback(filtered_entities, args.description)
     if dropped_stage1:
         for ent_id, reason, mention in dropped_stage1[:50]:
             print(f"[WARNING] Stage1 drop: {ent_id}: {reason}; mention='{mention[:60]}'")
     entities = filtered_entities
+    _apply_default_movement_triggers(entities)
     valid_entity_ids = set(str(e.get("entity_id")) for e in entities if e.get("entity_id"))
     print(f"[TIMING] Stage1 entity filtering+evidence repair: {time.time() - t0:.2f}s", flush=True)
     print(f"[TIMING] Stage1 total: {time.time() - t_stage1_start:.2f}s", flush=True)
@@ -335,12 +571,17 @@ def run_object_placer(args, model=None, tokenizer=None):
                 options = _merge_assets(large, options)
             else:
                 options.sort(key=lambda a: (_asset_matches_tokens(a, SMALL_STATIC_TOKENS), a.asset_id))
+        if occlusion_hint and kind == "parked_vehicle":
+            options = _merge_assets(top_vehicle_occluders, options)
+            options.sort(key=_asset_area, reverse=True)
 
         # Key by entity_id for Stage 2
         per_entity_options[entity_id] = [
             {"asset_id": a.asset_id, "category": a.category, "tags": a.tags[:6]} for a in options
         ]
     print(f"[TIMING] asset matching for {len(entities)} entities: {time.time() - t0:.2f}s", flush=True)
+
+    ego_spawns: List[Dict[str, Any]] = []
 
     # Handle empty entities case early
     if not entities:
@@ -369,6 +610,7 @@ def run_object_placer(args, model=None, tokenizer=None):
             try:
                 stage2_obj = parse_llm_json(stage2_text, required_top_keys=["actors"])
             except ValueError as exc:
+                _bump("object_stage2_json_repair")
                 repair_prompt = build_repair_prompt(stage2_text, [f"JSON parse failed: {exc}"])
                 repair_text = generate_with_model(
                     model=model,
@@ -386,6 +628,7 @@ def run_object_placer(args, model=None, tokenizer=None):
 
             errs = validate_stage2_output(actors, vehicle_segments)
             if errs:
+                _bump("object_stage2_validation_repair")
                 repair_prompt = build_repair_prompt(stage2_text, errs)
                 repair_text = generate_with_model(
                     model=model,
@@ -405,15 +648,11 @@ def run_object_placer(args, model=None, tokenizer=None):
             # CSP mode: LLM emits symbolic preferences; solver chooses anchors.
             # We need geometry (seg_by_id) to enumerate candidates; build it here.
             t0 = time.time()
-            resolved_nodes_path = resolve_nodes_path(args.picked_paths, str(nodes_field), args.nodes_root)
-            if not os.path.exists(resolved_nodes_path):
-                raise SystemExit(f"[ERROR] nodes path not found: {resolved_nodes_path}\n"
-                                 f"Tip: pass --nodes-root to resolve relative paths.")
-            nodes = load_nodes(resolved_nodes_path)
-            all_segments = build_segments_from_nodes(nodes)
-            seg_by_id: Dict[int, np.ndarray] = {int(s["seg_id"]): s["points"] for s in all_segments}
-            # Override with refined polylines from picked paths (so CSP uses accurate path lengths)
-            seg_by_id = _override_seg_points_with_picked(picked, seg_by_id)
+            if nodes is None:
+                nodes = load_nodes(resolved_nodes_path)
+                all_segments = build_segments_from_nodes(nodes)
+                seg_by_id = {int(s["seg_id"]): s["points"] for s in all_segments}
+                seg_by_id = _override_seg_points_with_picked(picked, seg_by_id)
             merge_min_s_by_vehicle = _compute_merge_min_s_by_vehicle(picked_payload, picked, seg_by_id)
             print(f"[TIMING] Stage2 load nodes+build segments: {time.time() - t0:.2f}s", flush=True)
 
@@ -436,6 +675,7 @@ def run_object_placer(args, model=None, tokenizer=None):
             try:
                 stage2_obj = parse_llm_json(stage2_text, required_top_keys=["actor_specs"])
             except Exception:
+                _bump("object_stage2_json_repair")
                 repair_prompt = (
                     "Return JSON ONLY with top-level key 'actor_specs' (a list). No prose.\n"
                     "If needed, convert your previous output into the required JSON now.\n\n"
@@ -458,6 +698,30 @@ def run_object_placer(args, model=None, tokenizer=None):
             for w in warns[:50]:
                 print("[WARNING] Stage2(CSP): " + w)
 
+            # Extract ego vehicle spawn positions BEFORE CSP solve so CSP can enforce buffer constraints
+            ego_spawns = []
+            for p in picked:
+                vehicle_name = p.get("vehicle", "")
+                sig = p.get("signature", {}) if isinstance(p.get("signature"), dict) else {}
+                entry = sig.get("entry", {}) if isinstance(sig.get("entry"), dict) else {}
+                
+                if entry and isinstance(entry, dict):
+                    entry_point = entry.get("point", {})
+                    if isinstance(entry_point, dict):
+                        ego_x = entry_point.get("x")
+                        ego_y = entry_point.get("y")
+                        heading = entry.get("heading_deg", 0.0)
+                        
+                        if ego_x is not None and ego_y is not None:
+                            ego_spawns.append({
+                                "vehicle": vehicle_name,
+                                "spawn": {
+                                    "x": float(ego_x),
+                                    "y": float(ego_y),
+                                    "yaw_deg": float(heading)
+                                }
+                            })
+
             if not actor_specs:
                 actors = []
             else:
@@ -472,6 +736,7 @@ def run_object_placer(args, model=None, tokenizer=None):
                     merge_min_s_by_vehicle=merge_min_s_by_vehicle,
                     min_sep_scale=1.0,
                     max_extension_iterations=3,
+                    ego_spawns=ego_spawns,
                 )
                 print(f"[TIMING] CSP solve (with extension): {time.time() - t0:.2f}s", flush=True)
                 print("[INFO] CSP solve debug: " + json.dumps(dbg, indent=2))
@@ -499,6 +764,8 @@ def run_object_placer(args, model=None, tokenizer=None):
                         "semantic": spec.get("semantic", sid),
                         "category": spec["category"],
                         "asset_id": asset_id,
+                        "trigger": spec.get("trigger"),
+                        "action": spec.get("action"),
                         "placement": {
                             "target_vehicle": f"Vehicle {cand.vehicle_num}" if cand.vehicle_num > 0 else None,
                             "segment_index": int(cand.segment_index),
@@ -551,6 +818,118 @@ def run_object_placer(args, model=None, tokenizer=None):
     apply_after_turn_segment_corrections(actors, stage1_obj.get("entities", []), picked, seg_by_id)
     # Guardrail: if Stage1 said "in_intersection", keep it on a turn-connector segment.
     apply_in_intersection_segment_corrections(actors, stage1_obj.get("entities", []), picked, seg_by_id)
+
+    # Expand quantity>1 entities for llm_anchor placement mode.
+    if args.placement_mode == "llm_anchor":
+        stage1_entities = stage1_obj.get("entities", [])
+        entity_by_id = {
+            str(e.get("entity_id")): e for e in stage1_entities if e.get("entity_id")
+        }
+
+        def _segment_id_for_actor(actor: Dict[str, Any]) -> Optional[int]:
+            placement = actor.get("placement", {}) if isinstance(actor.get("placement", {}), dict) else {}
+            seg_id = placement.get("seg_id")
+            if seg_id is not None:
+                return int(seg_id)
+            tv = placement.get("target_vehicle")
+            try:
+                seg_idx = int(placement.get("segment_index", 0))
+            except Exception:
+                seg_idx = 0
+            if not tv or seg_idx <= 0:
+                return None
+            picked_entry = next((p for p in picked if p.get("vehicle") == tv), None)
+            if not picked_entry:
+                return None
+            seg_ids = (picked_entry.get("signature", {}) or {}).get("segment_ids", [])
+            if not isinstance(seg_ids, list) or seg_idx > len(seg_ids):
+                return None
+            return int(seg_ids[seg_idx - 1])
+
+        def _normalize_group_pattern(ent: Dict[str, Any], qty: int) -> Optional[Dict[str, Any]]:
+            if qty <= 1:
+                return None
+            patt = str(ent.get("group_pattern", "unknown"))
+            if patt == "diagonal":
+                patt = "along_lane"
+            if patt not in ("across_lane", "along_lane", "scatter", "unknown"):
+                patt = "along_lane"
+            sl = ent.get("start_lateral")
+            el = ent.get("end_lateral")
+            if sl is not None and str(sl) not in LATERAL_TO_M:
+                sl = None
+            if el is not None and str(el) not in LATERAL_TO_M:
+                el = None
+            return {"pattern": patt, "start_lateral": sl, "end_lateral": el, "spacing_bucket": "auto"}
+
+        expanded: List[Dict[str, Any]] = []
+        for actor in actors:
+            entity_id = str(actor.get("entity_id") or actor.get("id") or "")
+            if entity_id:
+                actor.setdefault("id", entity_id)
+            ent = entity_by_id.get(entity_id)
+            if not ent:
+                expanded.append(actor)
+                continue
+
+            if "trigger" not in actor and ent.get("trigger") is not None:
+                actor["trigger"] = ent.get("trigger")
+            if "action" not in actor and ent.get("action") is not None:
+                actor["action"] = ent.get("action")
+
+            try:
+                qty = int(ent.get("quantity", 1))
+            except Exception:
+                qty = 1
+            qty = max(1, qty)
+            if qty <= 1:
+                expanded.append(actor)
+                continue
+
+            seg_id = _segment_id_for_actor(actor)
+            if seg_id is None or seg_id not in seg_by_id:
+                print(
+                    f"[WARNING] {entity_id}: missing seg_id for group expansion; "
+                    f"expected {qty} actors, placing 1",
+                    flush=True,
+                )
+                expanded.append(actor)
+                continue
+
+            placement = actor.get("placement", {})
+            if isinstance(placement, dict):
+                placement["seg_id"] = int(seg_id)
+                actor["placement"] = placement
+
+            spec = dict(ent)
+            spec["id"] = entity_id
+            spec["quantity"] = qty
+            spec["group_pattern"] = _normalize_group_pattern(ent, qty)
+            spec["category"] = actor.get("category", "static")
+            spec["actor_kind"] = ent.get("actor_kind", "static_prop")
+            spec["asset_id"] = actor.get("asset_id")
+
+            chosen = CandidatePlacement(
+                vehicle_num=0,
+                segment_index=int(placement.get("segment_index", 1) or 1),
+                seg_id=int(seg_id),
+                s_along=float(placement.get("s_along", 0.5)),
+                lateral_relation=str(placement.get("lateral_relation", "center") or "center"),
+                x=0.0,
+                y=0.0,
+                yaw_deg=0.0,
+                path_s_m=0.0,
+                base_score=0.0,
+            )
+            expanded_children = expand_group_to_actors(actor, spec, chosen, seg_by_id)
+            if len(expanded_children) < qty:
+                print(
+                    f"[WARNING] {entity_id}: expected {qty} actors but only got {len(expanded_children)} "
+                    f"(group_pattern={spec.get('group_pattern')}, seg_id={seg_id})",
+                    flush=True,
+                )
+            expanded.extend(expanded_children)
+        actors = expanded
 
     actors_world: List[Dict[str, Any]] = []
     for a in actors:
@@ -722,11 +1101,48 @@ def run_object_placer(args, model=None, tokenizer=None):
                 if placed_for_entity < qty:
                     print(f"  - {eid}: expected {qty}, placed {placed_for_entity}", flush=True)
 
+    # Verify actors maintain minimum buffer from ego spawns (buffer enforced in CSP during placement)
+    MIN_BUFFER_TO_ACTORS_M = 15.0  # Minimum buffer from ego spawn to any actor
+    if ego_spawns:
+        violations = []
+        for actor in actors_world:
+            actor_spawn = actor.get("spawn", {})
+            if not isinstance(actor_spawn, dict):
+                continue
+            ax = actor_spawn.get("x")
+            ay = actor_spawn.get("y")
+            if ax is None or ay is None:
+                continue
+            
+            for ego in ego_spawns:
+                ego_spawn = ego.get("spawn", {})
+                ex = ego_spawn.get("x")
+                ey = ego_spawn.get("y")
+                if ex is None or ey is None:
+                    continue
+                
+                dist = math.hypot(float(ax) - float(ex), float(ay) - float(ey))
+                if dist < MIN_BUFFER_TO_ACTORS_M:
+                    actor_id = actor.get("id", "actor_?")
+                    vehicle_id = ego.get("vehicle", "Vehicle?")
+                    violations.append({
+                        "actor": actor_id,
+                        "vehicle": vehicle_id,
+                        "distance": dist,
+                        "required": MIN_BUFFER_TO_ACTORS_M
+                    })
+        
+        if violations:
+            print(f"[ERROR] {len(violations)} actor(s) violate ego spawn buffer constraint:", flush=True)
+            for v in violations:
+                print(f"  {v['actor']} only {v['distance']:.1f}m from {v['vehicle']} (min {v['required']}m)", flush=True)
+
     out_payload = {
         "source_picked_paths": args.picked_paths,
         "nodes": resolved_nodes_path,
         "crop_region": crop_region,
         "ego_picked": picked,
+        "ego_spawns": ego_spawns,
         "actors": actors_world,
         "macro_plan": stage1_obj.get("entities", []),
     }
@@ -767,8 +1183,9 @@ def main():
 
     # LLM gen controls
     ap.add_argument("--max-new-tokens", type=int, default=1200)
-    ap.add_argument("--do-sample", action="store_true")
-    ap.add_argument("--temperature", type=float, default=0.2)
+    ap.add_argument("--do-sample", action="store_true", default=True, help="Enable sampling (default: True)")
+    ap.add_argument("--no-sample", dest="do_sample", action="store_false", help="Disable sampling")
+    ap.add_argument("--temperature", type=float, default=0.5)
     ap.add_argument("--top-p", type=float, default=0.95)
 
     args = ap.parse_args()

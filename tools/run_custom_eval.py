@@ -279,6 +279,44 @@ def detect_ego_routes(routes_dir: Path) -> int:
     return count
 
 
+def detect_scenario_subfolders(routes_dir: Path) -> List[Path]:
+    """
+    Check if routes_dir contains multiple scenario subfolders (each with their own ego routes).
+    
+    Returns a list of subfolders that each contain at least one ego route.
+    If routes_dir itself contains ego routes directly (not in subfolders), returns empty list.
+    """
+    # First check if there are ego routes directly in routes_dir (not in subfolders)
+    for xml_path in routes_dir.glob("*.xml"):
+        try:
+            _, _, role = parse_route_metadata(xml_path.read_bytes())
+            if role == "ego":
+                # routes_dir itself is a scenario directory
+                return []
+        except Exception:
+            continue
+    
+    # Check subfolders for ego routes
+    scenario_folders = []
+    for subdir in sorted(routes_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+        # Check if this subfolder has ego routes
+        has_ego = False
+        for xml_path in subdir.rglob("*.xml"):
+            try:
+                _, _, role = parse_route_metadata(xml_path.read_bytes())
+                if role == "ego":
+                    has_ego = True
+                    break
+            except Exception:
+                continue
+        if has_ego:
+            scenario_folders.append(subdir)
+    
+    return scenario_folders
+
+
 def read_manifest(routes_dir: Path) -> tuple[Path | None, Dict[str, List[Dict[str, str]]] | None]:
     manifest_path = routes_dir / "actors_manifest.json"
     if not manifest_path.exists():
@@ -360,6 +398,64 @@ def main() -> None:
         routes_dir = args.routes_dir.expanduser().resolve()
         if not routes_dir.exists():
             raise FileNotFoundError(routes_dir)
+        
+        # Check if routes_dir contains multiple scenario subfolders
+        scenario_subfolders = detect_scenario_subfolders(routes_dir)
+        if scenario_subfolders:
+            print(f"Detected {len(scenario_subfolders)} scenario subfolders in {routes_dir}:")
+            for sf in scenario_subfolders:
+                print(f"  - {sf.name}")
+            print("\nRunning each scenario sequentially...\n")
+            
+            # Run each subfolder as a separate scenario
+            for i, subfolder in enumerate(scenario_subfolders, 1):
+                print(f"\n{'='*60}")
+                print(f"SCENARIO {i}/{len(scenario_subfolders)}: {subfolder.name}")
+                print(f"{'='*60}")
+                
+                # Build a new command to run this subfolder
+                new_cmd = [sys.executable, __file__]
+                new_cmd.extend(["--routes-dir", str(subfolder)])
+                new_cmd.extend(["--port", str(args.port)])
+                if args.planner:
+                    new_cmd.extend(["--planner", args.planner])
+                if args.agent:
+                    new_cmd.extend(["--agent", args.agent])
+                if args.agent_config:
+                    new_cmd.extend(["--agent-config", args.agent_config])
+                new_cmd.extend(["--repetitions", str(args.repetitions)])
+                new_cmd.extend(["--track", args.track])
+                new_cmd.extend(["--timeout", str(args.timeout)])
+                new_cmd.extend(["--carla-seed", str(args.carla_seed)])
+                new_cmd.extend(["--traffic-seed", str(args.traffic_seed)])
+                if args.debug:
+                    new_cmd.append("--debug")
+                if args.resume:
+                    new_cmd.append("--resume")
+                if not args.skip_existed:
+                    new_cmd.append("--no-skip-existed")
+                if args.add_night:
+                    new_cmd.append("--add-night")
+                if args.add_cloudy:
+                    new_cmd.append("--add-cloudy")
+                if args.add_npcs:
+                    new_cmd.append("--add-npcs")
+                if args.add_no_negotiation:
+                    new_cmd.append("--add-no-negotiation")
+                if args.dry_run:
+                    new_cmd.append("--dry-run")
+                
+                try:
+                    subprocess.run(new_cmd, check=True, env=os.environ.copy())
+                except subprocess.CalledProcessError as e:
+                    print(f"[WARNING] Scenario {subfolder.name} failed with exit code {e.returncode}")
+                    continue
+            
+            print(f"\n{'='*60}")
+            print(f"Completed all {len(scenario_subfolders)} scenarios")
+            print(f"{'='*60}")
+            return
+        
         auto_ego_num = detect_ego_routes(routes_dir)
         if auto_ego_num == 0:
             raise RuntimeError(
@@ -512,9 +608,15 @@ def main() -> None:
                     env["CUSTOM_ACTOR_ROOT"] = str(actors_root)
                 else:
                     env.pop("CUSTOM_ACTOR_ROOT", None)
+                behavior_path = variant_manifest.parent / "actors_behavior.json"
+                if behavior_path.exists():
+                    env["CUSTOM_ACTOR_BEHAVIORS"] = str(behavior_path)
+                else:
+                    env.pop("CUSTOM_ACTOR_BEHAVIORS", None)
             else:
                 env.pop("CUSTOM_ACTOR_MANIFEST", None)
                 env.pop("CUSTOM_ACTOR_ROOT", None)
+                env.pop("CUSTOM_ACTOR_BEHAVIORS", None)
 
             if negotiation.disable_comm:
                 env["COLMDRIVER_DISABLE_NEGOTIATION"] = "1"

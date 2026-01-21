@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .candidates import (
     _build_road_corridors,
@@ -27,6 +27,46 @@ from .constraints import (
     _normalize_constraints_obj,
     _opposite_cardinal,
 )
+
+
+def _lane_relation_ok(a_c: Dict[str, Any], b_c: Dict[str, Any], relation: str) -> Optional[bool]:
+    """Return True/False if checkable, else None (insufficient signal => don't over-constrain)."""
+    # Must be the same approach direction; lane relations are defined on approach.
+    if _candidate_entry_cardinal(a_c) != _candidate_entry_cardinal(b_c):
+        return False
+
+    # If entry road_id is known for both, require them to match.
+    rid_a = _candidate_entry_road_id(a_c)
+    rid_b = _candidate_entry_road_id(b_c)
+    if rid_a is not None and rid_b is not None and rid_a != rid_b:
+        return False
+
+    # If lane_id is known for both, prefer adjacent lanes.
+    lid_a = _candidate_entry_lane_id(a_c)
+    lid_b = _candidate_entry_lane_id(b_c)
+    if lid_a is not None and lid_b is not None and abs(lid_a - lid_b) != 1:
+        return False
+
+    pa = _candidate_entry_point(a_c)
+    pb = _candidate_entry_point(b_c)
+    th = _candidate_entry_heading_rad(b_c)
+    if pa is None or pb is None or th is None:
+        return None
+
+    dx = pa[0] - pb[0]
+    dy = pa[1] - pb[1]
+    # Left normal for b's heading.
+    left_x = -math.sin(th)
+    left_y = math.cos(th)
+    lat = dx * left_x + dy * left_y
+
+    # Small deadband to avoid numerical flicker.
+    eps = 0.5
+    if relation == "left":
+        return lat > eps
+    if relation == "right":
+        return lat < -eps
+    return None
 
 
 def _consistent_with_constraints(
@@ -131,6 +171,8 @@ def _solve_paths_csp(
     candidates: List[Dict[str, Any]],
     description: str = "",
     require_straight: bool = False,
+    require_on_ramp: bool = False,
+    lane_counts_by_road: Optional[Dict[int, int]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Soft CSP/backtracking over candidate paths.
@@ -172,6 +214,93 @@ def _solve_paths_csp(
     
     if lane_change_phase_req:
         print(f"[INFO] Lane change phase requirements: {lane_change_phase_req}")
+
+    def _lane_count_for_road(road_id: Optional[int]) -> Optional[int]:
+        if not lane_counts_by_road or road_id is None:
+            return None
+        try:
+            return int(lane_counts_by_road.get(road_id))
+        except Exception:
+            pass
+        try:
+            return int(lane_counts_by_road.get(str(road_id)))
+        except Exception:
+            return None
+
+    def _candidate_lane_renumbering_ok(cand: Dict[str, Any], gap_threshold_m: float = 2.0) -> bool:
+        if not lane_counts_by_road:
+            return False
+        sig = (cand or {}).get("signature", {})
+        lanes = sig.get("lanes", [])
+        roads = sig.get("roads", [])
+        segs = sig.get("segments_detailed", [])
+        if not isinstance(lanes, list) or not isinstance(roads, list):
+            return False
+        if len(lanes) < 2 or len(lanes) != len(roads):
+            return False
+
+        for i in range(1, len(lanes)):
+            try:
+                prev_lane = int(lanes[i - 1])
+                lane = int(lanes[i])
+                prev_road = int(roads[i - 1])
+                road = int(roads[i])
+            except Exception:
+                return False
+
+            if lane == prev_lane:
+                continue
+
+            if prev_road == road:
+                return False
+
+            prev_count = _lane_count_for_road(prev_road)
+            cur_count = _lane_count_for_road(road)
+            if prev_count is None or cur_count is None:
+                return False
+            if abs(cur_count - prev_count) != 1:
+                return False
+            if abs(lane - prev_lane) != 1:
+                return False
+
+            if isinstance(segs, list) and i - 1 < len(segs) and i < len(segs):
+                end_pt = segs[i - 1].get("end", {}).get("point", {})
+                start_pt = segs[i].get("start", {}).get("point", {})
+                try:
+                    end_x = float(end_pt.get("x", 0))
+                    end_y = float(end_pt.get("y", 0))
+                    start_x = float(start_pt.get("x", 0))
+                    start_y = float(start_pt.get("y", 0))
+                    gap = ((end_x - start_x) ** 2 + (end_y - start_y) ** 2) ** 0.5
+                    if gap > gap_threshold_m:
+                        return False
+                except Exception:
+                    return False
+
+        return True
+
+    def _candidate_lane_consistent(cand: Dict[str, Any]) -> bool:
+        return _candidate_lane_inconsistency(cand) == 0 or _candidate_lane_renumbering_ok(cand)
+
+    adjacent_lane_req: Dict[str, str] = {}
+    for v in vehicles:
+        req = str(unary.get(v, {}).get("adjacent_lane_req", "")).strip().lower()
+        if req in ("left", "right"):
+            adjacent_lane_req[v] = req
+
+    def _candidate_has_adjacent_lane(cand: Dict[str, Any], relation: str) -> Optional[bool]:
+        saw_unknown = False
+        for other in candidates:
+            if other is cand:
+                continue
+            ok = _lane_relation_ok(other, cand, relation)
+            if ok is True:
+                return True
+            if ok is None:
+                saw_unknown = True
+        if saw_unknown:
+            return None
+        return False
 
     def _candidate_effective_length(cand: Dict[str, Any], vehicle: str) -> float:
         base = _candidate_length(cand)
@@ -222,11 +351,188 @@ def _solve_paths_csp(
         
         return max(0.0, base - total_penalty)
 
-    role_sets = _infer_road_role_sets(candidates)
+    # For on-ramps, we need to identify ramp candidates FIRST, then use them to build role sets
     road_corridors = _build_road_corridors(candidates)
+
+    def _corridor_key(road_id: Optional[int]) -> Optional[frozenset]:
+        if road_id is None:
+            return None
+        return frozenset(road_corridors.get(road_id, {road_id}))
+
+    main_exit_corridor: Optional[frozenset] = None
+    ramp_candidates: set = set()
+    mainline_candidates: set = set()
+    clean_mainline_candidates: set = set()
+    smooth_mainline_candidates: set = set()
+    prefer_merge_lane: Optional[int] = None
+    merge_targets: set = set()
+    merge_sources: set = set()
+    if require_on_ramp:
+        lane_count_by_corridor: Dict[frozenset, int] = {}
+        if lane_counts_by_road:
+            for rid_raw, count_raw in lane_counts_by_road.items():
+                try:
+                    rid_i = int(rid_raw)
+                    count_i = int(count_raw)
+                except Exception:
+                    continue
+                ck = _corridor_key(rid_i)
+                if ck is None:
+                    continue
+                lane_count_by_corridor[ck] = max(lane_count_by_corridor.get(ck, 0), count_i)
+        else:
+            lane_ids_by_road: Dict[int, set] = {}
+            for c in candidates:
+                sig = (c or {}).get("signature", {})
+                roads = sig.get("roads", [])
+                lanes = sig.get("lanes", [])
+                if isinstance(roads, list) and isinstance(lanes, list):
+                    for rid, lid in zip(roads, lanes):
+                        try:
+                            rid_i = int(rid)
+                            lid_i = int(lid)
+                        except Exception:
+                            continue
+                        lane_ids_by_road.setdefault(rid_i, set()).add(lid_i)
+                try:
+                    ent = int(sig["entry"]["road_id"])
+                    ent_l = int(sig["entry"]["lane_id"])
+                    lane_ids_by_road.setdefault(ent, set()).add(ent_l)
+                except Exception:
+                    pass
+                try:
+                    ex = int(sig["exit"]["road_id"])
+                    ex_l = int(sig["exit"]["lane_id"])
+                    lane_ids_by_road.setdefault(ex, set()).add(ex_l)
+                except Exception:
+                    pass
+
+            for rid, lanes in lane_ids_by_road.items():
+                ck = _corridor_key(rid)
+                if ck is None:
+                    continue
+                lane_count_by_corridor[ck] = max(lane_count_by_corridor.get(ck, 0), len(lanes))
+
+        exit_corridor_counts: Dict[frozenset, int] = {}
+        for c in candidates:
+            exrid = _candidate_exit_road_id(c)
+            ck = _corridor_key(exrid)
+            if ck is None:
+                continue
+            exit_corridor_counts[ck] = exit_corridor_counts.get(ck, 0) + 1
+        if exit_corridor_counts:
+            main_exit_corridor = max(exit_corridor_counts.items(), key=lambda kv: kv[1])[0]
+
+        ramp_options: List[Tuple[int, str, int]] = []
+        if main_exit_corridor:
+            main_lanes = lane_count_by_corridor.get(main_exit_corridor, 0)
+            for c in candidates:
+                exrid = _candidate_exit_road_id(c)
+                entrid = _candidate_entry_road_id(c)
+                exit_ck = _corridor_key(exrid)
+                entry_ck = _corridor_key(entrid)
+                if exit_ck is None or entry_ck is None:
+                    continue
+                if exit_ck != main_exit_corridor:
+                    continue
+                if entry_ck == main_exit_corridor:
+                    continue
+                entry_lanes = lane_count_by_corridor.get(entry_ck, 0)
+                if not (main_lanes >= 3 and entry_lanes > 0 and entry_lanes < main_lanes):
+                    continue
+                if entry_lanes > 2:
+                    continue
+                turn = str((c.get("signature") or {}).get("entry_to_exit_turn", "")).strip().lower()
+                if turn == "uturn":
+                    continue
+                name = c.get("name")
+                exit_lane = _candidate_exit_lane_id(c)
+                if name and exit_lane is not None:
+                    ramp_options.append((entry_lanes, name, exit_lane))
+
+        if ramp_options:
+            prefer_single = any(entry_lanes == 1 for entry_lanes, _, _ in ramp_options)
+            max_entry_lanes = 1 if prefer_single else 2
+            for entry_lanes, name, _ in ramp_options:
+                if entry_lanes <= max_entry_lanes:
+                    ramp_candidates.add(name)
+            if prefer_single:
+                print("[INFO] CSP: prefer single-lane ramp candidates")
+
+        if ramp_candidates:
+            print(f"[INFO] CSP: on-ramp candidates available: {len(ramp_candidates)}")
+        else:
+            print("[WARN] CSP: no on-ramp candidates found; skipping on-ramp enforcement")
+    
+    # Now infer role sets, using ramp candidates if available
+    role_sets = _infer_road_role_sets(candidates, ramp_candidate_names=ramp_candidates if require_on_ramp else None)
+    
+    if require_on_ramp:
+        if main_exit_corridor:
+            for c in candidates:
+                exrid = _candidate_exit_road_id(c)
+                entrid = _candidate_entry_road_id(c)
+                exit_ck = _corridor_key(exrid)
+                entry_ck = _corridor_key(entrid)
+                if exit_ck is None or entry_ck is None:
+                    continue
+                if exit_ck == main_exit_corridor and entry_ck == main_exit_corridor:
+                    name = c.get("name")
+                    if not name:
+                        continue
+                    mainline_candidates.add(name)
+                    if _candidate_lane_consistent(c):
+                        clean_mainline_candidates.add(name)
+                        if _candidate_geometric_discontinuity(c, threshold_m=2.0) == 0:
+                            smooth_mainline_candidates.add(name)
+
+        if ramp_candidates and mainline_candidates:
+            ramp_exit_counts: Dict[int, int] = {}
+            main_exit_lanes: set = set()
+            clean_main_exit_lanes: set = set()
+            for c in candidates:
+                name = c.get("name")
+                if not name:
+                    continue
+                exit_lane = _candidate_exit_lane_id(c)
+                if exit_lane is None:
+                    continue
+                if name in ramp_candidates:
+                    ramp_exit_counts[exit_lane] = ramp_exit_counts.get(exit_lane, 0) + 1
+                if name in mainline_candidates:
+                    main_exit_lanes.add(exit_lane)
+                if name in clean_mainline_candidates:
+                    clean_main_exit_lanes.add(exit_lane)
+            if ramp_exit_counts:
+                shared_lanes = [lane for lane in ramp_exit_counts if lane in main_exit_lanes]
+                if shared_lanes:
+                    preferred_pool = [lane for lane in shared_lanes if lane in clean_main_exit_lanes] or shared_lanes
+                    prefer_merge_lane = max(preferred_pool, key=lambda lane: (ramp_exit_counts.get(lane, 0)))
+                    print(f"[INFO] CSP: prefer merge lane {prefer_merge_lane}")
 
     # Domains (filtered by unary constraints)
     domains: Dict[str, List[Dict[str, Any]]] = {}
+    if require_on_ramp:
+        for c in constraints:
+            if str(c.get("type", "")).strip().lower() == "merges_into_lane_of":
+                a = c.get("a")
+                b = c.get("b")
+                if a:
+                    merge_sources.add(a)
+                if b:
+                    merge_targets.add(b)
+        if not merge_targets:
+            side_vs = [v for v in vehicles if unary.get(v, {}).get("entry_road") == "side"]
+            main_vs = [v for v in vehicles if unary.get(v, {}).get("entry_road") == "main"]
+            if side_vs and main_vs:
+                preferred_target = None
+                for v in main_vs:
+                    if str(v).strip().lower() == "vehicle 1":
+                        preferred_target = v
+                        break
+                if preferred_target is None:
+                    preferred_target = sorted(main_vs)[0]
+                merge_targets.add(preferred_target)
     for v in vehicles:
         u = unary.get(v, {})
         man = str(u.get("maneuver", "unknown")).strip().lower()
@@ -235,7 +541,41 @@ def _solve_paths_csp(
             man = "straight"
         er = str(u.get("entry_road", "unknown")).strip().lower()
         xr = str(u.get("exit_road", "unknown")).strip().lower()
+        if require_on_ramp and er == "side" and man == "straight":
+            man = "unknown"
         dom = [c for c in candidates if _candidate_matches_unary(c, man, er, xr, role_sets)]
+        if require_on_ramp:
+            if er == "side" and ramp_candidates:
+                dom_side = [c for c in dom if c.get("name") in ramp_candidates]
+                if prefer_merge_lane is not None:
+                    dom_lane = [c for c in dom_side if _candidate_exit_lane_id(c) == prefer_merge_lane]
+                    if dom_lane:
+                        dom_side = dom_lane
+                if dom_side:
+                    dom = dom_side
+            elif er == "main" and mainline_candidates:
+                dom_main = [c for c in dom if c.get("name") in mainline_candidates]
+                if v in merge_targets and prefer_merge_lane is not None:
+                    dom_lane = [c for c in dom_main if _candidate_exit_lane_id(c) == prefer_merge_lane]
+                    if dom_lane:
+                        dom_main = dom_lane
+                if dom_main:
+                    dom = dom_main
+                if smooth_mainline_candidates:
+                    dom_smooth = [c for c in dom if c.get("name") in smooth_mainline_candidates]
+                    if dom_smooth:
+                        dom = dom_smooth
+                if clean_mainline_candidates:
+                    dom_clean = [c for c in dom if c.get("name") in clean_mainline_candidates]
+                    if dom_clean:
+                        dom = dom_clean
+        adj_req = adjacent_lane_req.get(v)
+        if adj_req:
+            dom_adj = [c for c in dom if _candidate_has_adjacent_lane(c, adj_req) is True]
+            if dom_adj:
+                dom = dom_adj
+            else:
+                print(f"[WARN] No candidates with a {adj_req} adjacent lane for {v}; keeping all.")
         dom.sort(key=lambda c: (-_candidate_effective_length(c, v), str(c.get("name", ""))))
         domains[v] = dom
 
@@ -256,45 +596,6 @@ def _solve_paths_csp(
         exrid_o = _candidate_exit_road_id(c_o)
         all_roads_v = _candidate_all_road_ids(c_v)
         all_roads_o = _candidate_all_road_ids(c_o)
-
-        def _lane_relation_ok(a_c: Dict[str, Any], b_c: Dict[str, Any], relation: str) -> Optional[bool]:
-            """Return True/False if checkable, else None (insufficient signal => don't over-constrain)."""
-            # Must be the same approach direction; lane relations are defined on approach.
-            if _candidate_entry_cardinal(a_c) != _candidate_entry_cardinal(b_c):
-                return False
-
-            # If entry road_id is known for both, require them to match.
-            rid_a = _candidate_entry_road_id(a_c)
-            rid_b = _candidate_entry_road_id(b_c)
-            if rid_a is not None and rid_b is not None and rid_a != rid_b:
-                return False
-
-            # If lane_id is known for both, prefer adjacent lanes.
-            lid_a = _candidate_entry_lane_id(a_c)
-            lid_b = _candidate_entry_lane_id(b_c)
-            if lid_a is not None and lid_b is not None and abs(lid_a - lid_b) != 1:
-                return False
-
-            pa = _candidate_entry_point(a_c)
-            pb = _candidate_entry_point(b_c)
-            th = _candidate_entry_heading_rad(b_c)
-            if pa is None or pb is None or th is None:
-                return None
-
-            dx = pa[0] - pb[0]
-            dy = pa[1] - pb[1]
-            # Left normal for b's heading.
-            left_x = -math.sin(th)
-            left_y = math.cos(th)
-            lat = dx * left_x + dy * left_y
-
-            # Small deadband to avoid numerical flicker.
-            eps = 0.5
-            if relation == "left":
-                return lat > eps
-            if relation == "right":
-                return lat < -eps
-            return None
 
         if t == "same_approach_as":
             return 0.0 if ent_v == ent_o else 1.0
@@ -355,6 +656,16 @@ def _solve_paths_csp(
             same_corridor = bool(corridor_v & corridor_o)
             exit_in_other_path = (exrid_v in all_roads_o) or (exrid_o in all_roads_v)
             return 0.0 if (same_corridor or exit_in_other_path) else 1.0
+        if t == "same_lane_as":
+            # Symmetric: both vehicles must be in the SAME physical lane.
+            # Same approach direction required.
+            if _candidate_entry_cardinal(c_v) != _candidate_entry_cardinal(c_o):
+                return 1.0  # Different approach = can't be same lane
+            lid_v = _candidate_entry_lane_id(c_v)
+            lid_o = _candidate_entry_lane_id(c_o)
+            if lid_v is None or lid_o is None:
+                return 0.0  # Can't determine, don't over-constrain
+            return 0.0 if lid_v == lid_o else 1.0
         if t == "left_lane_of":
             # Asymmetric: "a" is in the lane to the left of "b" (on approach).
             ok = _lane_relation_ok(c_v, c_o, "left") if v_is_a else _lane_relation_ok(c_o, c_v, "left")
@@ -410,16 +721,22 @@ def _solve_paths_csp(
             # Exit lanes must be the SAME (merge into reference's lane)
             if exit_lid_v != exit_lid_o:
                 penalty += 1.0  # Different exit lane = violation (should merge into same lane)
-            
+
+            if prefer_merge_lane is not None:
+                if exit_lid_v != prefer_merge_lane or exit_lid_o != prefer_merge_lane:
+                    penalty += 2.0
+
             return penalty
         return 0.0
 
     best_assignment: Optional[Dict[str, Dict[str, Any]]] = None
     best_score = -1e18
 
-    def backtrack(i: int, asn: Dict[str, Dict[str, Any]], cur_len: float, cur_pen: float):
+    def backtrack(i: int, asn: Dict[str, Dict[str, Any]], cur_len: float, cur_pen: float, has_ramp: bool):
         nonlocal best_assignment, best_score
         if i >= len(order):
+            if require_on_ramp and ramp_candidates and not has_ramp:
+                return
             score = cur_len - penalty_weight * cur_pen
             if score > best_score:
                 best_score = score
@@ -449,10 +766,17 @@ def _solve_paths_csp(
                 if other is not None:
                     add_pen += _constraint_penalty(cand, other, t, v_is_a=(a == vname))
             asn[vname] = cand
-            backtrack(i + 1, asn, cur_len + _candidate_effective_length(cand, vname), cur_pen + add_pen)
+            new_has_ramp = has_ramp or (cand.get("name") in ramp_candidates)
+            backtrack(
+                i + 1,
+                asn,
+                cur_len + _candidate_effective_length(cand, vname),
+                cur_pen + add_pen,
+                new_has_ramp,
+            )
             del asn[vname]
 
-    backtrack(0, {}, 0.0, 0.0)
+    backtrack(0, {}, 0.0, 0.0, False)
 
     if not best_assignment:
         raise ValueError("No feasible assignment found.")
@@ -473,9 +797,19 @@ def _solve_paths_csp(
     out = []
     for v in vehicles:
         c = best_assignment[v]
+        # Get unary constraint info including entry_road
+        u = unary.get(v, {})
         # Encode a soft confidence: 1.0 if no penalties, else lower
         confidence = 1.0
-        out.append({"vehicle": v, "path_name": str(c.get("name", "")), "confidence": confidence})
+        # Include entry_road and maneuver from unary constraints for debugging and validation
+        out.append({
+            "vehicle": v, 
+            "path_name": str(c.get("name", "")), 
+            "confidence": confidence,
+            "entry_road": u.get("entry_road", "unknown"),
+            "exit_road": u.get("exit_road", "unknown"),
+            "maneuver": u.get("maneuver", "unknown"),
+        })
     return out
 
 

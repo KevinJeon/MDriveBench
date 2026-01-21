@@ -49,6 +49,7 @@ class TopologyType(Enum):
     INTERSECTION = "intersection"  # General intersection (3+ way)
     T_JUNCTION = "t_junction"      # Exactly 3 directions
     CORRIDOR = "corridor"          # Straight road segment
+    HIGHWAY = "highway"            # Multi-lane high-speed road (3+ lanes)
     UNKNOWN = "unknown"            # Fallback
 
 
@@ -124,9 +125,11 @@ class LateralPosition(Enum):
     HALF_RIGHT = "half_right"
     RIGHT_EDGE = "right_edge"
     OFFROAD_RIGHT = "offroad_right"
+    SIDEWALK_RIGHT = "sidewalk_right"  # pedestrian on right sidewalk
     HALF_LEFT = "half_left"
     LEFT_EDGE = "left_edge"
     OFFROAD_LEFT = "offroad_left"
+    SIDEWALK_LEFT = "sidewalk_left"    # pedestrian on left sidewalk
 
 
 class GroupPattern(Enum):
@@ -159,6 +162,7 @@ class ConstraintType(Enum):
     LEFT_LANE_OF = "left_lane_of"
     RIGHT_LANE_OF = "right_lane_of"
     MERGES_INTO_LANE_OF = "merges_into_lane_of"
+    SAME_LANE_AS = "same_lane_as"
 
 
 class EgoManeuver(Enum):
@@ -200,12 +204,13 @@ class PipelineCapabilities:
     
     # === TOPOLOGY MATCHING ===
     # The pipeline matches descriptions to existing map regions
-    # It can detect: intersection, t_junction, corridor
+    # It can detect: intersection, t_junction, corridor, highway
     # It CANNOT create: roundabouts (no detection), signalized intersections
     supported_topologies: Set[TopologyType] = field(default_factory=lambda: {
         TopologyType.INTERSECTION,
         TopologyType.T_JUNCTION,
         TopologyType.CORRIDOR,
+        TopologyType.HIGHWAY,
     })
     
     # Map feature detection
@@ -235,16 +240,15 @@ class PipelineCapabilities:
         "CANNOT specify exact vehicle speeds in m/s or km/h - only qualitative hints",
         "CANNOT specify exact timing between vehicles in seconds",
         "CANNOT control NPC behavioral personality (aggressive, hesitant)",
-        "CANNOT script dynamic reactions (brake when X happens)",
         "CANNOT specify exact headway distances between vehicles",
-        "CANNOT create multi-stage scenarios (do X, then later do Y)",
+        "CANNOT create complex multi-stage scenarios (beyond a single trigger -> action)",
         
         # Spatial limitations
         "CANNOT reference specific coordinates - only segment-relative positions",
         "CANNOT specify exact distances - only relative positions (s_along 0-1)",
         
         # Actor limitations
-        "NPC vehicles are SIMPLE - spawn and move, no complex paths",
+        "NPC vehicles only support simple trigger actions (start motion, hard brake, single lane change)",
         "NPC vehicles do NOT get their own picked paths like ego vehicles",
     ])
 
@@ -254,17 +258,16 @@ PIPELINE_CAPABILITIES = PipelineCapabilities()
 
 
 # =============================================================================
-# CATEGORY FEASIBILITY ANALYSIS
+# CATEGORY DEFINITIONS
 # =============================================================================
 
 @dataclass
-class CategoryFeasibility:
+class CategoryDefinition:
     """
-    Analysis of whether a scenario category is actually implementable.
+    Scenario category definition aligned with pipeline capabilities.
     """
     name: str
-    is_feasible: bool
-    feasibility_notes: str
+    notes: str
     
     # What map features are required
     required_topology: TopologyType
@@ -288,17 +291,16 @@ class CategoryFeasibility:
 
 
 # Honest assessment of each category
-CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
+CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
     
-    "Highway On-Ramp Merge": CategoryFeasibility(
+    "Highway On-Ramp Merge": CategoryDefinition(
         name="Highway On-Ramp Merge",
-        is_feasible=True,
-        feasibility_notes="Uses merge_onto_same_road + multi_lane geometry for on-ramp-like scenarios. The strict has_on_ramp heuristic is too restrictive, so we use more common merge geometry instead.",
-        required_topology=TopologyType.CORRIDOR,
-        needs_on_ramp=False,  # Heuristic is too strict; use needs_merge_onto_same_road instead
-        needs_merge=True,     # Mark as needing merge, but actual spec uses merge_onto_same_road
-        uses_non_ego_actors=True,
-        non_ego_actors_min_difficulty=1,
+        notes="Multi-lane highway with on-ramp merge points. Requires highway geometry with 3+ lanes and merge capabilities.",
+        required_topology=TopologyType.HIGHWAY,
+        needs_on_ramp=True,
+        needs_merge=True,
+        uses_non_ego_actors=False,
+        non_ego_actors_min_difficulty=999,
         conflict_via=[
             "Multiple ego vehicles with paths converging at merge",
             "follow_route_of constraint for queued vehicles",
@@ -321,15 +323,14 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Lane Drop Merge (Zipper)": CategoryFeasibility(
-        name="Lane Drop Merge (Zipper)",
-        is_feasible=True,
-        feasibility_notes="Works if map has lane drop region with multi-lane approach. Can include construction cones or parked vehicles to further constrict lanes.",
+    "Lane Drop / Alternating Merge": CategoryDefinition(
+        name="Lane Drop / Alternating Merge",
+        notes="Works if map has lane drop region with multi-lane approach. Can include construction cones or parked vehicles to further constrict lanes.",
         required_topology=TopologyType.CORRIDOR,
         needs_multi_lane=True,
         needs_merge=True,
         uses_non_ego_actors=True,
-        non_ego_actors_min_difficulty=2,  # Only include props at difficulty 2+
+        non_ego_actors_min_difficulty=1,  # Lane drops require obstacles at all difficulties.
         conflict_via=[
             "Ego vehicles in adjacent lanes reaching taper",
             "left_lane_of / right_lane_of constraints",
@@ -352,23 +353,11 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Roundabout Entry": CategoryFeasibility(
-        name="Roundabout Entry",
-        is_feasible=False,
-        feasibility_notes="NOT FEASIBLE - no roundabout detection in CropFeatures.",
+    "Intersection Deadlock Resolution": CategoryDefinition(
+        name="Intersection Deadlock Resolution",
+        notes="Works at uncontrolled intersections with perpendicular approaches - HIGHLY MULTI-AGENT, pure vehicle-to-vehicle deadlock resolution",
         required_topology=TopologyType.INTERSECTION,
         uses_non_ego_actors=False,
-        conflict_via=[],
-        difficulty_knobs=[],
-        variation_axes=[],
-    ),
-    
-    "Courtesy & Deadlock Negotiation": CategoryFeasibility(
-        name="Courtesy & Deadlock Negotiation",
-        is_feasible=True,
-        feasibility_notes="Works at uncontrolled intersections with perpendicular approaches - HIGHLY MULTI-AGENT",
-        required_topology=TopologyType.INTERSECTION,
-        uses_non_ego_actors=True,
         conflict_via=[
             "perpendicular_right_of / perpendicular_left_of constraints creating ambiguous right-of-way",
             "opposite_approach_of for oncoming standoff",
@@ -377,22 +366,21 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
         difficulty_knobs=[
             "Number of approach directions with vehicles",
+            "Number of inter-vehicle constraints",
             "Mix of maneuvers creating crossing conflicts",
         ],
         variation_axes=[
             "ego_count: 3 vs 4 vs 5 vs 6 vehicles from different approaches",
             "approach_pattern: 2-way standoff vs 3-way deadlock vs 4-way gridlock",
             "constraint_web: chain of perpendicular constraints vs mixed perpendicular+opposite",
+            "constraint_count: 2 vs 3 vs 4 vs 5+ inter-vehicle constraints",
             "maneuver_clash: all straight vs mix where turns cross each other's paths",
-            "complication: none vs walker with cross_perpendicular vs parked_vehicle occlusion",
-            "occlusion_position: half_right vs right_edge limiting visibility",
         ],
     ),
     
-    "Unprotected Left Turn": CategoryFeasibility(
+    "Unprotected Left Turn": CategoryDefinition(
         name="Unprotected Left Turn",
-        is_feasible=True,
-        feasibility_notes="Works at intersections with oncoming traffic - classic multi-agent coordination",
+        notes="Works at intersections with oncoming traffic - classic multi-agent coordination",
         required_topology=TopologyType.INTERSECTION,
         needs_oncoming=True,
         uses_non_ego_actors=True,
@@ -418,10 +406,9 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Lane Change Negotiation": CategoryFeasibility(
-        name="Lane Change Negotiation",
-        is_feasible=True,
-        feasibility_notes="Works on multi-lane corridors - multiple vehicles competing for same lane. Can include occlusions to block visibility of neighboring vehicles.",
+    "Interactive Lane Change": CategoryDefinition(
+        name="Interactive Lane Change",
+        notes="Works on multi-lane corridors - multiple vehicles competing for same lane. Can include occlusions to block visibility of neighboring vehicles.",
         required_topology=TopologyType.CORRIDOR,
         needs_multi_lane=True,
         uses_non_ego_actors=True,
@@ -448,39 +435,39 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Highway Weaving": CategoryFeasibility(
-        name="Highway Weaving",
-        is_feasible=True,
-        feasibility_notes="Works for lane weaving on multi-lane corridors. Can include obstacles or parked vehicles to create additional complexity.",
-        required_topology=TopologyType.CORRIDOR,
+    "Weaving Section": CategoryDefinition(
+        name="Weaving Section",
+        notes="Lane weaving on multi-lane highways/corridors. Vehicles in adjacent lanes constantly change lanes, crossing into each other's lanes. Pure vehicle-to-vehicle interaction, no props.",
+        required_topology=TopologyType.HIGHWAY,
         needs_multi_lane=True,
-        uses_non_ego_actors=True,
-        non_ego_actors_min_difficulty=2,  # Start adding props at difficulty 2+
+        uses_non_ego_actors=False,  # NO props - pure vehicle weaving
+        non_ego_actors_min_difficulty=999,  # Never add props
         conflict_via=[
-            "Multiple lane change constraints",
-            "Vehicles distributed across lanes",
-            "Obstacles blocking lanes force adaptive weaving patterns",
+            "Multiple MERGES_INTO_LANE_OF constraints (vehicles weaving into each other's lanes)",
+            "LEFT_LANE_OF and RIGHT_LANE_OF to establish adjacent starting positions",
+            "All vehicles perform active lane changes throughout the scenario",
         ],
         difficulty_knobs=[
-            "Number of lanes and vehicles",
-            "Obstacle count and positioning",
+            "Number of vehicles (d1=2, d2=3, d3=4, d4=4, d5=5)",
+            "Number of lane change constraints (d1=1, d2=2, d3=3, d4=4, d5=5+)",
+            "Frequency and density of lane changes",
         ],
         variation_axes=[
-            "ego_count: 3-8 vehicles",
-            "lane_span: 2-lane vs 3-lane road",
-            "constraint_density: sparse vs dense lane relationships",
-            "merge_conflicts: single merges_into_lane_of vs crossing merges",
-            "prop_arrangement: none vs linear_spread vs scattered_dense",
-            "  linear_spread: 3-4 static_props in a diagonal line forcing coordinated weaving",
-            "  scattered_dense: 6-8 static_props scattered randomly (difficulty 4+) forcing reactive navigation",
-            "parked_vehicles: none vs 1-2 interspersed with props blocking merge gaps",
+            "ego_count_d1: 2 vehicles side-by-side with 1 lane change",
+            "ego_count_d2: 3 vehicles with 2 lane changes (multiple weave interactions)",
+            "ego_count_d3: 4 vehicles with 3 lane changes (complex weaving pattern)",
+            "ego_count_d4: 4 vehicles with 4 lane changes (dense weaving)",
+            "ego_count_d5: 5 vehicles with 5+ lane changes (maximum density weaving)",
+            "lane_span: 2-lane vs 3-lane corridor",
+            "constraint_density: increases with difficulty",
+            "weave_pattern: simple adjacent swaps vs complex multi-vehicle weaving",
+            "spatial_coupling: all vehicles start in adjacent lanes (LEFT_LANE_OF/RIGHT_LANE_OF)",
         ],
     ),
     
-    "Overtaking on Two-Lane Road": CategoryFeasibility(
+    "Overtaking on Two-Lane Road": CategoryDefinition(
         name="Overtaking on Two-Lane Road",
-        is_feasible=True,
-        feasibility_notes="Works on multi-lane same-direction roads. Can include oncoming vehicles, obstacles, and pedestrians to increase complexity.",
+        notes="Works on multi-lane same-direction roads. Can include oncoming vehicles, obstacles, and pedestrians to increase complexity.",
         required_topology=TopologyType.CORRIDOR,
         needs_multi_lane=True,
         uses_non_ego_actors=True,
@@ -506,10 +493,9 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Opposing Traffic on Narrow Road": CategoryFeasibility(
-        name="Opposing Traffic on Narrow Road",
-        is_feasible=True,
-        feasibility_notes="Works with oncoming traffic detection",
+    "Narrow Passage Encounter": CategoryDefinition(
+        name="Narrow Passage Encounter",
+        notes="Works with oncoming traffic detection",
         required_topology=TopologyType.CORRIDOR,
         needs_oncoming=True,
         uses_non_ego_actors=True,
@@ -530,57 +516,63 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Pedestrian Crosswalk": CategoryFeasibility(
+    "Pedestrian Crosswalk": CategoryDefinition(
         name="Pedestrian Crosswalk",
-        is_feasible=True,
-        feasibility_notes="Works with walker actors using crossing motion",
+        notes="D1-D3: Focus on vehicle count (2/3/4 cars), single pedestrian. D4-D5: Focus on pedestrian count (2/3 pedestrians) spawning behind parked vehicle occlusions. NO moving NPC vehicles or cyclists.",
         required_topology=TopologyType.CORRIDOR,
         uses_non_ego_actors=True,
+        non_ego_actors_min_difficulty=1,
         conflict_via=[
             "walker actor with cross_perpendicular motion",
             "Timing via when=on_approach",
+            "Multiple vehicles encountering the same pedestrian crossing",
+            "Occlusion hiding pedestrian from oncoming vehicles (d4-d5)",
         ],
         difficulty_knobs=[
-            "Number of pedestrians",
-            "Occlusion actors",
+            "D1-D3: Vehicle count (2/3/4 cars)",
+            "D4-D5: Pedestrian count (2/3 pedestrians)",
+            "Occlusion actors (required d4-d5, pedestrians spawn behind)",
+            "Trigger distance variation",
         ],
         variation_axes=[
-            "ego_count: 1-4 vehicles",
-            "walker_count: 1 vs 2-3 with group pattern",
-            "walker_motion: cross_perpendicular",
+            "ego_count: d1=2, d2=3, d3=4 vehicles (linear scaling for d1-d3)",
+            "ego_count: 2-3 vehicles for d4-d5 (pedestrian-focused)",
+            "walker_count: 1 for d1-d3, d4=2, d5=3 pedestrians",
+            "walker_start: right_edge vs left_edge (ALWAYS start from side of road)",
             "crossing_direction: left vs right",
-            "timing_phase: on_approach vs in_intersection",
-            "occlusion: none vs parked_vehicle",
-            "parked_lateral: half_right vs right_edge",
+            "timing_phase: on_approach (pedestrian triggers when vehicle approaches)",
+            "trigger_distance: 8-12m (vary occasionally for harder scenarios)",
+            "occlusion: none (d1-d3) vs parked_vehicle blocking view (d4-d5 required)",
+            "parked_lateral: right_edge vs offroad_right (NOT in driving path)",
+            "occlusion_type: large parked vehicles (box truck, van, bus, delivery truck)",
         ],
     ),
     
-    "Occluded Hazard": CategoryFeasibility(
+    "Occluded Hazard": CategoryDefinition(
         name="Occluded Hazard",
-        is_feasible=True,
-        feasibility_notes="Works with parked_vehicle actor creating occlusion",
+        notes="Large occluder hides a pedestrian/cyclist crossing until late",
         required_topology=TopologyType.INTERSECTION,
         uses_non_ego_actors=True,
         conflict_via=[
-            "parked_vehicle actor positioned to occlude",
-            "Crossing vehicle or walker revealed late",
+            "large parked_vehicle or static_prop positioned to occlude",
+            "Pedestrian/cyclist revealed late from behind occluder",
         ],
         difficulty_knobs=[
             "Occluder size/position",
         ],
         variation_axes=[
             "ego_count: 2-4 vehicles",
-            "occluder_type: parked_vehicle vs static_prop",
+            "occluder_type: parked_vehicle vs large static_prop",
             "occluder_lateral: half_right vs right_edge vs offroad_right",
-            "occluded_actor: another ego via perpendicular constraint vs walker",
-            "walker_motion: cross_perpendicular if walker",
+            "hazard_type: pedestrian vs cyclist",
+            "crossing_direction: left vs right",
+            "hazard_motion: cross_perpendicular",
         ],
     ),
     
-    "Blocked Lane (Obstacle)": CategoryFeasibility(
+    "Blocked Lane (Obstacle)": CategoryDefinition(
         name="Blocked Lane (Obstacle)",
-        is_feasible=True,
-        feasibility_notes="Works with parked_vehicle actor blocking lane",
+        notes="Works with parked_vehicle actor blocking lane",
         required_topology=TopologyType.CORRIDOR,
         needs_multi_lane=True,
         uses_non_ego_actors=True,
@@ -601,10 +593,9 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Construction Zone": CategoryFeasibility(
+    "Construction Zone": CategoryDefinition(
         name="Construction Zone",
-        is_feasible=True,
-        feasibility_notes="Works with static_prop actors (cones) creating taper",
+        notes="Works with static_prop actors (cones) creating taper",
         required_topology=TopologyType.CORRIDOR,
         needs_multi_lane=True,
         uses_non_ego_actors=True,
@@ -626,10 +617,9 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Multi-Conflict Scenarios": CategoryFeasibility(
+    "Multi-Conflict Scenarios": CategoryDefinition(
         name="Multi-Conflict Scenarios",
-        is_feasible=True,
-        feasibility_notes="HIGHLY MULTI-AGENT: Combines multiple conflict types - the most challenging scenarios",
+        notes="HIGHLY MULTI-AGENT: Combines multiple conflict types - the most challenging scenarios",
         required_topology=TopologyType.INTERSECTION,
         needs_oncoming=True,
         uses_non_ego_actors=True,
@@ -653,10 +643,9 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Side Street Entry": CategoryFeasibility(
-        name="Side Street Entry",
-        is_feasible=True,
-        feasibility_notes="Works at T-junctions - classic yield scenario with queue. Parked vehicles can block view of oncoming traffic or limit merge space.",
+    "Major/Minor Unsignalized Entry": CategoryDefinition(
+        name="Major/Minor Unsignalized Entry",
+        notes="Works at T-junctions - classic yield scenario with queue. Parked vehicles can block view of oncoming traffic or limit merge space.",
         required_topology=TopologyType.T_JUNCTION,
         uses_non_ego_actors=True,
         conflict_via=[
@@ -681,21 +670,9 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Emergency Vehicle Encounter": CategoryFeasibility(
-        name="Emergency Vehicle Encounter",
-        is_feasible=False,
-        feasibility_notes="NOT FEASIBLE - no emergency vehicle behavior or priority logic.",
-        required_topology=TopologyType.CORRIDOR,
-        uses_non_ego_actors=False,
-        conflict_via=[],
-        difficulty_knobs=[],
-        variation_axes=[],
-    ),
-    
-    "Wide Turn Negotiation": CategoryFeasibility(
+    "Wide Turn Negotiation": CategoryDefinition(
         name="Wide Turn Negotiation",
-        is_feasible=True,
-        feasibility_notes="Can specify turn maneuver for ego vehicles. Parked vehicles or pedestrians can complicate turn paths and sight lines.",
+        notes="Can specify turn maneuver for ego vehicles. Parked vehicles or pedestrians can complicate turn paths and sight lines.",
         required_topology=TopologyType.INTERSECTION,
         uses_non_ego_actors=True,
         conflict_via=[
@@ -718,34 +695,37 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Shared Left Turn Lane Conflict": CategoryFeasibility(
-        name="Shared Left Turn Lane Conflict",
-        is_feasible=True,
-        feasibility_notes="Works at intersections with opposing left turns",
+    "Multi Left Turn Conflict": CategoryDefinition(
+        name="Multi Left Turn Conflict",
+        notes="Multi Left Turn Conflict: 2+ vehicles making left turns from different approaches (main road and side road) with INTERSECTING turn paths. NOT opposing left turns.",
         required_topology=TopologyType.INTERSECTION,
-        needs_oncoming=True,
+        needs_oncoming=False,
         uses_non_ego_actors=True,
         conflict_via=[
-            "Two ego vehicles with left maneuver",
-            "opposite_approach_of constraint",
-            "same_exit_as targeting same side street",
+            "2+ ego vehicles EACH with left maneuver",
+            "perpendicular_left_of or perpendicular_right_of constraint (NOT opposite_approach_of)",
+            "Left turn paths MUST intersect (vehicles from main and side roads both turning left)",
+            "Conflict occurs when turning paths cross in the intersection",
         ],
         difficulty_knobs=[
-            "Queue depth per direction",
+            "Number of left-turning vehicles",
+            "Queue depth behind each turner",
+            "Actor complexity",
         ],
         variation_axes=[
-            "ego_count: 2-6 vehicles",
-            "queue_pattern: symmetric vs asymmetric follow_route_of chains",
-            "exit_conflict: same_exit_as vs different exits",
-            "actor: none vs walker on destination leg",
-            "walker_timing: on_approach vs after_turn",
+            "ego_count: 2-6 vehicles (at least 2 must have left maneuver)",
+            "left_turner_count: 2 vs 3 vehicles with left maneuver from different approaches",
+            "approach_relation: perpendicular_left_of vs perpendicular_right_of (NOT opposite)",
+            "queue_pattern: single turners vs follow_route_of chains behind each turner",
+            "additional_traffic: none vs straight-through vehicles on other approaches",
+            "actor: none vs walker crossing turn destination",
+            "walker_timing: on_approach vs in_intersection vs after_turn",
         ],
     ),
     
-    "Multi-Way Standoff": CategoryFeasibility(
+    "Multi-Way Standoff": CategoryDefinition(
         name="Multi-Way Standoff",
-        is_feasible=True,
-        feasibility_notes="HIGHLY MULTI-AGENT: 4+ vehicles arriving at intersection simultaneously with no clear priority",
+        notes="HIGHLY MULTI-AGENT: 4+ vehicles arriving at intersection simultaneously with no clear priority",
         required_topology=TopologyType.INTERSECTION,
         uses_non_ego_actors=True,
         conflict_via=[
@@ -766,10 +746,9 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Platoon Merge Conflict": CategoryFeasibility(
+    "Platoon Merge Conflict": CategoryDefinition(
         name="Platoon Merge Conflict",
-        is_feasible=True,
-        feasibility_notes="HIGHLY MULTI-AGENT: Two chains of following vehicles must merge into single lane",
+        notes="HIGHLY MULTI-AGENT: Two chains of following vehicles must merge into single lane",
         required_topology=TopologyType.CORRIDOR,
         needs_multi_lane=True,
         needs_merge=True,
@@ -791,10 +770,9 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Narrow Passage Negotiation": CategoryFeasibility(
+    "Narrow Passage Negotiation": CategoryDefinition(
         name="Narrow Passage Negotiation",
-        is_feasible=True,
-        feasibility_notes="HIGHLY MULTI-AGENT: Opposing traffic queues must negotiate through single-lane bottleneck",
+        notes="HIGHLY MULTI-AGENT: Opposing traffic queues must negotiate through single-lane bottleneck",
         required_topology=TopologyType.CORRIDOR,
         needs_oncoming=True,
         uses_non_ego_actors=True,
@@ -816,60 +794,9 @@ CATEGORY_FEASIBILITY: Dict[str, CategoryFeasibility] = {
         ],
     ),
     
-    "Parking Lot Maneuvers": CategoryFeasibility(
-        name="Parking Lot Maneuvers",
-        is_feasible=False,
-        feasibility_notes="NOT FEASIBLE - no parking lot topology detection.",
-        required_topology=TopologyType.CORRIDOR,
-        uses_non_ego_actors=False,
-        conflict_via=[],
-        difficulty_knobs=[],
-        variation_axes=[],
-    ),
-    
-    "Highway Diverge / Off-Ramp Exit Negotiation": CategoryFeasibility(
-        name="Highway Diverge / Off-Ramp Exit Negotiation",
-        is_feasible=False,
-        feasibility_notes="NOT FEASIBLE - only on-ramp detection exists (has_on_ramp).",
-        required_topology=TopologyType.CORRIDOR,
-        needs_multi_lane=True,
-        uses_non_ego_actors=False,
-        conflict_via=[],
-        difficulty_knobs=[],
-        variation_axes=[],
-    ),
 }
 
 
-def get_feasible_categories() -> List[str]:
-    """Return only categories that are actually implementable."""
-    return [name for name, cat in CATEGORY_FEASIBILITY.items() if cat.is_feasible]
-
-
-def get_infeasible_categories() -> List[str]:
-    """Return categories that cannot be implemented with current pipeline."""
-    return [name for name, cat in CATEGORY_FEASIBILITY.items() if not cat.is_feasible]
-
-
-def print_feasibility_report():
-    """Print a human-readable feasibility report."""
-    feasible = get_feasible_categories()
-    infeasible = get_infeasible_categories()
-    
-    print("=" * 60)
-    print("SCENARIO CATEGORY FEASIBILITY REPORT")
-    print("=" * 60)
-    
-    print(f"\n✓ FEASIBLE ({len(feasible)} categories):")
-    for name in feasible:
-        cat = CATEGORY_FEASIBILITY[name]
-        print(f"  - {name}")
-        print(f"    {cat.feasibility_notes}")
-    
-    print(f"\n✗ NOT FEASIBLE ({len(infeasible)} categories):")
-    for name in infeasible:
-        cat = CATEGORY_FEASIBILITY[name]
-        print(f"  - {name}")
-        print(f"    {cat.feasibility_notes}")
-    
-    print("\n" + "=" * 60)
+def get_available_categories() -> List[str]:
+    """Return all supported categories."""
+    return list(CATEGORY_DEFINITIONS.keys())

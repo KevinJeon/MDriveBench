@@ -1,0 +1,1517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PKL to XODR Manual Alignment</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+  <style>
+    :root {
+      --bg: #f5efe6;
+      --bg-2: #fdf7ee;
+      --ink: #1c1b18;
+      --muted: #6f645a;
+      --accent: #0e7c86;
+      --accent-2: #e0703e;
+      --panel: #fff8ef;
+      --panel-2: #f3e6d7;
+      --border: #d9cdbf;
+      --shadow: rgba(24, 18, 9, 0.18);
+      --xodr: #1b6fb8;
+      --pkl: #c24b2f;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at 10% 10%, #fff2d9, var(--bg) 40%, #efe6d6 100%);
+      min-height: 100vh;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: -20%;
+      background:
+        radial-gradient(circle at 20% 15%, rgba(14, 124, 134, 0.18), transparent 45%),
+        radial-gradient(circle at 85% 70%, rgba(224, 112, 62, 0.2), transparent 50%);
+      z-index: -1;
+      animation: drift 18s ease-in-out infinite;
+    }
+
+    @keyframes drift {
+      0% { transform: translate3d(0, 0, 0); }
+      50% { transform: translate3d(-2%, 1.5%, 0); }
+      100% { transform: translate3d(0, 0, 0); }
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+
+    .page {
+      padding: 20px 24px 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px 20px;
+      animation: rise 0.6s ease-out;
+    }
+
+    .title-block h1 {
+      margin: 0;
+      font-size: clamp(1.6rem, 2vw + 1rem, 2.4rem);
+      letter-spacing: -0.02em;
+    }
+
+    .title-block p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      max-width: 560px;
+    }
+
+    .badge {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      font-size: 0.85rem;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 2.2fr) minmax(280px, 1fr);
+      gap: 16px;
+      align-items: stretch;
+    }
+
+    .canvas-panel {
+      position: relative;
+      min-height: 520px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: 0 18px 40px var(--shadow);
+      overflow: hidden;
+      animation: rise 0.7s ease-out;
+    }
+
+    .canvas-wrap {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      padding: 16px;
+    }
+
+    #viewer {
+      width: 100%;
+      height: 100%;
+      border-radius: 14px;
+      background: var(--bg-2);
+      border: 1px solid var(--panel-2);
+      display: block;
+    }
+
+    .canvas-overlay {
+      position: absolute;
+      left: 28px;
+      right: 28px;
+      bottom: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      pointer-events: none;
+    }
+
+    .overlay-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .overlay-chip {
+      background: rgba(255, 248, 239, 0.92);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 0.85rem;
+      color: var(--muted);
+      backdrop-filter: blur(4px);
+    }
+
+    .overlay-chip strong {
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    .panel {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      animation: rise 0.8s ease-out;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px 14px 16px;
+      box-shadow: 0 12px 22px rgba(24, 18, 9, 0.08);
+    }
+
+    .card h3 {
+      margin: 0 0 10px;
+      font-size: 1rem;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+
+    label {
+      font-size: 0.86rem;
+      color: var(--muted);
+    }
+
+    input[type="text"],
+    input[type="number"],
+    select,
+    textarea {
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #fffdf8;
+      color: var(--ink);
+      font-size: 0.95rem;
+    }
+
+    textarea {
+      min-height: 110px;
+      font-family: "IBM Plex Mono", "Courier New", monospace;
+      font-size: 0.85rem;
+      resize: vertical;
+    }
+
+    .inline-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .inline-row.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .drop-zone {
+      border: 1px dashed var(--accent);
+      border-radius: 12px;
+      padding: 12px;
+      text-align: center;
+      color: var(--muted);
+      background: #fffaf2;
+      transition: border-color 0.2s ease, background 0.2s ease;
+      cursor: pointer;
+    }
+
+    .drop-zone.dragover {
+      border-color: var(--accent-2);
+      background: #fff2e6;
+    }
+
+    .small {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .mono {
+      font-family: "IBM Plex Mono", "Courier New", monospace;
+    }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    button {
+      border: none;
+      border-radius: 10px;
+      padding: 8px 12px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff8f0;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    button.secondary {
+      background: #3f3a34;
+    }
+
+    button.ghost {
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--accent);
+    }
+
+    button:active {
+      transform: translateY(1px);
+      box-shadow: none;
+    }
+
+    .status {
+      font-size: 0.85rem;
+      color: var(--muted);
+      min-height: 18px;
+    }
+
+    .legend {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      margin-right: 6px;
+    }
+
+    .legend .xodr::before {
+      background: var(--xodr);
+    }
+
+    .legend .pkl::before {
+      background: var(--pkl);
+    }
+
+    @media (max-width: 980px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+      .canvas-panel {
+        min-height: 440px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div class="title-block">
+        <h1>PKL to XODR Manual Alignment</h1>
+        <p>Drop XODR and PKL JSON data, then drag, rotate, and scale the PKL overlay to read off alignment values.</p>
+      </div>
+      <span class="badge">No server, runs local</span>
+    </header>
+
+    <div class="layout">
+      <section class="canvas-panel">
+        <div class="canvas-wrap">
+          <canvas id="viewer"></canvas>
+          <div class="canvas-overlay">
+            <div class="overlay-row" id="statsRow">
+              <div class="overlay-chip"><strong>XODR</strong> <span id="xodrCount">0</span></div>
+              <div class="overlay-chip"><strong>PKL</strong> <span id="pklCount">0</span></div>
+              <div class="overlay-chip"><strong>Scale</strong> <span id="scaleReadout" class="mono">1.0000</span></div>
+              <div class="overlay-chip"><strong>Deg</strong> <span id="thetaReadout" class="mono">0.00</span></div>
+              <div class="overlay-chip"><strong>TX</strong> <span id="txReadout" class="mono">0.00</span></div>
+              <div class="overlay-chip"><strong>TY</strong> <span id="tyReadout" class="mono">0.00</span></div>
+            </div>
+            <div class="overlay-row">
+              <div class="overlay-chip">Drag = translate, Shift-drag = rotate, Alt-drag = scale, Space-drag = pan, Wheel = zoom</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <div class="card">
+          <h3>Load</h3>
+          <div class="field">
+            <label for="xodrInput">XODR file</label>
+            <div class="drop-zone" id="xodrDrop">Drop XODR here or click to browse</div>
+            <input id="xodrInput" type="file" accept=".xodr,.xml" hidden />
+          </div>
+          <div class="field">
+            <label for="pklInput">PKL JSON file(s)</label>
+            <div class="drop-zone" id="pklDrop">Drop PKL JSON here or click to browse</div>
+            <input id="pklInput" type="file" accept=".json" multiple hidden />
+            <div class="small">Use tools/export_pkl_geometry_json.py to convert PKL to JSON.</div>
+          </div>
+          <div class="legend">
+            <span class="xodr">XODR</span>
+            <span class="pkl">PKL</span>
+          </div>
+          <div class="status" id="statusMsg"></div>
+        </div>
+
+        <div class="card">
+          <h3>Transform</h3>
+          <div class="field">
+            <label for="axisVariant">Axis variant</label>
+            <select id="axisVariant">
+              <option value="xy">xy (x, y)</option>
+              <option value="x_neg_y">x_neg_y (x, -y)</option>
+              <option value="neg_x_y">neg_x_y (-x, y)</option>
+              <option value="neg_x_neg_y">neg_x_neg_y (-x, -y)</option>
+              <option value="y_x">y_x (y, x)</option>
+              <option value="y_neg_x">y_neg_x (y, -x)</option>
+              <option value="neg_y_x">neg_y_x (-y, x)</option>
+              <option value="neg_y_neg_x">neg_y_neg_x (-y, -x)</option>
+            </select>
+          </div>
+          <div class="inline-row">
+            <div class="field">
+              <label for="scaleInput">Scale</label>
+              <input id="scaleInput" type="number" step="0.0001" value="1" />
+            </div>
+            <div class="field">
+              <label for="thetaInput">Rotation (deg)</label>
+              <input id="thetaInput" type="number" step="0.1" value="0" />
+            </div>
+          </div>
+          <div class="inline-row">
+            <div class="field">
+              <label for="txInput">Translate X</label>
+              <input id="txInput" type="number" step="0.1" value="0" />
+            </div>
+            <div class="field">
+              <label for="tyInput">Translate Y</label>
+              <input id="tyInput" type="number" step="0.1" value="0" />
+            </div>
+          </div>
+          <div class="field">
+            <label>
+              <input type="checkbox" id="anchorToggle" checked />
+              Keep PKL centroid anchored when rotating or scaling
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="resetTransform">Reset transform</button>
+            <button id="centerOnXodr" class="secondary">Center on XODR</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Sampling + View</h3>
+          <div class="inline-row three">
+            <div class="field">
+              <label for="xodrStep">XODR step (m)</label>
+              <input id="xodrStep" type="number" step="0.1" value="2.0" />
+            </div>
+            <div class="field">
+              <label for="maxPoints">Max points</label>
+              <input id="maxPoints" type="number" step="1000" value="200000" />
+            </div>
+            <div class="field">
+              <label for="nudgeStep">Nudge (m)</label>
+              <input id="nudgeStep" type="number" step="0.1" value="1.0" />
+            </div>
+          </div>
+          <div class="inline-row">
+            <div class="field">
+              <label for="laneMode">XODR lanes</label>
+              <select id="laneMode">
+                <option value="reference">Reference only</option>
+                <option value="center">Lane centers</option>
+                <option value="boundary">Lane boundaries</option>
+                <option value="both">Centers + boundaries</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="laneTypes">Lane types</label>
+              <input id="laneTypes" type="text" value="all" />
+            </div>
+          </div>
+          <div class="button-row">
+            <button id="resampleXodr" class="ghost">Resample XODR</button>
+            <button id="applySampling" class="ghost">Apply sampling</button>
+            <button id="fitView">Fit view</button>
+            <button id="resetView" class="secondary">Reset view</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Export</h3>
+          <div class="field">
+            <label for="transformOutput">Alignment JSON</label>
+            <textarea id="transformOutput" readonly></textarea>
+          </div>
+          <div class="button-row">
+            <button id="copyTransform">Copy</button>
+            <button id="downloadTransform" class="secondary">Download</button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById("viewer");
+      const ctx = canvas.getContext("2d");
+      const xodrInput = document.getElementById("xodrInput");
+      const xodrDrop = document.getElementById("xodrDrop");
+      const pklInput = document.getElementById("pklInput");
+      const pklDrop = document.getElementById("pklDrop");
+      const axisVariant = document.getElementById("axisVariant");
+      const scaleInput = document.getElementById("scaleInput");
+      const thetaInput = document.getElementById("thetaInput");
+      const txInput = document.getElementById("txInput");
+      const tyInput = document.getElementById("tyInput");
+      const anchorToggle = document.getElementById("anchorToggle");
+      const xodrStepInput = document.getElementById("xodrStep");
+      const maxPointsInput = document.getElementById("maxPoints");
+      const nudgeStepInput = document.getElementById("nudgeStep");
+      const laneModeInput = document.getElementById("laneMode");
+      const laneTypesInput = document.getElementById("laneTypes");
+      const resampleXodrBtn = document.getElementById("resampleXodr");
+      const applySamplingBtn = document.getElementById("applySampling");
+      const resetTransformBtn = document.getElementById("resetTransform");
+      const centerOnXodrBtn = document.getElementById("centerOnXodr");
+      const fitViewBtn = document.getElementById("fitView");
+      const resetViewBtn = document.getElementById("resetView");
+      const transformOutput = document.getElementById("transformOutput");
+      const copyTransformBtn = document.getElementById("copyTransform");
+      const downloadTransformBtn = document.getElementById("downloadTransform");
+      const statusMsg = document.getElementById("statusMsg");
+      const xodrCountEl = document.getElementById("xodrCount");
+      const pklCountEl = document.getElementById("pklCount");
+      const scaleReadout = document.getElementById("scaleReadout");
+      const thetaReadout = document.getElementById("thetaReadout");
+      const txReadout = document.getElementById("txReadout");
+      const tyReadout = document.getElementById("tyReadout");
+
+      const AXIS_VARIANTS = {
+        xy: (x, y) => [x, y],
+        x_neg_y: (x, y) => [x, -y],
+        neg_x_y: (x, y) => [-x, y],
+        neg_x_neg_y: (x, y) => [-x, -y],
+        y_x: (x, y) => [y, x],
+        y_neg_x: (x, y) => [y, -x],
+        neg_y_x: (x, y) => [-y, x],
+        neg_y_neg_x: (x, y) => [-y, -x],
+      };
+
+      const state = {
+        viewport: { width: 0, height: 0 },
+        xodrText: "",
+        xodrRawPoints: [],
+        xodrPoints: [],
+        xodrSource: "",
+        pklRawPoints: [],
+        pklAllPoints: [],
+        pklPoints: [],
+        pklSources: [],
+        pklTotalCount: 0,
+        xodrTotalCount: 0,
+        variantPoints: [],
+        centroid: { x: 0, y: 0 },
+        transform: { scale: 1, theta: 0, tx: 0, ty: 0, axisVariant: "xy" },
+        view: { scale: 1, offsetX: 0, offsetY: 0 },
+        drag: { active: false, mode: "", lastX: 0, lastY: 0 },
+        spacePressed: false,
+        needsRender: true,
+      };
+
+      function setStatus(message) {
+        statusMsg.textContent = message || "";
+      }
+
+      function resizeCanvas() {
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        state.viewport.width = rect.width;
+        state.viewport.height = rect.height;
+        canvas.width = Math.max(1, Math.round(rect.width * dpr));
+        canvas.height = Math.max(1, Math.round(rect.height * dpr));
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        requestRender();
+      }
+
+      function requestRender() {
+        state.needsRender = true;
+      }
+
+      function worldToScreen(pt) {
+        return {
+          x: pt.x * state.view.scale + state.view.offsetX,
+          y: state.viewport.height - (pt.y * state.view.scale + state.view.offsetY),
+        };
+      }
+
+      function screenToWorld(x, y) {
+        return {
+          x: (x - state.view.offsetX) / state.view.scale,
+          y: ((state.viewport.height - y) - state.view.offsetY) / state.view.scale,
+        };
+      }
+
+      function clampScale(value) {
+        if (!Number.isFinite(value)) return state.transform.scale;
+        return Math.max(1e-6, value);
+      }
+
+      function formatNum(value, digits) {
+        if (!Number.isFinite(value)) return "0";
+        return Number(value.toFixed(digits || 4)).toString();
+      }
+
+      function applyTransform(pt) {
+        const c = Math.cos(state.transform.theta);
+        const s = Math.sin(state.transform.theta);
+        return {
+          x: state.transform.scale * (pt.x * c - pt.y * s) + state.transform.tx,
+          y: state.transform.scale * (pt.x * s + pt.y * c) + state.transform.ty,
+        };
+      }
+
+      function computeCentroid(points) {
+        if (!points.length) return { x: 0, y: 0 };
+        let sx = 0;
+        let sy = 0;
+        for (const p of points) {
+          sx += p[0];
+          sy += p[1];
+        }
+        return { x: sx / points.length, y: sy / points.length };
+      }
+
+      function getBounds(points) {
+        if (!points.length) return null;
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const p of points) {
+          if (p[0] < minX) minX = p[0];
+          if (p[1] < minY) minY = p[1];
+          if (p[0] > maxX) maxX = p[0];
+          if (p[1] > maxY) maxY = p[1];
+        }
+        return { minX, minY, maxX, maxY };
+      }
+
+      function getBoundsTransformed(points) {
+        if (!points.length) return null;
+        const c = Math.cos(state.transform.theta);
+        const s = Math.sin(state.transform.theta);
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const p of points) {
+          const x = state.transform.scale * (p[0] * c - p[1] * s) + state.transform.tx;
+          const y = state.transform.scale * (p[0] * s + p[1] * c) + state.transform.ty;
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
+        return { minX, minY, maxX, maxY };
+      }
+
+      function fitViewToBounds(bounds) {
+        if (!bounds) return;
+        const margin = 40;
+        const spanX = Math.max(1e-6, bounds.maxX - bounds.minX);
+        const spanY = Math.max(1e-6, bounds.maxY - bounds.minY);
+        const scaleX = (state.viewport.width - margin * 2) / spanX;
+        const scaleY = (state.viewport.height - margin * 2) / spanY;
+        state.view.scale = Math.max(1e-6, Math.min(scaleX, scaleY));
+        state.view.offsetX = margin - bounds.minX * state.view.scale;
+        state.view.offsetY = state.viewport.height - margin - bounds.maxY * state.view.scale;
+        requestRender();
+      }
+
+      function fitView() {
+        const boundsList = [];
+        const xodrBounds = getBounds(state.xodrPoints);
+        if (xodrBounds) boundsList.push(xodrBounds);
+        const pklBounds = getBoundsTransformed(state.variantPoints);
+        if (pklBounds) boundsList.push(pklBounds);
+        if (!boundsList.length) return;
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const b of boundsList) {
+          minX = Math.min(minX, b.minX);
+          minY = Math.min(minY, b.minY);
+          maxX = Math.max(maxX, b.maxX);
+          maxY = Math.max(maxY, b.maxY);
+        }
+        fitViewToBounds({ minX, minY, maxX, maxY });
+      }
+
+      function resetView() {
+        state.view.scale = 1;
+        state.view.offsetX = 0;
+        state.view.offsetY = 0;
+        fitView();
+      }
+
+      function decimate(points, maxPoints) {
+        if (!maxPoints || points.length <= maxPoints) return points;
+        const step = Math.max(1, Math.ceil(points.length / maxPoints));
+        const out = [];
+        for (let i = 0; i < points.length; i += step) {
+          out.push(points[i]);
+        }
+        return out;
+      }
+
+      function normalizePoints(raw) {
+        const out = [];
+        for (const p of raw) {
+          if (!p || p.length < 2) continue;
+          const x = Number(p[0]);
+          const y = Number(p[1]);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+          out.push([x, y]);
+        }
+        return out;
+      }
+
+      function extractPoints(data) {
+        if (!data) return [];
+        if (Array.isArray(data)) {
+          if (data.length && Array.isArray(data[0])) return data;
+        }
+        if (Array.isArray(data.points)) return data.points;
+        if (Array.isArray(data.aligned_points)) return data.aligned_points;
+        if (Array.isArray(data.polylines)) {
+          const out = [];
+          for (const poly of data.polylines) {
+            if (Array.isArray(poly)) {
+              out.push(...poly);
+            }
+          }
+          return out;
+        }
+        return [];
+      }
+
+      function parseLaneTypes(value) {
+        const cleaned = (value || "").trim().toLowerCase();
+        if (!cleaned || cleaned === "all" || cleaned === "*") return null;
+        const parts = cleaned.split(",").map((part) => part.trim()).filter(Boolean);
+        return parts.length ? new Set(parts) : null;
+      }
+
+      function rebuildVariantPoints(keepAnchor) {
+        const raw = state.pklRawPoints;
+        const variantFn = AXIS_VARIANTS[state.transform.axisVariant] || AXIS_VARIANTS.xy;
+        let anchorWorld = null;
+        if (keepAnchor && state.variantPoints.length) {
+          anchorWorld = applyTransform({ x: state.centroid.x, y: state.centroid.y });
+        }
+        const out = [];
+        for (const p of raw) {
+          out.push(variantFn(p[0], p[1]));
+        }
+        state.variantPoints = out;
+        state.centroid = computeCentroid(out);
+        if (keepAnchor && anchorWorld) {
+          const c = state.centroid;
+          const cos = Math.cos(state.transform.theta);
+          const sin = Math.sin(state.transform.theta);
+          state.transform.tx = anchorWorld.x - state.transform.scale * (c.x * cos - c.y * sin);
+          state.transform.ty = anchorWorld.y - state.transform.scale * (c.x * sin + c.y * cos);
+        }
+        updateTransformOutputs();
+        requestRender();
+      }
+
+      function setRotation(theta, keepAnchor) {
+        if (!Number.isFinite(theta)) return;
+        let anchorWorld = null;
+        if (keepAnchor && state.variantPoints.length) {
+          anchorWorld = applyTransform({ x: state.centroid.x, y: state.centroid.y });
+        }
+        state.transform.theta = theta;
+        if (keepAnchor && anchorWorld) {
+          const c = state.centroid;
+          const cos = Math.cos(state.transform.theta);
+          const sin = Math.sin(state.transform.theta);
+          state.transform.tx = anchorWorld.x - state.transform.scale * (c.x * cos - c.y * sin);
+          state.transform.ty = anchorWorld.y - state.transform.scale * (c.x * sin + c.y * cos);
+        }
+        updateTransformOutputs();
+        requestRender();
+      }
+
+      function setScale(scale, keepAnchor) {
+        const nextScale = clampScale(scale);
+        let anchorWorld = null;
+        if (keepAnchor && state.variantPoints.length) {
+          anchorWorld = applyTransform({ x: state.centroid.x, y: state.centroid.y });
+        }
+        state.transform.scale = nextScale;
+        if (keepAnchor && anchorWorld) {
+          const c = state.centroid;
+          const cos = Math.cos(state.transform.theta);
+          const sin = Math.sin(state.transform.theta);
+          state.transform.tx = anchorWorld.x - state.transform.scale * (c.x * cos - c.y * sin);
+          state.transform.ty = anchorWorld.y - state.transform.scale * (c.x * sin + c.y * cos);
+        }
+        updateTransformOutputs();
+        requestRender();
+      }
+
+      function setTranslation(tx, ty) {
+        if (Number.isFinite(tx)) state.transform.tx = tx;
+        if (Number.isFinite(ty)) state.transform.ty = ty;
+        updateTransformOutputs();
+        requestRender();
+      }
+
+      function updateTransformOutputs() {
+        scaleInput.value = formatNum(state.transform.scale, 6);
+        thetaInput.value = formatNum((state.transform.theta * 180) / Math.PI, 3);
+        txInput.value = formatNum(state.transform.tx, 3);
+        tyInput.value = formatNum(state.transform.ty, 3);
+        scaleReadout.textContent = formatNum(state.transform.scale, 4);
+        thetaReadout.textContent = formatNum((state.transform.theta * 180) / Math.PI, 2);
+        txReadout.textContent = formatNum(state.transform.tx, 2);
+        tyReadout.textContent = formatNum(state.transform.ty, 2);
+
+        const payload = {
+          scale: Number(state.transform.scale.toFixed(6)),
+          theta_rad: Number(state.transform.theta.toFixed(6)),
+          theta_deg: Number(((state.transform.theta * 180) / Math.PI).toFixed(4)),
+          tx: Number(state.transform.tx.toFixed(4)),
+          ty: Number(state.transform.ty.toFixed(4)),
+          axis_variant: state.transform.axisVariant,
+          xodr_lane_mode: laneModeInput?.value || "reference",
+          xodr_lane_types: laneTypesInput?.value?.trim() || "all",
+          source_pkls: state.pklSources,
+          source_xodr: state.xodrSource,
+        };
+        transformOutput.value = JSON.stringify(payload, null, 2);
+        xodrCountEl.textContent = state.xodrPoints.length.toString();
+        pklCountEl.textContent = state.variantPoints.length.toString();
+      }
+
+      function zoomAt(factor, screenX, screenY) {
+        const world = screenToWorld(screenX, screenY);
+        state.view.scale = Math.max(1e-6, state.view.scale * factor);
+        state.view.offsetX = screenX - world.x * state.view.scale;
+        state.view.offsetY = state.viewport.height - screenY - world.y * state.view.scale;
+        requestRender();
+      }
+
+      function drawPoints(points, color, size) {
+        if (!points.length) return;
+        ctx.fillStyle = color;
+        const half = size / 2;
+        for (const p of points) {
+          const screen = worldToScreen({ x: p[0], y: p[1] });
+          ctx.fillRect(screen.x - half, screen.y - half, size, size);
+        }
+      }
+
+      function drawTransformedPoints(points, color, size) {
+        if (!points.length) return;
+        const c = Math.cos(state.transform.theta);
+        const s = Math.sin(state.transform.theta);
+        const half = size / 2;
+        ctx.fillStyle = color;
+        for (const p of points) {
+          const x = state.transform.scale * (p[0] * c - p[1] * s) + state.transform.tx;
+          const y = state.transform.scale * (p[0] * s + p[1] * c) + state.transform.ty;
+          const screen = worldToScreen({ x, y });
+          ctx.fillRect(screen.x - half, screen.y - half, size, size);
+        }
+      }
+
+      function drawOrigin() {
+        const origin = worldToScreen({ x: 0, y: 0 });
+        ctx.strokeStyle = "rgba(30, 30, 30, 0.35)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(origin.x - 8, origin.y);
+        ctx.lineTo(origin.x + 8, origin.y);
+        ctx.moveTo(origin.x, origin.y - 8);
+        ctx.lineTo(origin.x, origin.y + 8);
+        ctx.stroke();
+      }
+
+      function render() {
+        if (!state.needsRender) return;
+        state.needsRender = false;
+        ctx.clearRect(0, 0, state.viewport.width, state.viewport.height);
+        ctx.fillStyle = "#fdf7ee";
+        ctx.fillRect(0, 0, state.viewport.width, state.viewport.height);
+
+        drawOrigin();
+        drawPoints(state.xodrPoints, getComputedStyle(document.documentElement).getPropertyValue("--xodr"), 1.4);
+        drawTransformedPoints(state.variantPoints, getComputedStyle(document.documentElement).getPropertyValue("--pkl"), 2.0);
+      }
+
+      function animate() {
+        render();
+        requestAnimationFrame(animate);
+      }
+
+      function upperBound(values, target) {
+        let lo = 0;
+        let hi = values.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (values[mid] <= target) {
+            lo = mid + 1;
+          } else {
+            hi = mid;
+          }
+        }
+        return lo;
+      }
+
+      function sampleLineWithHeading(x0, y0, hdg, length, step, s0) {
+        if (!(length > 0)) return { s: [], x: [], y: [], hdg: [] };
+        const safeStep = Math.max(step, 0.1);
+        const n = Math.max(1, Math.ceil(length / safeStep));
+        const s = new Array(n + 1);
+        const x = new Array(n + 1);
+        const y = new Array(n + 1);
+        const h = new Array(n + 1);
+        const cosH = Math.cos(hdg);
+        const sinH = Math.sin(hdg);
+        for (let i = 0; i <= n; i += 1) {
+          const sLocal = (length * i) / n;
+          s[i] = s0 + sLocal;
+          x[i] = x0 + sLocal * cosH;
+          y[i] = y0 + sLocal * sinH;
+          h[i] = hdg;
+        }
+        return { s, x, y, hdg: h };
+      }
+
+      function sampleArcWithHeading(x0, y0, hdg, length, curvature, step, s0) {
+        if (Math.abs(curvature) < 1e-6) {
+          return sampleLineWithHeading(x0, y0, hdg, length, step, s0);
+        }
+        const safeStep = Math.max(step, 0.1);
+        const n = Math.max(1, Math.ceil(length / safeStep));
+        const s = new Array(n + 1);
+        const x = new Array(n + 1);
+        const y = new Array(n + 1);
+        const h = new Array(n + 1);
+        for (let i = 0; i <= n; i += 1) {
+          const sLocal = (length * i) / n;
+          const theta = hdg + curvature * sLocal;
+          s[i] = s0 + sLocal;
+          x[i] = x0 + (Math.sin(theta) - Math.sin(hdg)) / curvature;
+          y[i] = y0 - (Math.cos(theta) - Math.cos(hdg)) / curvature;
+          h[i] = theta;
+        }
+        return { s, x, y, hdg: h };
+      }
+
+      function sampleSpiralWithHeading(x0, y0, hdg, length, curvStart, curvEnd, step, s0) {
+        if (!(length > 0)) return { s: [], x: [], y: [], hdg: [] };
+        const safeStep = Math.max(step, 0.1);
+        const n = Math.max(1, Math.ceil(length / safeStep));
+        const ds = length / n;
+        const s = new Array(n + 1);
+        const x = new Array(n + 1);
+        const y = new Array(n + 1);
+        const h = new Array(n + 1);
+        let px = x0;
+        let py = y0;
+        let theta = hdg;
+        s[0] = s0;
+        x[0] = px;
+        y[0] = py;
+        h[0] = theta;
+        for (let i = 0; i < n; i += 1) {
+          const sMid = (i + 0.5) * ds;
+          const curv = curvStart + (curvEnd - curvStart) * (sMid / length);
+          const thetaMid = theta + 0.5 * curv * ds;
+          px += ds * Math.cos(thetaMid);
+          py += ds * Math.sin(thetaMid);
+          theta += curv * ds;
+          s[i + 1] = s0 + (i + 1) * ds;
+          x[i + 1] = px;
+          y[i + 1] = py;
+          h[i + 1] = theta;
+        }
+        return { s, x, y, hdg: h };
+      }
+
+      function sampleGeometryWithHeading(geom, step) {
+        const s0 = Number(geom.getAttribute("s") || "0");
+        const x0 = Number(geom.getAttribute("x") || "0");
+        const y0 = Number(geom.getAttribute("y") || "0");
+        const hdg = Number(geom.getAttribute("hdg") || "0");
+        const length = Number(geom.getAttribute("length") || "0");
+        if (!(length > 0)) return { s: [], x: [], y: [], hdg: [] };
+        const child = geom.children[0];
+        if (!child) return { s: [], x: [], y: [], hdg: [] };
+        if (child.tagName === "line") {
+          return sampleLineWithHeading(x0, y0, hdg, length, step, s0);
+        }
+        if (child.tagName === "arc") {
+          const curvature = Number(child.getAttribute("curvature") || "0");
+          return sampleArcWithHeading(x0, y0, hdg, length, curvature, step, s0);
+        }
+        if (child.tagName === "spiral") {
+          const curvStart = Number(child.getAttribute("curvStart") || "0");
+          const curvEnd = Number(child.getAttribute("curvEnd") || "0");
+          return sampleSpiralWithHeading(x0, y0, hdg, length, curvStart, curvEnd, step, s0);
+        }
+        return { s: [], x: [], y: [], hdg: [] };
+      }
+
+      function parseLaneOffsets(lanesElem) {
+        const segments = [];
+        if (!lanesElem) return { segments, starts: [] };
+        const offsets = lanesElem.querySelectorAll("laneOffset");
+        for (const elem of offsets) {
+          segments.push({
+            s: Number(elem.getAttribute("s") || "0"),
+            a: Number(elem.getAttribute("a") || "0"),
+            b: Number(elem.getAttribute("b") || "0"),
+            c: Number(elem.getAttribute("c") || "0"),
+            d: Number(elem.getAttribute("d") || "0"),
+          });
+        }
+        segments.sort((a, b) => a.s - b.s);
+        return { segments, starts: segments.map((seg) => seg.s) };
+      }
+
+      function parseLaneWidths(laneElem) {
+        const widths = [];
+        const widthElems = laneElem.querySelectorAll("width");
+        for (const width of widthElems) {
+          widths.push({
+            s: Number(width.getAttribute("sOffset") || "0"),
+            a: Number(width.getAttribute("a") || "0"),
+            b: Number(width.getAttribute("b") || "0"),
+            c: Number(width.getAttribute("c") || "0"),
+            d: Number(width.getAttribute("d") || "0"),
+          });
+        }
+        widths.sort((a, b) => a.s - b.s);
+        return widths;
+      }
+
+      function parseLanes(container, side) {
+        const lanes = [];
+        if (!container) return lanes;
+        const laneElems = container.querySelectorAll("lane");
+        for (const laneElem of laneElems) {
+          const laneId = Number(laneElem.getAttribute("id") || "0");
+          if (!Number.isFinite(laneId) || laneId === 0) continue;
+          const laneType = (laneElem.getAttribute("type") || "unknown").toLowerCase();
+          const widthSegments = parseLaneWidths(laneElem);
+          const widthStarts = widthSegments.map((seg) => seg.s);
+          lanes.push({
+            id: laneId,
+            type: laneType,
+            widthSegments,
+            widthStarts,
+          });
+        }
+        lanes.sort((a, b) => (side === "left" ? a.id - b.id : b.id - a.id));
+        return lanes;
+      }
+
+      function parseLaneSections(lanesElem) {
+        const sections = [];
+        if (!lanesElem) return sections;
+        const sectionElems = lanesElem.querySelectorAll("laneSection");
+        for (const sectionElem of sectionElems) {
+          const s = Number(sectionElem.getAttribute("s") || "0");
+          const left = parseLanes(sectionElem.querySelector("left"), "left");
+          const right = parseLanes(sectionElem.querySelector("right"), "right");
+          sections.push({ s, left, right });
+        }
+        sections.sort((a, b) => a.s - b.s);
+        return sections;
+      }
+
+      function evalPolySegments(segments, starts, s) {
+        if (!segments.length) return 0;
+        let idx = upperBound(starts, s) - 1;
+        if (idx < 0) idx = 0;
+        const seg = segments[idx];
+        const ds = s - seg.s;
+        return seg.a + seg.b * ds + seg.c * ds * ds + seg.d * ds * ds * ds;
+      }
+
+      function evalLaneWidth(lane, ds) {
+        if (!lane.widthSegments.length) return 0;
+        let idx = upperBound(lane.widthStarts, ds) - 1;
+        if (idx < 0) idx = 0;
+        const seg = lane.widthSegments[idx];
+        const dsLocal = ds - seg.s;
+        const width = seg.a + seg.b * dsLocal + seg.c * dsLocal * dsLocal + seg.d * dsLocal * dsLocal * dsLocal;
+        return Math.max(0, width);
+      }
+
+      function laneCenterOffsets(section, ds, laneOffset, laneTypes) {
+        const offsets = [];
+        let cum = 0;
+        for (const lane of section.left) {
+          const width = evalLaneWidth(lane, ds);
+          if (!(width > 0)) continue;
+          if (!laneTypes || laneTypes.has(lane.type)) {
+            offsets.push(laneOffset + cum + width / 2);
+          }
+          cum += width;
+        }
+        cum = 0;
+        for (const lane of section.right) {
+          const width = evalLaneWidth(lane, ds);
+          if (!(width > 0)) continue;
+          if (!laneTypes || laneTypes.has(lane.type)) {
+            offsets.push(laneOffset - cum - width / 2);
+          }
+          cum += width;
+        }
+        return offsets;
+      }
+
+      function laneBoundaryOffsets(section, ds, laneOffset, laneTypes) {
+        const offsets = [];
+        let cum = 0;
+        for (const lane of section.left) {
+          const width = evalLaneWidth(lane, ds);
+          if (!(width > 0)) continue;
+          cum += width;
+          if (!laneTypes || laneTypes.has(lane.type)) {
+            offsets.push(laneOffset + cum);
+          }
+        }
+        cum = 0;
+        for (const lane of section.right) {
+          const width = evalLaneWidth(lane, ds);
+          if (!(width > 0)) continue;
+          cum += width;
+          if (!laneTypes || laneTypes.has(lane.type)) {
+            offsets.push(laneOffset - cum);
+          }
+        }
+        return offsets;
+      }
+
+      function offsetPoint(x, y, hdg, offset) {
+        const nx = -Math.sin(hdg);
+        const ny = Math.cos(hdg);
+        return [x + offset * nx, y + offset * ny];
+      }
+
+      function sampleLanePoints(lanesElem, refSamples, laneMode, laneTypes) {
+        if (!lanesElem || !refSamples.s.length) return [];
+        const { segments, starts } = parseLaneOffsets(lanesElem);
+        const laneSections = parseLaneSections(lanesElem);
+        if (!laneSections.length) return [];
+        const sectionStarts = laneSections.map((section) => section.s);
+        const points = [];
+        for (let i = 0; i < refSamples.s.length; i += 1) {
+          const s = refSamples.s[i];
+          let idx = upperBound(sectionStarts, s) - 1;
+          if (idx < 0) idx = 0;
+          const section = laneSections[idx];
+          const ds = s - section.s;
+          const laneOffset = evalPolySegments(segments, starts, s);
+          if (laneMode === "center" || laneMode === "both") {
+            const offsets = laneCenterOffsets(section, ds, laneOffset, laneTypes);
+            for (const off of offsets) {
+              points.push(offsetPoint(refSamples.x[i], refSamples.y[i], refSamples.hdg[i], off));
+            }
+          }
+          if (laneMode === "boundary" || laneMode === "both") {
+            const offsets = laneBoundaryOffsets(section, ds, laneOffset, laneTypes);
+            for (const off of offsets) {
+              points.push(offsetPoint(refSamples.x[i], refSamples.y[i], refSamples.hdg[i], off));
+            }
+          }
+        }
+        return points;
+      }
+
+      function sampleRoadReference(road, step) {
+        const s = [];
+        const x = [];
+        const y = [];
+        const hdg = [];
+        const geoms = road.querySelectorAll("planView > geometry");
+        for (const geom of geoms) {
+          const samples = sampleGeometryWithHeading(geom, step);
+          for (let i = 0; i < samples.s.length; i += 1) {
+            s.push(samples.s[i]);
+            x.push(samples.x[i]);
+            y.push(samples.y[i]);
+            hdg.push(samples.hdg[i]);
+          }
+        }
+        return { s, x, y, hdg };
+      }
+
+      function parseXodr(text, step, laneMode, laneTypes) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(text, "text/xml");
+        if (doc.querySelector("parsererror")) {
+          throw new Error("Invalid XODR XML.");
+        }
+        const points = [];
+        const roads = Array.from(doc.querySelectorAll("road"));
+        if (!roads.length) {
+          const geoms = Array.from(doc.querySelectorAll("planView > geometry"));
+          for (const geom of geoms) {
+            const samples = sampleGeometryWithHeading(geom, step);
+            for (let i = 0; i < samples.x.length; i += 1) {
+              points.push([samples.x[i], samples.y[i]]);
+            }
+          }
+          return points;
+        }
+        for (const road of roads) {
+          const refSamples = sampleRoadReference(road, step);
+          for (let i = 0; i < refSamples.x.length; i += 1) {
+            points.push([refSamples.x[i], refSamples.y[i]]);
+          }
+          if (laneMode && laneMode !== "reference") {
+            const lanesElem = road.querySelector("lanes");
+            const lanePoints = sampleLanePoints(lanesElem, refSamples, laneMode, laneTypes);
+            if (lanePoints.length) {
+              points.push(...lanePoints);
+            }
+          }
+        }
+        return points;
+      }
+
+      function resampleXodr() {
+        if (!state.xodrText) return;
+        const step = Number(xodrStepInput.value) || 2.0;
+        const laneMode = laneModeInput?.value || "reference";
+        const laneTypes = parseLaneTypes(laneTypesInput?.value || "");
+        try {
+          const points = parseXodr(state.xodrText, step, laneMode, laneTypes);
+          state.xodrTotalCount = points.length;
+          state.xodrRawPoints = points;
+          state.xodrPoints = decimate(points, Number(maxPointsInput.value) || 0);
+          setStatus(`XODR sampled: ${state.xodrPoints.length} points (${laneMode})`);
+          updateTransformOutputs();
+          fitView();
+        } catch (err) {
+          setStatus(err.message || "Failed to parse XODR.");
+        }
+      }
+
+      async function handleXodrFile(file) {
+        const text = await file.text();
+        state.xodrText = text;
+        state.xodrSource = file.name;
+        resampleXodr();
+      }
+
+      async function handlePklFiles(files) {
+        const combined = [];
+        const sources = [];
+        let totalCount = 0;
+        for (const file of files) {
+          try {
+            const text = await file.text();
+            const data = JSON.parse(text);
+            const rawPoints = normalizePoints(extractPoints(data));
+            totalCount += rawPoints.length;
+            combined.push(...rawPoints);
+            sources.push(file.name);
+          } catch (err) {
+            setStatus(`Failed to read ${file.name}`);
+          }
+        }
+        state.pklTotalCount = totalCount;
+        state.pklAllPoints = combined;
+        state.pklRawPoints = decimate(state.pklAllPoints, Number(maxPointsInput.value) || 0);
+        state.pklSources = sources;
+        rebuildVariantPoints(false);
+        setStatus(`PKL loaded: ${state.pklRawPoints.length} points`);
+        fitView();
+      }
+
+      function centerOnXodr() {
+        if (!state.xodrPoints.length || !state.variantPoints.length) return;
+        const xodrCenter = computeCentroid(state.xodrPoints);
+        const c = state.centroid;
+        const cos = Math.cos(state.transform.theta);
+        const sin = Math.sin(state.transform.theta);
+        state.transform.tx = xodrCenter.x - state.transform.scale * (c.x * cos - c.y * sin);
+        state.transform.ty = xodrCenter.y - state.transform.scale * (c.x * sin + c.y * cos);
+        updateTransformOutputs();
+        requestRender();
+      }
+
+      function resetTransform() {
+        state.transform.scale = 1;
+        state.transform.theta = 0;
+        state.transform.tx = 0;
+        state.transform.ty = 0;
+        updateTransformOutputs();
+        requestRender();
+      }
+
+      function applySampling() {
+        const maxPoints = Number(maxPointsInput.value) || 0;
+        state.xodrPoints = decimate(state.xodrRawPoints, maxPoints);
+        state.pklRawPoints = decimate(state.pklAllPoints, maxPoints);
+        rebuildVariantPoints(false);
+        fitView();
+      }
+
+      function handlePointerDown(event) {
+        if (event.button === 2) {
+          state.drag.mode = "pan";
+        } else if (event.shiftKey) {
+          state.drag.mode = "rotate";
+        } else if (event.altKey) {
+          state.drag.mode = "scale";
+        } else if (event.ctrlKey || event.metaKey || state.spacePressed) {
+          state.drag.mode = "pan";
+        } else {
+          state.drag.mode = "translate";
+        }
+        state.drag.active = true;
+        state.drag.lastX = event.offsetX;
+        state.drag.lastY = event.offsetY;
+        canvas.setPointerCapture(event.pointerId);
+      }
+
+      function handlePointerMove(event) {
+        if (!state.drag.active) return;
+        const dx = event.offsetX - state.drag.lastX;
+        const dy = event.offsetY - state.drag.lastY;
+        state.drag.lastX = event.offsetX;
+        state.drag.lastY = event.offsetY;
+
+        if (state.drag.mode === "pan") {
+          state.view.offsetX += dx;
+          state.view.offsetY -= dy;
+          requestRender();
+          return;
+        }
+
+        if (state.drag.mode === "translate") {
+          const worldDx = dx / state.view.scale;
+          const worldDy = -dy / state.view.scale;
+          setTranslation(state.transform.tx + worldDx, state.transform.ty + worldDy);
+          return;
+        }
+
+        if (state.drag.mode === "rotate") {
+          const delta = dx * 0.01;
+          setRotation(state.transform.theta + delta, anchorToggle.checked);
+          return;
+        }
+
+        if (state.drag.mode === "scale") {
+          const factor = Math.exp(-dy * 0.01);
+          setScale(state.transform.scale * factor, anchorToggle.checked);
+        }
+      }
+
+      function handlePointerUp(event) {
+        state.drag.active = false;
+        canvas.releasePointerCapture(event.pointerId);
+      }
+
+      function handleWheel(event) {
+        event.preventDefault();
+        const factor = Math.exp(-event.deltaY * 0.001);
+        zoomAt(factor, event.offsetX, event.offsetY);
+      }
+
+      function handleKeydown(event) {
+        const tag = document.activeElement?.tagName?.toLowerCase();
+        if (tag === "input" || tag === "textarea" || tag === "select") return;
+        if (event.key === " " || event.key === "Spacebar") {
+          state.spacePressed = true;
+          event.preventDefault();
+          return;
+        }
+        const step = Number(nudgeStepInput.value) || 1.0;
+        const fast = event.shiftKey ? 5 : 1;
+        if (event.key === "ArrowUp") {
+          setTranslation(state.transform.tx, state.transform.ty + step * fast);
+        } else if (event.key === "ArrowDown") {
+          setTranslation(state.transform.tx, state.transform.ty - step * fast);
+        } else if (event.key === "ArrowLeft") {
+          setTranslation(state.transform.tx - step * fast, state.transform.ty);
+        } else if (event.key === "ArrowRight") {
+          setTranslation(state.transform.tx + step * fast, state.transform.ty);
+        } else if (event.key === "q" || event.key === "Q") {
+          setRotation(state.transform.theta - (Math.PI / 180) * fast, anchorToggle.checked);
+        } else if (event.key === "e" || event.key === "E") {
+          setRotation(state.transform.theta + (Math.PI / 180) * fast, anchorToggle.checked);
+        } else if (event.key === "-" || event.key === "_") {
+          setScale(state.transform.scale * (1 - 0.02 * fast), anchorToggle.checked);
+        } else if (event.key === "=" || event.key === "+") {
+          setScale(state.transform.scale * (1 + 0.02 * fast), anchorToggle.checked);
+        } else if (event.key === "f" || event.key === "F") {
+          fitView();
+        } else if (event.key === "0") {
+          resetTransform();
+        }
+      }
+
+      function handleKeyup(event) {
+        if (event.key === " " || event.key === "Spacebar") {
+          state.spacePressed = false;
+        }
+      }
+
+      async function copyTransform() {
+        const text = transformOutput.value;
+        try {
+          await navigator.clipboard.writeText(text);
+          setStatus("Transform copied.");
+        } catch (err) {
+          transformOutput.focus();
+          transformOutput.select();
+          document.execCommand("copy");
+          setStatus("Transform copied.");
+        }
+      }
+
+      function downloadTransform() {
+        const blob = new Blob([transformOutput.value], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "transform_manual.json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }
+
+      function handleDrop(zone, handler) {
+        zone.addEventListener("dragover", (event) => {
+          event.preventDefault();
+          zone.classList.add("dragover");
+        });
+        zone.addEventListener("dragleave", () => zone.classList.remove("dragover"));
+        zone.addEventListener("drop", (event) => {
+          event.preventDefault();
+          zone.classList.remove("dragover");
+          const files = Array.from(event.dataTransfer.files || []);
+          handler(files);
+        });
+        zone.addEventListener("click", () => {
+          if (zone === xodrDrop) xodrInput.click();
+          if (zone === pklDrop) pklInput.click();
+        });
+      }
+
+      xodrInput.addEventListener("change", (event) => {
+        const file = event.target.files[0];
+        if (file) handleXodrFile(file);
+      });
+
+      pklInput.addEventListener("change", (event) => {
+        const files = Array.from(event.target.files || []);
+        if (files.length) handlePklFiles(files);
+      });
+
+      handleDrop(xodrDrop, (files) => {
+        if (files.length) handleXodrFile(files[0]);
+      });
+
+      handleDrop(pklDrop, (files) => {
+        if (files.length) handlePklFiles(files);
+      });
+
+      axisVariant.addEventListener("change", () => {
+        state.transform.axisVariant = axisVariant.value;
+        rebuildVariantPoints(anchorToggle.checked);
+      });
+
+      scaleInput.addEventListener("input", () => {
+        setScale(Number(scaleInput.value), anchorToggle.checked);
+      });
+
+      thetaInput.addEventListener("input", () => {
+        const deg = Number(thetaInput.value) || 0;
+        setRotation((deg * Math.PI) / 180, anchorToggle.checked);
+      });
+
+      txInput.addEventListener("input", () => {
+        setTranslation(Number(txInput.value), state.transform.ty);
+      });
+
+      tyInput.addEventListener("input", () => {
+        setTranslation(state.transform.tx, Number(tyInput.value));
+      });
+
+      resampleXodrBtn.addEventListener("click", resampleXodr);
+      laneModeInput.addEventListener("change", resampleXodr);
+      laneTypesInput.addEventListener("change", resampleXodr);
+      applySamplingBtn.addEventListener("click", applySampling);
+      resetTransformBtn.addEventListener("click", resetTransform);
+      centerOnXodrBtn.addEventListener("click", centerOnXodr);
+      fitViewBtn.addEventListener("click", fitView);
+      resetViewBtn.addEventListener("click", resetView);
+      copyTransformBtn.addEventListener("click", copyTransform);
+      downloadTransformBtn.addEventListener("click", downloadTransform);
+
+      canvas.addEventListener("pointerdown", handlePointerDown);
+      canvas.addEventListener("pointermove", handlePointerMove);
+      canvas.addEventListener("pointerup", handlePointerUp);
+      canvas.addEventListener("pointercancel", handlePointerUp);
+      canvas.addEventListener("wheel", handleWheel, { passive: false });
+      canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+      window.addEventListener("keydown", handleKeydown);
+      window.addEventListener("keyup", handleKeyup);
+      window.addEventListener("resize", resizeCanvas);
+
+      resizeCanvas();
+      updateTransformOutputs();
+      fitView();
+      requestAnimationFrame(animate);
+    })();
+  </script>
+</body>
+</html>

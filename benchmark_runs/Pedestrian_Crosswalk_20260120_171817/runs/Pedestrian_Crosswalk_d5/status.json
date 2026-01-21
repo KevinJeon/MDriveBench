@@ -1,0 +1,25 @@
+{
+  "attempt_history": [],
+  "category": "Pedestrian Crosswalk",
+  "completed_states": [],
+  "current_state": "scenario_generation",
+  "difficulty": 5,
+  "metrics": {},
+  "repair_counts": {},
+  "row_written": false,
+  "run_id": "Pedestrian_Crosswalk_20260120_171817",
+  "run_key": "Pedestrian_Crosswalk_d5",
+  "start_time": "2026-01-21T01:34:56.155821+00:00",
+  "state_history": [
+    {
+      "state": "scenario_generation",
+      "timestamp": "2026-01-21T01:34:56.155832+00:00"
+    }
+  ],
+  "success": false,
+  "timestamps": {
+    "scenario_generation_start": "2026-01-21T01:34:56.155834+00:00"
+  },
+  "updated_at": "2026-01-21T01:34:56.155836+00:00",
+  "variant_index": 1
+}
