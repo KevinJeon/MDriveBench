@@ -400,15 +400,47 @@ class PipelineRunner:
         else:
             spec = geometry_spec
 
-        radii = [45.0, 55.0, 65.0]
-        crops = crop_picker.build_candidate_crops_for_town(
-            town_name=town,
-            town_json_path=str(nodes_path),
-            radii=radii,
-            min_path_len=22.0,
-            max_paths=80,
-            max_depth=8,
+        # Check if this is a TWO_LANE_CORRIDOR topology - use specialized crop generation
+        is_two_lane_corridor = (
+            spec.topology == "two_lane_corridor" or 
+            (cat_info and cat_info.map.topology == TopologyType.TWO_LANE_CORRIDOR)
         )
+        
+        if is_two_lane_corridor:
+            # Use corridor-specific crop generation for TWO_LANE_CORRIDOR topology
+            print(f"[INFO] Using corridor-specific crop generation for TWO_LANE_CORRIDOR topology")
+            crops = crop_picker.build_corridor_candidate_crops_for_town(
+                town_name=town,
+                town_json_path=str(nodes_path),
+                min_corridor_length=80.0,
+                crop_width=20.0,
+                min_path_len=15.0,
+                max_paths=100,
+                max_depth=5,
+            )
+            if not crops:
+                # Fall back to standard crop generation if no corridor crops found
+                print(f"[WARNING] No corridor-specific crops found, falling back to standard crop generation")
+                radii = [45.0, 55.0, 65.0]
+                crops = crop_picker.build_candidate_crops_for_town(
+                    town_name=town,
+                    town_json_path=str(nodes_path),
+                    radii=radii,
+                    min_path_len=22.0,
+                    max_paths=80,
+                    max_depth=8,
+                )
+        else:
+            # Standard crop generation for all other topologies
+            radii = [45.0, 55.0, 65.0]
+            crops = crop_picker.build_candidate_crops_for_town(
+                town_name=town,
+                town_json_path=str(nodes_path),
+                radii=radii,
+                min_path_len=22.0,
+                max_paths=80,
+                max_depth=8,
+            )
 
         if not crops:
             return False, None, f"No candidate crops found for {town}"
@@ -485,14 +517,17 @@ class PipelineRunner:
         )
         max_paths = 200 if spec.needs_on_ramp else 100
         max_depth = 8 if spec.needs_on_ramp else 5
+        
+        # Use corridor_mode for TWO_LANE_CORRIDOR topology
         legal_paths = generate_legal_paths(
             cropped_segments,
             adj,
             crop,
-            min_path_length=20.0,
+            min_path_length=15.0 if is_two_lane_corridor else 20.0,
             max_paths=max_paths,
             max_depth=max_depth,
             allow_within_region_fallback=False,
+            corridor_mode=is_two_lane_corridor,
         )
         if not legal_paths:
             return False, None, "No legal paths found for this crop"

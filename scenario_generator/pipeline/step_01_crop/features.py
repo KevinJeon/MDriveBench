@@ -156,10 +156,24 @@ def compute_crop_features(
     min_path_len: float,
     max_paths: int,
     max_depth: int,
+    corridor_mode: bool = False,
 ) -> Optional[CropFeatures]:
+    """
+    Compute features for a crop region.
+    
+    Args:
+        corridor_mode: If True, use relaxed constraints suitable for corridor topologies:
+                       - Minimum 2 segments (one per lane) instead of 6
+                       - Minimum 2 paths instead of 6
+                       - Enable corridor_mode in path generation to handle pass-through segments
+    """
     cb = glp.CropBox(crop.xmin, crop.xmax, crop.ymin, crop.ymax)
     segs_crop = glp.crop_segments(segments_full, cb)
-    if len(segs_crop) < 6:
+    
+    # Corridor mode: allow minimum 2 segments (one per lane for bidirectional road)
+    # Standard mode: require at least 6 segments (typical for intersections)
+    min_segments = 2 if corridor_mode else 6
+    if len(segs_crop) < min_segments:
         return None
 
     adj_crop = glp.build_connectivity(segs_crop)
@@ -168,9 +182,14 @@ def compute_crop_features(
         min_path_length=min_path_len,
         max_paths=max_paths,
         max_depth=max_depth,
-        allow_within_region_fallback=False
+        allow_within_region_fallback=False,
+        corridor_mode=corridor_mode,
     )
-    if len(paths) < 6:
+    
+    # Corridor mode: allow minimum 2 paths (one per direction for bidirectional road)
+    # Standard mode: require at least 6 paths
+    min_paths = 2 if corridor_mode else 6
+    if len(paths) < min_paths:
         return None
 
     sigs = [glp.build_path_signature(p) for p in paths]

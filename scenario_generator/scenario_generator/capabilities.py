@@ -485,15 +485,16 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         intent="Exercise overtaking decisions with adjacent lane use, potential oncoming traffic, and obstacles.",
         map=MapRequirements(topology=TopologyType.TWO_LANE_CORRIDOR, needs_multi_lane=False),
         must_include=[
-            "Prop blocking one lane of one vehicles path",
-            "Another vehicle coming from opposite direction (oncoming)",
+            "Prop blocking lane in Vehicle 1's path",
+            "Vehicle 2 approaches from the opposite direction as Vehicle 1",
         ],
         avoid=[
             "Props on either side of the road that do not contribute to the overtaking scenario",
+            "Having all vehicles travel in the same direction",
+            "Any lane changes"
         ],
         vary=[
-            VariationAxis("ego_count", ["2", "3", "4", "5"], "vehicles involved in the overtake scenario"),
-            VariationAxis("obstacle", ["none", "parked_vehicle blocking pass lane"], "blocking obstacle forcing the pass"),
+            VariationAxis("ego_count", ["2", "3", "4"], "vehicles involved in the overtake scenario"),
             VariationAxis("pedestrian", ["none", "walker crossing from sidewalk left or sidewalk right"], "pedestrian involvement during pass"),
             VariationAxis("cyclist", ["none", "cyclist riding in the lane opposite of the one that has the obstacle"], "cyclist involvement during pass"),
         ],

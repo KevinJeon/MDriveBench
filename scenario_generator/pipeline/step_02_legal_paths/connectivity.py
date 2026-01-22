@@ -41,12 +41,21 @@ def build_connectivity(segments: List[LaneSegment],
 
 
 def identify_boundary_segments(segments: List[LaneSegment],
-                               crop: CropBox) -> Tuple[List[int], List[int]]:
+                               crop: CropBox,
+                               corridor_mode: bool = False) -> Tuple[List[int], List[int]]:
     """
     Identify segments that cross the crop boundary.
 
     Entry segments: start outside, enter inside
     Exit segments: start inside, exit outside
+    
+    Args:
+        segments: List of lane segments
+        crop: Crop bounding box
+        corridor_mode: If True, allow pass-through segments (start outside, end outside,
+                       middle inside) to be classified as BOTH entry AND exit.
+                       This is needed for corridor topologies where a road runs
+                       entirely through the crop region.
     """
     entry_segments = []
     exit_segments = []
@@ -66,11 +75,22 @@ def identify_boundary_segments(segments: List[LaneSegment],
         if start_inside and not end_inside:
             exit_segments.append(i)
         elif not start_inside and not end_inside:
-            if i not in entry_segments:
+            # Pass-through segment: starts outside, ends outside, but passes through crop
+            if corridor_mode:
+                # In corridor mode, pass-through segments can serve as BOTH entry and exit
+                # This allows straight roads that run entirely through the crop to generate paths
                 for pt in seg.points[1:-1]:
                     if crop.contains(pt):
-                        exit_segments.append(i)
+                        if i not in exit_segments:
+                            exit_segments.append(i)
                         break
+            else:
+                # Original behavior: only add to exit if not already an entry
+                if i not in entry_segments:
+                    for pt in seg.points[1:-1]:
+                        if crop.contains(pt):
+                            exit_segments.append(i)
+                            break
 
     return entry_segments, exit_segments
 
@@ -81,13 +101,26 @@ def generate_legal_paths(segments: List[LaneSegment],
                          min_path_length: float = 20.0,
                          max_paths: int = 100,
                          max_depth: int = 10,
-                         allow_within_region_fallback: bool = True) -> List[LegalPath]:
+                         allow_within_region_fallback: bool = True,
+                         corridor_mode: bool = False) -> List[LegalPath]:
     """
     Generate legal paths that go from outside the crop area to outside.
+    
+    Args:
+        segments: List of lane segments
+        adj: Adjacency list for segment connectivity
+        crop: Crop bounding box
+        min_path_length: Minimum path length in meters
+        max_paths: Maximum number of paths to generate
+        max_depth: Maximum DFS depth
+        allow_within_region_fallback: If True, fall back to any paths within region
+        corridor_mode: If True, use corridor-specific boundary segment detection
+                       that allows pass-through segments as both entry and exit.
+                       Also allows single-segment paths for corridors.
     """
     legal_paths: List[LegalPath] = []
 
-    entry_segments, exit_segments = identify_boundary_segments(segments, crop)
+    entry_segments, exit_segments = identify_boundary_segments(segments, crop, corridor_mode=corridor_mode)
     print(f"[INFO] Found {len(entry_segments)} entry segments and {len(exit_segments)} exit segments")
 
     if len(entry_segments) == 0 or len(exit_segments) == 0:
@@ -100,16 +133,21 @@ def generate_legal_paths(segments: List[LaneSegment],
         exit_segments = list(range(len(segments)))
 
     exit_set = set(exit_segments)
+    
+    # In corridor mode, allow single-segment paths (a road that passes entirely through)
+    min_path_segments = 1 if corridor_mode else 2
 
     def dfs(current_idx: int, path: List[int], total_length: float, depth: int):
         if len(legal_paths) >= max_paths:
             return
 
-        if current_idx in exit_set and len(path) >= 2:
+        if current_idx in exit_set and len(path) >= min_path_segments:
             if total_length >= min_path_length:
                 path_segments = [segments[i] for i in path]
                 legal_paths.append(LegalPath(path_segments, total_length))
-                return
+                # In corridor mode with single-segment path, don't continue exploring
+                if corridor_mode and len(path) == 1:
+                    return
 
         if depth >= max_depth:
             return
