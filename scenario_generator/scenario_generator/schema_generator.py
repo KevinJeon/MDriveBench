@@ -530,8 +530,10 @@ def _ensure_direction_and_lane_constraints(spec: ScenarioSpec) -> ScenarioSpec:
         # Get the entry_road of the reference vehicle (vehicle_b = ego_vehicles[0])
         ref_entry_road = spec.ego_vehicles[0].entry_road
         for vehicle in spec.ego_vehicles[1:]:
+            # Check if vehicle already has a direction constraint (as EITHER a or b)
             has_direction = any(
-                c.vehicle_a == vehicle.vehicle_id and c.constraint_type in direction_types
+                (c.vehicle_a == vehicle.vehicle_id or c.vehicle_b == vehicle.vehicle_id)
+                and c.constraint_type in direction_types
                 for c in spec.vehicle_constraints
             )
             if not has_direction:
@@ -725,11 +727,12 @@ class SchemaScenarioGenerator:
         
         out["category"] = category
         out["topology"] = cat_info.map.topology.value
-        # Clamp capability flags to the category definition; do not let the model opt into other geometry classes
-        out["needs_oncoming"] = bool(cat_info.map.needs_oncoming)
-        out["needs_multi_lane"] = bool(cat_info.map.needs_multi_lane)
-        out["needs_on_ramp"] = bool(cat_info.map.needs_on_ramp)
-        out["needs_merge"] = bool(cat_info.map.needs_merge or cat_info.map.needs_on_ramp)
+        # Preserve LLM's capability flags if true, OR use category definition
+        # This allows LLM to correctly infer needs_oncoming from must_include constraints
+        out["needs_oncoming"] = bool(cat_info.map.needs_oncoming) or bool(obj.get("needs_oncoming", False))
+        out["needs_multi_lane"] = bool(cat_info.map.needs_multi_lane) or bool(obj.get("needs_multi_lane", False))
+        out["needs_on_ramp"] = bool(cat_info.map.needs_on_ramp) or bool(obj.get("needs_on_ramp", False))
+        out["needs_merge"] = bool(cat_info.map.needs_merge or cat_info.map.needs_on_ramp) or bool(obj.get("needs_merge", False))
 
         vehicles = out.get("ego_vehicles")
         if not isinstance(vehicles, list) or not vehicles:

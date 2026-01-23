@@ -288,6 +288,7 @@ class CategoryDefinition:
     must_include: List[str]
     avoid: List[str]
     vary: List[VariationAxis] = field(default_factory=list)
+    allow_static_props: bool = True
 
 
 # Honest assessment of each category
@@ -300,8 +301,9 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         map=MapRequirements(topology=TopologyType.INTERSECTION),
         must_include=[
             "Vehicle 1 must be from (entry_road=main) and Vehicle 2 from (entry_road=side)",
-            "Every vehicle must have at least one conflicting interaction with another vehicle (i.e., no vehicle may be behaviorally independent).",
-            "No vehicle may complete its maneuver without yielding to, blocking, or negotiating with at least one other vehicle.",
+            "Each vehicle must participate in at least one semantic maneuver conflict with another vehicle, such as straight-through vs opposing left turn, left turn vs perpendicular straight-through, or right turn merging into an occupied exit lane.",
+            "Conflicts must involve overlapping or intersecting planned paths within the intersection or its immediate exits, not merely proximity or sequential yielding.",
+            "No vehicle may be behaviorally independent; every maneuver must require negotiation, yielding, or mutual blocking due to another vehicle.",
         ],
         avoid=[
             "Non-ego props, pedestrians, or cyclists",
@@ -318,12 +320,15 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         intent="Test gap acceptance and oncoming priority; conflict at junction center and exit lane.",
         map=MapRequirements(topology=TopologyType.INTERSECTION, needs_oncoming=True),
         must_include=[
-            "Vehicle 1 turns left across oncoming traffic. Other vehicles may turn left/right/straight",
-            "One vehicle mandatorly must have the opposite entry road of Vehicle 1 and continue straight (oncoming)",
-            "Paths intersect at intersection center",
+            "Vehicle 1 must enter from one approach and execute a left turn to a perpendicular exit road.",
+            "One vehicle must enter from the opposite approach of Vehicle 1 and continue straight through the intersection (oncoming relative to Vehicle 1).",
+            "The left-turn path of Vehicle 1 must geometrically cross the straight-through path of the oncoming vehicle.",
+            "Either Vehicle 1 must slow/stop to allow the oncoming vehicle to pass first, or the oncoming vehicle must slow/stop to allow Vehicle 1 to complete the left turn.",
+            "Any additional vehicle must interact with Vehicle 1 or the oncoming stream in a meaningful way, such as queueing behind Vehicle 1, following the oncoming vehicle through the intersection, competing for the same exit lane as Vehicle 1, or crossing perpendicularly in a way that constrains the left turn.",
+            "No vehicle may traverse the intersection without yielding, slowing, or being constrained by another vehicle.",
         ],
         avoid=[
-            "Prop in the lane of travel of any vehicle, including props in the side of their lane",
+            "Any static props",
         ],
         vary=[
             VariationAxis("ego_count", ["3", "4", "5", "6"], "total egos in the intersection scenario"),
@@ -333,6 +338,7 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
             VariationAxis("pedestrian", ["none", "walker crossing exit leg from sidewalk_right", "walker crossing exit leg from sidewalk_left"], "pedestrian involvement on the exit leg"),
             VariationAxis("occlusion", ["none", "parked_vehicle limiting visibility"], "visibility constraint level for the turn. vehicle type options: box truck, van, bus, delivery truck. vehicle must not block any vehicle paths"),
         ],
+        allow_static_props=False,
     ), 
 
     "Highway On-Ramp Merge": CategoryDefinition(
@@ -352,6 +358,7 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
             VariationAxis("ramp_queue", ["single merging", "multiple merging"], "how many vehicles are queued on the ramp"),
             VariationAxis("ramp_adjacent_lane_platoon", ["single vehicle", "multiple vehicles"], "how many vehicles are queued in the adjacent lane next to the ramp"),
         ],
+        allow_static_props=False,
     ), 
 
     "Interactive Lane Change": CategoryDefinition(
@@ -360,8 +367,12 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         intent="Stress lane-change negotiations in multi-lane traffic without props.",
         map=MapRequirements(topology=TopologyType.HIGHWAY, needs_multi_lane=True),
         must_include=[
-            "Vehicles in adjacent lanes",
-            "Active lane-change relations (merges_into_lane_of / left/right lane of) for ALL vehicles",
+            "All vehicles must begin on a multi-lane highway/corridor with at least two adjacent lanes occupied by different vehicles.",
+            "Every vehicle must execute at least one lane change (left or right) during the scenario (no purely lane-keeping vehicles).",
+            "Lane changes must occur at different longitudinal positions (staggered along the road), not all at the same point.",
+            "For every lane change, the target lane must contain at least one other vehicle at the time of the lane change such that the lane change creates a meaningful interaction (yielding/slowdown/spacing adjustment) with that vehicle.",
+            "Lane-change interactions must be persistent: if Vehicle A changes into the lane of Vehicle B, Vehicle B may not have already left that lane before A begins the lane change; the interaction must occur with B while B remains in the target lane.",
+            "No lane change may be 'into an empty lane' at the moment it begins; each lane change must be into an occupied lane segment near another vehicle (ahead, alongside, or behind) that constrains the maneuver.",
         ],
         avoid=[
             "Non-ego props or pedestrians",
@@ -370,6 +381,7 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
             VariationAxis("ego_count", ["2", "3", "4", "5"], "vehicles participating in weaving"),
             VariationAxis("lane_distribution", ["many vehicles attempt to merge into same lane", "merges are relatively even between lanes"], "how vehicles are distributed across lanes"),
         ],
+        allow_static_props=False,
     ), 
 
     "Blocked Lane (Obstacle)": CategoryDefinition(
@@ -378,10 +390,11 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         intent="Force lane change or negotiation around a blocked lane segment.",
         map=MapRequirements(topology=TopologyType.CORRIDOR, needs_multi_lane=True),
         must_include=[
-            "Parked/stationary actor fully blocking or partially blocking a lane that a vehicle is travelling in",
+            "Static prop fully blocking or partially blocking a lane that a vehicle is travelling in. Only one lane should be blocked.",
             "Vehicle in adjacent lane relative to blocked lane (left/right lane of). Some vehicles may also have a different entry road and turn onto the blocked lane before the blockage.",
         ],
         avoid=[
+            "Any lane changes"
         ],
         vary=[
             VariationAxis("ego_count", ["2", "3", "4", "5"], "vehicles navigating around the blockage"),
@@ -483,15 +496,16 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         name="Overtaking on Two-Lane Road",
         summary="Corridor overtaking/pass maneuvers with adjacent/oncoming/obstacle factors.",
         intent="Exercise overtaking decisions with adjacent lane use, potential oncoming traffic, and obstacles.",
-        map=MapRequirements(topology=TopologyType.TWO_LANE_CORRIDOR, needs_multi_lane=False),
+        map=MapRequirements(topology=TopologyType.TWO_LANE_CORRIDOR, needs_multi_lane=False, needs_oncoming=True),
         must_include=[
-            "Prop blocking lane in Vehicle 1's path",
+            "Static prop, such as a parked vehicle, blocking lane in Vehicle 1's path",
             "Vehicle 2 approaches from the opposite direction as Vehicle 1",
         ],
         avoid=[
             "Props on either side of the road that do not contribute to the overtaking scenario",
             "Having all vehicles travel in the same direction",
             "Any lane changes"
+            "This is a two lane road - no additional lanes may be referenced or used beyond the two lanes (one per direction)",
         ],
         vary=[
             VariationAxis("ego_count", ["2", "3", "4"], "vehicles involved in the overtake scenario"),

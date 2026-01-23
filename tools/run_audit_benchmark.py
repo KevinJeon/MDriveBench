@@ -88,11 +88,13 @@ CSV_FIELDS = [
     "video_generation_success",
     "state_history",
     "best_rank",
-    "kept_best",
-    "start_time",
-    "end_time",
-    "elapsed_s",
-    "csv_committed_at",
+        "kept_best",
+        "start_time",
+        "end_time",
+        "elapsed_s",
+        "csv_committed_at",
+        # Optional debug artifacts
+        "csp_debug_path",
 ]
 
 
@@ -174,6 +176,42 @@ def _atomic_write_text(path: Path, text: str) -> None:
 def _atomic_write_json(path: Path, obj: Any) -> None:
     text = json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=True)
     _atomic_write_text(path, text)
+
+
+def _run_csp_debug(run_dir: Path, out_path: Optional[Path] = None) -> Optional[Path]:
+    """
+    Optional helper: rerun CSP solver on saved attempt artifacts and emit rich debug JSON.
+    Safe to call even if debug script is missing; failures are logged but non-fatal.
+    """
+    script = REPO_ROOT / "scripts" / "rerun_csp_debug.py"
+    if not script.exists():
+        print(f"[DEBUG] CSP debug script not found at {script}, skipping rerun.")
+        return None
+    out_path = out_path or (run_dir / "scene_objects_csp_rerun_debug.json")
+    cmd = [
+        sys.executable,
+        str(script),
+        "--run-dir",
+        str(run_dir),
+        "--out",
+        str(out_path),
+    ]
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DEBUG] Failed to run CSP debug rerun: {exc}")
+        return None
+    if res.returncode != 0:
+        print(f"[DEBUG] CSP debug rerun failed (code {res.returncode}): {res.stderr.strip()}")
+        return None
+    if res.stdout.strip():
+        print(res.stdout.strip())
+    return out_path
 
 
 def _write_schema_validation_report(
@@ -794,6 +832,14 @@ def _run_single(
                     break
                 continue
 
+            # Optional: rerun CSP locally and emit rich debug artifact
+            if args.csp_debug and scene_path:
+                attempt_dir = Path(scene_path).parent
+                csp_debug_path = _run_csp_debug(attempt_dir)
+                if csp_debug_path:
+                    attempt_record["csp_debug_path"] = str(csp_debug_path)
+                    status["csp_debug_path"] = str(csp_debug_path)
+
             validation = scene_validator.validate_scene(
                 scene_path,
                 schema_text,
@@ -1109,6 +1155,7 @@ def _run_single(
             "scenario_description": status.get("scenario_description"),
             "scenario_spec_path": status.get("scenario_spec_path"),
             "scene_objects_path": status.get("scene_objects_path"),
+            "csp_debug_path": status.get("csp_debug_path"),
             "scenario_objects_json": manifest,
             "scenario_generation_success": status.get("scenario_generation_success"),
             "validation_score": status.get("validation_score"),
@@ -1198,6 +1245,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-score", type=float, default=0.3)
     parser.add_argument("--show-pipeline", action="store_true")
     parser.add_argument("--routes-ego-num", type=int, default=None)
+    parser.add_argument("--csp-debug", action="store_true", help="Rerun CSP solver for each pipeline attempt and emit scene_objects_csp_rerun_debug.json")
     parser.add_argument("--no-align-routes", action="store_true")
     parser.add_argument("--carla-host", default="127.0.0.1")
     parser.add_argument("--carla-port", type=int, default=2000)

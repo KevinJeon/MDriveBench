@@ -46,6 +46,155 @@ def run_object_placer(args, model=None, tokenizer=None):
     """
     t_obj_start = time.time()
     stats = getattr(args, "stats", None)
+    scenario_spec_payload = getattr(args, "scenario_spec", None)
+    allow_static_props = True
+    if isinstance(scenario_spec_payload, dict):
+        allow_static_props = bool(scenario_spec_payload.get("allow_static_props", True))
+    actor_trace: List[Dict[str, Any]] = []
+
+    def _log_actor_trace(step: str, actors: Optional[List[Dict[str, Any]]] = None, note: Optional[str] = None) -> None:
+        """
+        Append a lightweight trace entry capturing actor-related mutations.
+        Stores counts and a small sample of actor ids/categories for debuggability.
+        """
+        sample = []
+        try:
+            if actors and isinstance(actors, list):
+                for a in actors[:5]:
+                    if isinstance(a, dict):
+                        sample.append({
+                            "id": a.get("id") or a.get("entity_id"),
+                            "category": a.get("category") or a.get("actor_kind"),
+                            "target_vehicle": (a.get("placement") or {}).get("target_vehicle"),
+                            "seg": (a.get("placement") or {}).get("seg_id"),
+                        })
+        except Exception:
+            pass
+        actor_trace.append({
+            "step": step,
+            "elapsed_s": round(time.time() - t_obj_start, 3),
+            "actor_count": len(actors) if isinstance(actors, list) else None,
+            "note": note,
+            "sample": sample,
+        })
+
+    def _adjust_triggers_by_paths(
+        actors_world: List[Dict[str, Any]],
+        picked: List[Dict[str, Any]],
+        seg_by_id: Dict[int, np.ndarray],
+        min_intersect_dist_m: float = 4.0,
+        max_keep_dist_m: float = 25.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Post-process moving NPCs (walkers/cyclists/vehicles) to align trigger.vehicle
+        with the ego path they intersect or are closest to.
+        """
+        # Build ego polylines
+        ego_paths: Dict[str, np.ndarray] = {}
+        seg_ids_by_vehicle: Dict[str, List[int]] = {}
+        for p in picked:
+            vname = p.get("vehicle")
+            seg_ids = (p.get("signature", {}) or {}).get("segment_ids", [])
+            pts_list = []
+            seg_ids_by_vehicle[vname] = []
+            for sid in seg_ids or []:
+                try:
+                    sid_int = int(sid)
+                except Exception:
+                    continue
+                pts = seg_by_id.get(sid_int)
+                if pts is None or len(pts) == 0:
+                    continue
+                seg_ids_by_vehicle[vname].append(sid_int)
+                pts_list.append(np.asarray(pts, dtype=float))
+            if pts_list:
+                ego_paths[vname] = np.vstack(pts_list)
+
+        def _actor_points(a: Dict[str, Any]) -> np.ndarray:
+            wps = a.get("world_waypoints")
+            if isinstance(wps, list) and wps and isinstance(wps[0], dict):
+                pts = [(float(w.get("x", 0.0)), float(w.get("y", 0.0))) for w in wps]
+            else:
+                sp = a.get("spawn", {}) or {}
+                pts = [(float(sp.get("x", 0.0)), float(sp.get("y", 0.0)))]
+            return np.asarray(pts, dtype=float)
+
+        adjusted = []
+        removed = 0
+        for a in actors_world:
+            cat = str(a.get("category", "")).lower()
+            kind = str(a.get("actor_kind", "")).lower()
+            motion = a.get("motion", {}) if isinstance(a.get("motion"), dict) else {}
+            mtype = str(motion.get("type", "unknown")).lower()
+            is_moving = mtype not in ("static", "unknown")
+            if not (cat in ("walker", "cyclist", "vehicle") or kind in ("walker", "cyclist", "npc_vehicle")):
+                adjusted.append(a)
+                continue
+            if not is_moving and cat == "static":
+                adjusted.append(a)
+                continue
+            pts = _actor_points(a)
+            if pts.size == 0:
+                adjusted.append(a)
+                continue
+
+            best_vehicle = None
+            best_dist = float("inf")
+            reason = "closest"
+
+            # Prefer direct segment overlap
+            seg_id = (a.get("resolved") or {}).get("seg_id") or (a.get("placement") or {}).get("seg_id")
+            if seg_id is not None:
+                try:
+                    seg_id = int(seg_id)
+                except Exception:
+                    seg_id = None
+            if seg_id is not None:
+                for vname, seg_ids in seg_ids_by_vehicle.items():
+                    if seg_id in seg_ids:
+                        best_vehicle = vname
+                        best_dist = 0.0
+                        reason = "same_segment"
+                        break
+
+            # Otherwise choose closest ego path
+            if best_vehicle is None:
+                for vname, path in ego_paths.items():
+                    if path is None or len(path) == 0:
+                        continue
+                    # pairwise min distance
+                    dists = np.linalg.norm(pts[:, None, :] - path[None, :, :], axis=2)
+                    md = float(np.min(dists))
+                    if md < best_dist:
+                        best_dist = md
+                        best_vehicle = vname
+
+            if best_vehicle is None:
+                best_dist = float("inf")
+
+            # If too far, still pick closest but note it
+            note = reason
+            if best_dist > min_intersect_dist_m and reason != "same_segment":
+                note = f"closest_{best_dist:.1f}m"
+
+            if best_dist > max_keep_dist_m:
+                removed += 1
+                print(f"[INFO] Removing actor {a.get('id','actor')} (no nearby ego path; closest={best_dist:.1f}m)", flush=True)
+                continue
+
+            trig = a.get("trigger")
+            if trig is None or not isinstance(trig, dict):
+                trig = {"type": "distance_to_vehicle", "distance_m": 8.0, "vehicle": best_vehicle, "evidence": ""}
+            else:
+                trig = dict(trig)
+                trig["vehicle"] = best_vehicle
+            a_mod = dict(a)
+            a_mod["trigger"] = trig
+            adjusted.append(a_mod)
+            print(f"[INFO] Adjusted trigger for {a.get('id','actor')}: vehicle={best_vehicle} ({note}) (prev trigger may differ)", flush=True)
+        if removed:
+            print(f"[INFO] Removed {removed} moving actor(s) with no nearby ego path", flush=True)
+        return adjusted
 
     def _bump(key: str, amount: int = 1) -> None:
         if stats is None:
@@ -114,7 +263,11 @@ def run_object_placer(args, model=None, tokenizer=None):
     # --------------------------
     t_stage1_start = time.time()
     schema_entities = getattr(args, "schema_entities", None)
+    print(f"[DEBUG] schema_entities provided: {schema_entities is not None}", flush=True)
     if schema_entities is not None:
+        print(f"[DEBUG] schema_entities count: {len(schema_entities) if isinstance(schema_entities, list) else 'not a list'}", flush=True)
+        for i, e in enumerate(schema_entities[:5] if isinstance(schema_entities, list) else []):
+            print(f"[DEBUG]   entity[{i}]: entity_id={e.get('entity_id')}, kind={e.get('actor_kind')}, mention={e.get('mention')}", flush=True)
         print("[INFO] Using schema-provided actors; skipping Stage1 LLM.")
         stage1_obj = {"entities": schema_entities}
     else:
@@ -157,6 +310,7 @@ def run_object_placer(args, model=None, tokenizer=None):
     entities = stage1_obj.get("entities", [])
     if not isinstance(entities, list):
         raise SystemExit("[ERROR] Stage1: 'entities' must be a list.")
+    _log_actor_trace("stage1_entities_extracted", entities)
 
     # Ensure each entity has a unique entity_id (normalize if LLM didn't provide one)
     valid_entity_ids = set()
@@ -700,7 +854,39 @@ def run_object_placer(args, model=None, tokenizer=None):
             print(f"[TIMING] Stage2 parse+repair: {time.time() - t0:.2f}s", flush=True)
 
             actor_specs_raw = stage2_obj.get("actor_specs", [])
+            
+            # Build debug log for file output
+            debug_log = {
+                "stage2_raw_output": stage2_text[:2000] if len(stage2_text) > 2000 else stage2_text,
+                "actor_specs_raw_count": len(actor_specs_raw),
+                "actor_specs_raw": actor_specs_raw,
+                "entities_for_stage2": [{"entity_id": e.get("entity_id"), "actor_kind": e.get("actor_kind"), "mention": e.get("mention")} for e in entities],
+                "per_entity_options": {eid: len(opts) for eid, opts in per_entity_options.items()},
+            }
+            
+            print(f"[DEBUG] actor_specs_raw count: {len(actor_specs_raw)}", flush=True)
+            print(f"[DEBUG] entities for Stage2: {[e.get('entity_id') for e in entities]}", flush=True)
+            print(f"[DEBUG] per_entity_options keys: {list(per_entity_options.keys())}", flush=True)
+            for eid, opts in per_entity_options.items():
+                print(f"[DEBUG]   {eid}: {len(opts)} asset options", flush=True)
             actor_specs, warns = validate_actor_specs(actor_specs_raw, entities, per_entity_options, picked=picked)
+            
+            debug_log["actor_specs_after_validation_count"] = len(actor_specs)
+            debug_log["actor_specs_after_validation"] = actor_specs
+            debug_log["validation_warnings"] = warns
+            debug_log["actor_trace"] = actor_trace
+            _log_actor_trace("after_validation", actor_specs, note="stage2 actor_specs")
+            
+            # Save debug log to file
+            debug_log_path = str(args.out).replace(".json", "_debug.json") if hasattr(args, 'out') and args.out else "/tmp/object_placer_debug.json"
+            try:
+                with open(debug_log_path, "w") as f:
+                    json.dump(debug_log, f, indent=2, default=str)
+                print(f"[DEBUG] Saved debug log to: {debug_log_path}", flush=True)
+            except Exception as e:
+                print(f"[DEBUG] Failed to save debug log: {e}", flush=True)
+            
+            print(f"[DEBUG] actor_specs after validation: {len(actor_specs)}", flush=True)
             for w in warns[:50]:
                 print("[WARNING] Stage2(CSP): " + w)
 
@@ -729,10 +915,14 @@ def run_object_placer(args, model=None, tokenizer=None):
                             })
 
             if not actor_specs:
+                print("[DEBUG] actor_specs is EMPTY after validation - no actors will be placed!", flush=True)
                 actors = []
+                _log_actor_trace("actor_specs_empty", [])
             else:
                 t0 = time.time()
                 print(f"[TIMING] Starting CSP solve with {len(actor_specs)} actor specs...", flush=True)
+                for i, spec in enumerate(actor_specs[:5]):
+                    print(f"[DEBUG] actor_spec[{i}]: id={spec.get('id')}, asset_id={spec.get('asset_id')}, category={spec.get('category')}", flush=True)
                 # Use iterative CSP with path extension - extends paths on-demand when distance constraints can't be met
                 # Returns expanded crop_region to include extended path areas
                 chosen, dbg, crop_region = solve_weighted_csp_with_extension(
@@ -746,6 +936,7 @@ def run_object_placer(args, model=None, tokenizer=None):
                 )
                 print(f"[TIMING] CSP solve (with extension): {time.time() - t0:.2f}s", flush=True)
                 print("[INFO] CSP solve debug: " + json.dumps(dbg, indent=2))
+                _log_actor_trace("after_csp_solve", actor_specs, note=f"chosen={list(chosen.keys())}")
 
                 actors = []
                 for spec in actor_specs:
@@ -796,6 +987,7 @@ def run_object_placer(args, model=None, tokenizer=None):
                         print(f"[WARNING] {sid}: expected {expected_qty} actors but only got {len(expanded)} "
                               f"(group_pattern={spec.get('group_pattern')}, seg_id={cand.seg_id})", flush=True)
                     actors.extend(expanded)
+                _log_actor_trace("after_expand_group", actors)
             print(f"[TIMING] Stage2 (CSP mode) total: {time.time() - t_stage2_start:.2f}s", flush=True)
 
 
@@ -831,6 +1023,7 @@ def run_object_placer(args, model=None, tokenizer=None):
         for e in stage1_obj.get("entities", [])
         if e.get("entity_id")
     }
+    _log_actor_trace("before_reanchor", actors)
     filtered_actors: List[Dict[str, Any]] = []
     for actor in actors:
         ent_id = str(actor.get("entity_id") or actor.get("id") or "")
@@ -864,6 +1057,7 @@ def run_object_placer(args, model=None, tokenizer=None):
                     continue
         filtered_actors.append(actor)
     actors = filtered_actors
+    _log_actor_trace("after_reanchor", actors)
 
     # Expand quantity>1 entities for llm_anchor placement mode.
     if args.placement_mode == "llm_anchor":
@@ -976,6 +1170,7 @@ def run_object_placer(args, model=None, tokenizer=None):
                 )
             expanded.extend(expanded_children)
         actors = expanded
+    _log_actor_trace("after_group_expansion_llm_anchor_mode", actors)
 
     actors_world: List[Dict[str, Any]] = []
     for a in actors:
@@ -1049,6 +1244,7 @@ def run_object_placer(args, model=None, tokenizer=None):
             "spawn": spawn,
             "world_waypoints": wps,
         })
+    _log_actor_trace("after_anchor_to_world", actors_world)
     print(f"[TIMING] anchor -> world conversion: {time.time() - t0:.2f}s", flush=True)
 
     # Enforce non-overlapping spawns using asset bounding boxes.
@@ -1130,6 +1326,25 @@ def run_object_placer(args, model=None, tokenizer=None):
                         xj, yj = float(actors_world[j]["spawn"]["x"]), float(actors_world[j]["spawn"]["y"])
     if passes > 0:
         print(f"[INFO] Non-overlap enforcement passes: {passes}")
+    _log_actor_trace("after_non_overlap", actors_world, note=f"passes={passes}")
+
+    # Post-process moving NPC triggers to align with intersecting/closest ego path
+    actors_world = _adjust_triggers_by_paths(actors_world, picked, seg_by_id)
+    _log_actor_trace("after_trigger_adjust", actors_world)
+
+    # Optionally strip static props if category disallows them
+    if not allow_static_props:
+        before = len(actors_world)
+        actors_world = [
+            a for a in actors_world
+            if str(a.get("category", "")).lower() not in ("static",)
+            and str(a.get("actor_kind", "")).lower() not in ("static_prop",)
+            and str((a.get("motion", {}) or {}).get("type", "unknown")).lower() not in ("static", "unknown")
+        ]
+        removed = before - len(actors_world)
+        if removed > 0:
+            print(f"[INFO] Removed {removed} static prop(s) because allow_static_props=False", flush=True)
+        _log_actor_trace("after_strip_static_props", actors_world, note=f"removed={removed}")
 
     # Validation: Check if total placed actors matches expected from Stage 1
     stage1_entities = stage1_obj.get("entities", [])
@@ -1182,6 +1397,7 @@ def run_object_placer(args, model=None, tokenizer=None):
             print(f"[ERROR] {len(violations)} actor(s) violate ego spawn buffer constraint:", flush=True)
             for v in violations:
                 print(f"  {v['actor']} only {v['distance']:.1f}m from {v['vehicle']} (min {v['required']}m)", flush=True)
+    _log_actor_trace("final_before_write", actors_world)
 
     out_payload = {
         "source_picked_paths": args.picked_paths,
@@ -1191,6 +1407,7 @@ def run_object_placer(args, model=None, tokenizer=None):
         "ego_spawns": ego_spawns,
         "actors": actors_world,
         "macro_plan": stage1_obj.get("entities", []),
+        "actor_trace": actor_trace,
     }
 
     t0 = time.time()
@@ -1200,6 +1417,8 @@ def run_object_placer(args, model=None, tokenizer=None):
 
     if args.viz:
         t_viz = time.time()
+        # Get scenario_spec from args if available (passed from pipeline_runner)
+        scenario_spec = getattr(args, "scenario_spec", None)
         visualize(
             picked=picked,
             seg_by_id=seg_by_id,
@@ -1208,6 +1427,8 @@ def run_object_placer(args, model=None, tokenizer=None):
             out_path=args.viz_out,
             description=args.description,
             show=args.viz_show,
+            scenario_spec=scenario_spec,
+            macro_plan=out_payload.get("macro_plan"),
         )
         print(f"[TIMING] visualization: {time.time() - t_viz:.2f}s", flush=True)
     print(f"[TIMING] object_placer total (internal): {time.time() - t_obj_start:.2f}s", flush=True)

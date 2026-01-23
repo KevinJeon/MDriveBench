@@ -353,6 +353,11 @@ class PipelineRunner:
         if cat_info and cat_info.map.topology in {TopologyType.CORRIDOR, TopologyType.TWO_LANE_CORRIDOR, TopologyType.HIGHWAY}:
             require_straight = True
             print(f"[INFO] Category '{category}' requires {cat_info.map.topology.value} topology, filtering to straight paths")
+        # Propagate category allow_static_props into scenario schema so placer can strip props
+        if cat_info:
+            if scenario_schema is None:
+                scenario_schema = {}
+            scenario_schema.setdefault("allow_static_props", cat_info.allow_static_props)
 
         parent_dir = Path(__file__).parent.parent
         if str(parent_dir) not in sys.path:
@@ -635,6 +640,7 @@ class PipelineRunner:
             top_p=self.placer_top_p,
             placement_mode="csp",
             schema_entities=schema_entities,
+            scenario_spec=scenario_schema,  # Pass scenario spec for visualization metadata
         )
         if stats is not None:
             placer_args.stats = stats

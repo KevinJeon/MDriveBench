@@ -412,6 +412,13 @@ def validate_actor_specs(
     picked: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     warnings: List[str] = []
+    # Debug: show what we're validating
+    print(f"[DEBUG] validate_actor_specs: received {len(actor_specs) if isinstance(actor_specs, list) else 'non-list'} specs", flush=True)
+    print(f"[DEBUG] validate_actor_specs: stage1_entities={[e.get('entity_id') for e in stage1_entities]}", flush=True)
+    print(f"[DEBUG] validate_actor_specs: per_entity_options keys={list(per_entity_options.keys())}", flush=True)
+    if isinstance(actor_specs, list):
+        for i, spec in enumerate(actor_specs[:5]):
+            print(f"[DEBUG] validate_actor_specs: raw spec[{i}] id={spec.get('id') or spec.get('entity_id')}", flush=True)
     if not isinstance(actor_specs, list):
         return [], ["actor_specs must be a list"]
     if picked is None:
@@ -678,6 +685,93 @@ def validate_actor_specs(
             "action": action,
         })
 
+    # Fallback: Create default specs for entities that the LLM didn't output specs for
+    processed_ids = {str(spec["id"]) for spec in clean}
+    for e in stage1_entities:
+        eid = str(e.get("entity_id", ""))
+        if not eid or eid in processed_ids:
+            continue
+        # Check if we have asset candidates for this entity
+        allowed = [str(o.get("asset_id")) for o in per_entity_options.get(eid, []) if isinstance(o, dict) and o.get("asset_id")]
+        if not allowed:
+            warnings.append(f"{eid}: LLM skipped and no asset candidates; cannot create fallback")
+            continue
+        
+        # Create a fallback spec using Stage 1 information
+        kind = str(e.get("actor_kind") or "static_prop")
+        if kind in ("walker",):
+            cat = "walker"
+        elif kind in ("cyclist",):
+            cat = "cyclist"
+        elif kind in ("parked_vehicle", "npc_vehicle"):
+            cat = "vehicle"
+        else:
+            cat = "static"
+        
+        # Get phase and target vehicle from Stage 1
+        phase = str(e.get("when", "unknown"))
+        if phase not in ALLOWED_PHASES:
+            phase = "on_approach"
+        tv = str(e.get("affects_vehicle", "unknown"))
+        
+        # Get lateral preference
+        lat = normalize_lateral(e.get("lateral_relation", "unknown"))
+        if lat == "unknown":
+            lat = normalize_lateral(e.get("start_lateral") or "unknown")
+        
+        # Determine motion type from stage1
+        motion_hint = str(e.get("motion_hint", "unknown"))
+        if motion_hint == "crossing":
+            mtype = "cross_perpendicular"
+        elif motion_hint == "follow_lane":
+            mtype = "follow_lane"
+        elif motion_hint == "static":
+            mtype = "static"
+        else:
+            mtype = "static" if kind in ("parked_vehicle", "static_prop") else "unknown"
+        
+        # Speed
+        sp = str(e.get("speed_hint", "unknown"))
+        if sp not in ("slow", "normal", "fast", "erratic", "stopped", "unknown"):
+            sp = "stopped" if mtype == "static" else "normal"
+        
+        # Cross direction for crossing motion
+        cross_dir = "unknown"
+        if mtype == "cross_perpendicular":
+            stage1_cross_dir = e.get("crossing_direction")
+            if stage1_cross_dir in ("left", "right"):
+                cross_dir = stage1_cross_dir
+            elif "right" in lat:
+                cross_dir = "left"
+            elif "left" in lat:
+                cross_dir = "right"
+        
+        qty = int(e.get("quantity", 1))
+        
+        fallback_spec = {
+            "id": eid,
+            "semantic": str(e.get("mention") or eid),
+            "category": cat,
+            "actor_kind": kind,
+            "asset_id": allowed[0],  # Use first available asset
+            "quantity": qty,
+            "anchor": {"target_vehicle": tv, "phase": phase, "lateral_preference": lat},
+            "relations": [],
+            "group_pattern": None,
+            "motion": {
+                "type": mtype,
+                "speed_profile": sp,
+                "cross_direction": cross_dir,
+                "start_lateral": lat,
+            },
+            "confidence": 0.5,  # Lower confidence for fallback
+            "direction_relative_to": e.get("direction_relative_to"),
+            "trigger": e.get("trigger"),
+            "action": e.get("action"),
+        }
+        clean.append(fallback_spec)
+        warnings.append(f"{eid}: LLM skipped; created fallback spec with asset={allowed[0]}")
+
     return clean, warnings
 
 
@@ -885,6 +979,7 @@ def generate_candidates_for_actor(
     ds_m: float = 6.0,
     crop_margin_m: float = 1.0,
     ego_spawns: Optional[List[Dict[str, Any]]] = None,
+    candidate_debug: Optional[Dict[str, Any]] = None,
 ) -> List[CandidatePlacement]:
     anchor = spec.get("anchor", {})
     tv = str(anchor.get("target_vehicle", "unknown"))
@@ -933,6 +1028,23 @@ def generate_candidates_for_actor(
     if pref_lat in laterals:
         laterals = [pref_lat] + [x for x in laterals if x != pref_lat]
 
+    sid = str(spec.get("id", "unknown"))
+    debug_entry = {
+        "actor_id": sid,
+        "vehicle_domain": list(veh_domain),
+        "attempted_samples": 0,
+        "outside_crop": 0,
+        "before_merge_window": 0,
+        "after_merge_window": 0,
+        "added_primary": 0,
+        "added_fallback": 0,
+        "added_far": 0,
+        "ego_buffer_filtered": 0,
+        "is_opposite_direction_mode": is_opposite_npc,
+        "segment_ids": [],
+        "segment_lengths_m": [],
+    }
+
     cands: List[CandidatePlacement] = []
     fallback_cands: List[CandidatePlacement] = []
     far_cands: List[CandidatePlacement] = []
@@ -969,6 +1081,8 @@ def generate_candidates_for_actor(
                 seg_len = seg_info["length_m"]
                 if seg_len < 2.0:
                     continue
+                debug_entry["segment_ids"].append(int(seg_id))
+                debug_entry["segment_lengths_m"].append(float(seg_len))
                 
                 step = max(2.0, float(ds_m))
                 s_values_m = list(np.arange(min(crop_margin_m, 0.2*seg_len), max(seg_len - crop_margin_m, 0.8*seg_len), step))
@@ -978,8 +1092,10 @@ def generate_candidates_for_actor(
                 for s_m in s_values_m:
                     s_along = float(min(1.0, max(0.0, s_m / seg_len)))
                     for lat in laterals:
+                        debug_entry["attempted_samples"] += 1
                         spawn = compute_spawn_from_anchor(pts, s_along, lat, None)
                         if not _inside_crop_xy(spawn["x"], spawn["y"], crop_region, margin_m=crop_margin_m):
+                            debug_entry["outside_crop"] += 1
                             continue
                         base = 3.0 + _lateral_score(lat, pref_lat)  # High bonus for matching opposite direction
                         cands.append(CandidatePlacement(
@@ -994,10 +1110,21 @@ def generate_candidates_for_actor(
                             path_s_m=float(s_m),
                             base_score=float(base),
                         ))
+                        debug_entry["added_primary"] += 1
             # If we found opposite-lane candidates, return them (don't mix with ego paths)
             if cands:
                 cands.sort(key=lambda c: c.base_score, reverse=True)
-                return cands[:max_candidates]
+                cands = cands[:max_candidates]
+                debug_entry["final_candidates"] = len(cands)
+                if candidate_debug is not None:
+                    candidate_debug[sid] = debug_entry
+                print(
+                    f"[DEBUG] Actor {sid} (opposite direction): kept {len(cands)} candidates "
+                    f"(attempted={debug_entry['attempted_samples']}, "
+                    f"outside_crop={debug_entry['outside_crop']})",
+                    flush=True,
+                )
+                return cands
     
     # Standard candidate generation for ego vehicle paths
     for veh_num in veh_domain:
@@ -1025,10 +1152,19 @@ def generate_candidates_for_actor(
             cum = cumulative_dist(pts)
             seg_lengths.append(float(cum[-1]))
             seg_pts_cache.append(pts)
+        try:
+            debug_entry["segment_ids"].extend([int(sid) for sid in seg_ids if sid is not None])
+        except Exception:
+            pass
+        debug_entry["segment_lengths_m"].extend([float(l) for l in seg_lengths if l is not None])
 
         total_path_len = float(sum(seg_lengths))
         if merge_min_s_m is not None and total_path_len > 0.0 and merge_min_s_m >= total_path_len:
             merge_min_s_m = None
+        debug_entry["merge_window_m"] = {
+            "min": float(merge_min_s_m) if merge_min_s_m is not None else None,
+            "max": float(merge_max_s_m) if merge_max_s_m is not None else None,
+        }
 
         for idx0, seg_id_raw in enumerate(seg_ids):
             segment_index = idx0 + 1
@@ -1051,8 +1187,10 @@ def generate_candidates_for_actor(
                 s_along = float(min(1.0, max(0.0, s_m / seg_len)))
                 centering_bonus = _s_along_centering_score(s_along, pref_phase)
                 for lat in laterals:
+                    debug_entry["attempted_samples"] += 1
                     spawn = compute_spawn_from_anchor(pts, s_along, lat, None)
                     if not _inside_crop_xy(spawn["x"], spawn["y"], crop_region, margin_m=crop_margin_m):
+                        debug_entry["outside_crop"] += 1
                         continue
                     path_s_m = float(sum(seg_lengths[:idx0]) + float(s_m))
                     if merge_min_s_m is not None and path_s_m < merge_min_s_m:
@@ -1069,6 +1207,8 @@ def generate_candidates_for_actor(
                             path_s_m=float(path_s_m),
                             base_score=float(phase_bonus + centering_bonus + _lateral_score(lat, pref_lat) + trigger_bias + (1.0 if preferred is not None else 0.0)),
                         ))
+                        debug_entry["before_merge_window"] += 1
+                        debug_entry["added_fallback"] += 1
                         continue
                     if merge_max_s_m is not None and path_s_m > merge_max_s_m:
                         base = phase_bonus + centering_bonus + _lateral_score(lat, pref_lat)
@@ -1087,6 +1227,8 @@ def generate_candidates_for_actor(
                             path_s_m=float(path_s_m),
                             base_score=float(base),
                         ))
+                        debug_entry["after_merge_window"] += 1
+                        debug_entry["added_far"] += 1
                         continue
                     base = phase_bonus + centering_bonus + _lateral_score(lat, pref_lat)
                     base += _trigger_distance_bias(spec, int(veh_num), path_s_m)
@@ -1104,6 +1246,7 @@ def generate_candidates_for_actor(
                         path_s_m=float(path_s_m),
                         base_score=float(base),
                     ))
+                    debug_entry["added_primary"] += 1
     if merge_max_s_m is not None and not cands:
         if far_cands:
             cands = far_cands
@@ -1116,6 +1259,7 @@ def generate_candidates_for_actor(
     # Filter candidates to maintain minimum buffer from ego vehicle spawns
     MIN_BUFFER_TO_EGO_M = 15.0
     if ego_spawns:
+        pre_buffer_len = len(cands)
         filtered_cands = []
         for cand in cands:
             violates_buffer = False
@@ -1138,8 +1282,29 @@ def generate_candidates_for_actor(
                 filtered_cands.append(cand)
         
         cands = filtered_cands
+        debug_entry["ego_buffer_filtered"] = max(0, pre_buffer_len - len(cands))
+
+    if len(cands) > max_candidates:
+        cands = cands[:max_candidates]
+
+    debug_entry["final_candidates"] = len(cands)
+    if candidate_debug is not None:
+        candidate_debug[sid] = debug_entry
+    print(
+        f"[DEBUG] Actor {sid}: kept {len(cands)} candidates "
+        f"(attempted={debug_entry['attempted_samples']}, "
+        f"outside_crop={debug_entry['outside_crop']}, "
+        f"before_merge_window={debug_entry['before_merge_window']}, "
+        f"after_merge_window={debug_entry['after_merge_window']}, "
+        f"ego_buffer_filtered={debug_entry['ego_buffer_filtered']}, "
+        f"primary={debug_entry['added_primary']}, "
+        f"fallback={debug_entry['added_fallback']}, far={debug_entry['added_far']}, "
+        f"vehicle_domain={debug_entry['vehicle_domain']}, "
+        f"seg_lens_m={[round(x,2) for x in debug_entry.get('segment_lengths_m', [])]})",
+        flush=True,
+    )
     
-    return cands[:max_candidates]
+    return cands
 
 
 def solve_weighted_csp(
@@ -1155,6 +1320,7 @@ def solve_weighted_csp(
 ) -> Tuple[Dict[str, CandidatePlacement], Dict[str, Any]]:
     veh_info = _infer_vehicle_turn_exit_indices(picked_list, seg_by_id)
     domains: Dict[str, List[CandidatePlacement]] = {}
+    candidate_debug: Dict[str, Any] = {}
     for s in specs:
         sid = str(s["id"])
         domains[sid] = generate_candidates_for_actor(
@@ -1166,7 +1332,19 @@ def solve_weighted_csp(
             merge_min_s_by_vehicle=merge_min_s_by_vehicle,
             all_segments=all_segments,
             ego_spawns=ego_spawns,
+            candidate_debug=candidate_debug,
         )
+    empty_domains = [sid for sid, dom in domains.items() if not dom]
+    if empty_domains:
+        for sid in empty_domains:
+            info = candidate_debug.get(sid, {})
+            print(
+                f"[WARNING] CSP: no placement candidates for {sid} "
+                f"(attempted={info.get('attempted_samples')}, "
+                f"outside_crop={info.get('outside_crop')}, "
+                f"vehicle_domain={info.get('vehicle_domain')})",
+                flush=True,
+            )
 
     # Build dependency graph: if A has relation to B, B should be placed before A
     # Topological sort to respect dependencies, then sort by domain size within each level
@@ -1286,7 +1464,12 @@ def solve_weighted_csp(
 
     bt(0, {}, 0.0)
 
-    dbg = {"nodes_searched": nodes, "best_score": best_score, "domain_sizes": {k: len(v) for k,v in domains.items()}}
+    dbg = {
+        "nodes_searched": nodes,
+        "best_score": best_score,
+        "domain_sizes": {k: len(v) for k, v in domains.items()},
+        "candidate_debug": candidate_debug,
+    }
     if len(best) != len(order):
         # greedy fallback
         fallback: Dict[str, CandidatePlacement] = {}
@@ -1302,8 +1485,13 @@ def solve_weighted_csp(
             if chosen is not None:
                 fallback[sid] = chosen
         dbg["fallback_used"] = True
+        missing = [sid for sid in order if sid not in fallback]
+        if missing:
+            dbg["missing_entities"] = missing
+            print(f"[WARNING] CSP fallback could not place: {missing}", flush=True)
         return fallback, dbg
     dbg["fallback_used"] = False
+    dbg["missing_entities"] = []
     return best, dbg
 
 

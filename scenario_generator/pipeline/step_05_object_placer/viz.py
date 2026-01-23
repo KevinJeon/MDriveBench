@@ -23,7 +23,23 @@ def visualize(
     out_path: str,
     description: Optional[str] = None,
     show: bool = False,
+    scenario_spec: Optional[Dict[str, Any]] = None,
+    macro_plan: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
+    """
+    Visualize the scene with ego paths, actors, and input metadata.
+    
+    Args:
+        picked: List of picked paths for ego vehicles
+        seg_by_id: Segment geometry by ID
+        actors_world: List of placed actors with world coordinates
+        crop_region: Crop region bounds
+        out_path: Output path for the visualization
+        description: Scene description text
+        show: Whether to display the plot interactively
+        scenario_spec: The scenario specification used for generation (for metadata display)
+        macro_plan: The macro plan / Stage 1 entities (to show what was requested vs placed)
+    """
     if plt is None:
         print("[WARNING] matplotlib not installed; skipping visualization")
         return
@@ -658,16 +674,72 @@ def visualize(
     _place_labels_repel(ax, fig, label_items, forbidden_bboxes=forbidden, fontsize=8, crop_region=crop_region)
 
     # ------------------------------------------------------------
-    # Title
+    # Title and metadata panel
     # ------------------------------------------------------------
+    def _format_constraint(c: Dict[str, Any]) -> str:
+        ctype = str(c.get("type", "unknown"))
+        a = str(c.get("a", "?"))
+        b = str(c.get("b", "?"))
+        return f"{ctype}({a}, {b})"
+    
+    def _format_vehicle_path(p: Dict[str, Any]) -> str:
+        veh = p.get("vehicle", "?")
+        sig = p.get("signature", {}) or {}
+        entry = sig.get("entry", {}) or {}
+        exit_pt = sig.get("exit", {}) or {}
+        entry_card = entry.get("cardinal4", "?")
+        exit_card = exit_pt.get("cardinal4", "?")
+        entry_bound = entry.get("bound", "")
+        maneuver = sig.get("entry_to_exit_turn", "?")
+        return f"{veh}: {entry_bound} ({entry_card}→{exit_card}, {maneuver})"
+    
     lines = []
-    scene_summary = _scene_summary_text(description)
-    if scene_summary:
-        desc_clean = " ".join(scene_summary.split())
-        scene_text = textwrap.fill(desc_clean, width=90)
-        lines.append(r"$\bf{Scene:}$ " + scene_text)
-    lines.append(rf"$\bf{{Placed\ actors\ (n={len(actors_world)})}}$")
-    ax.set_title("\n".join(lines), fontsize=12, loc="left")
+    
+    # Category and topology from scenario_spec
+    if scenario_spec:
+        cat = scenario_spec.get("category", "unknown")
+        topo = scenario_spec.get("topology", "unknown")
+        lines.append(rf"$\bf{{Category:}}$ {cat}  |  $\bf{{Topology:}}$ {topo}")
+        
+        # Capability flags
+        flags = []
+        if scenario_spec.get("needs_oncoming"):
+            flags.append("needs_oncoming")
+        if scenario_spec.get("needs_multi_lane"):
+            flags.append("needs_multi_lane")
+        if scenario_spec.get("needs_on_ramp"):
+            flags.append("needs_on_ramp")
+        if scenario_spec.get("needs_merge"):
+            flags.append("needs_merge")
+        if flags:
+            lines.append(rf"$\bf{{Flags:}}$ {', '.join(flags)}")
+        
+        # Vehicle constraints
+        constraints = scenario_spec.get("vehicle_constraints", [])
+        if constraints:
+            constraint_strs = [_format_constraint(c) for c in constraints[:4]]
+            if len(constraints) > 4:
+                constraint_strs.append(f"...+{len(constraints)-4} more")
+            lines.append(rf"$\bf{{Constraints:}}$ {', '.join(constraint_strs)}")
+    
+    # Vehicle paths resolved
+    if picked:
+        path_strs = [_format_vehicle_path(p) for p in picked[:3]]
+        if len(picked) > 3:
+            path_strs.append(f"...+{len(picked)-3} more")
+        lines.append(rf"$\bf{{Paths:}}$ " + " | ".join(path_strs))
+    
+    # Actors requested vs placed
+    requested_count = len(macro_plan) if macro_plan else 0
+    placed_count = len(actors_world)
+    if macro_plan:
+        requested_kinds = [str(e.get("actor_kind") or e.get("mention", "?")) for e in macro_plan]
+        lines.append(rf"$\bf{{Requested\ actors:}}$ {', '.join(requested_kinds)} (n={requested_count})")
+    
+    placed_status = "✓" if placed_count == requested_count else f"⚠ {placed_count}/{requested_count}"
+    lines.append(rf"$\bf{{Placed\ actors:}}$ {placed_status} (n={placed_count})")
+    
+    ax.set_title("\n".join(lines), fontsize=9, loc="left", linespacing=1.4)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")

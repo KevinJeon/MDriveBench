@@ -188,8 +188,27 @@ Scene description:
 """.strip()
 
     if schema_payload is not None:
-        # Structured schema provided: trust it and skip LLM extraction.
-        return {"vehicle_speeds": [], "spawn_relations": [], "lane_changes": [], "options": {"synchronize_conflicts": True}}
+        # Structured schema provided: derive lane_changes from vehicle_constraints.
+        lane_changes: List[Dict[str, Any]] = []
+        for vc in schema_payload.get("vehicle_constraints", []) or []:
+            if not isinstance(vc, dict):
+                continue
+            t = str(vc.get("type", "")).lower()
+            if t not in ("merges_into_lane_of", "merge_into_lane_of"):
+                continue
+            a = vc.get("a") or vc.get("vehicle")
+            b = vc.get("b") or vc.get("target")
+            if a not in vehicles or b not in vehicles:
+                continue
+            lane_changes.append({
+                "vehicle": a,
+                "type": "merge_into_lane_of",
+                "target": b,
+                "style": "polite",
+                "timing": "unknown",
+                "phase": "unknown",
+            })
+        return {"vehicle_speeds": [], "spawn_relations": [], "lane_changes": lane_changes, "options": {"synchronize_conflicts": True}}
 
     if model is None or tokenizer is None:
         # No model provided: default to no extra constraints
