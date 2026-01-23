@@ -402,11 +402,50 @@ def _candidate_geometric_discontinuity(cand: Dict[str, Any], threshold_m: float 
     return total_gap
 
 
+def _candidate_entry_in_crop(
+    cand: Dict[str, Any],
+    crop_region: Optional[Dict[str, Any]],
+    margin: float = 5.0,
+) -> bool:
+    """
+    Check if a candidate's entry point is within the crop region (with optional margin).
+    
+    Args:
+        cand: Candidate path dictionary with signature.entry.point
+        crop_region: Dict with xmin, xmax, ymin, ymax keys
+        margin: Extra margin (meters) to expand the crop bounds
+        
+    Returns:
+        True if entry point is inside crop (or if crop is not defined), False otherwise.
+    """
+    if not crop_region:
+        return True  # No crop region = accept all
+    
+    if not all(k in crop_region for k in ("xmin", "xmax", "ymin", "ymax")):
+        return True  # Invalid crop region = accept all
+    
+    entry_pt = _candidate_entry_point(cand)
+    if entry_pt is None:
+        return True  # Can't determine entry point = accept (don't over-constrain)
+    
+    x, y = entry_pt
+    try:
+        xmin = float(crop_region["xmin"]) - margin
+        xmax = float(crop_region["xmax"]) + margin
+        ymin = float(crop_region["ymin"]) - margin
+        ymax = float(crop_region["ymax"]) + margin
+    except (TypeError, ValueError):
+        return True  # Invalid crop values = accept all
+    
+    return xmin <= x <= xmax and ymin <= y <= ymax
+
+
 __all__ = [
     "_build_road_corridors",
     "_candidate_all_road_ids",
     "_candidate_entry_cardinal",
     "_candidate_entry_heading_rad",
+    "_candidate_entry_in_crop",
     "_candidate_entry_lane_id",
     "_candidate_entry_point",
     "_candidate_entry_road_id",

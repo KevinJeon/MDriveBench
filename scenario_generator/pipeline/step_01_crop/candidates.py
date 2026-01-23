@@ -245,3 +245,63 @@ def build_corridor_candidate_crops_for_town(
     out = list(uniq.values())
     out.sort(key=lambda x: -x.n_paths)  # Prefer crops with more paths
     return out
+
+
+def build_roundabout_crop_for_town(
+    town_name: str,
+    town_json_path: str,
+    min_path_len: float = 20.0,
+    max_paths: int = 100,
+    max_depth: int = 8,
+) -> Optional[CropFeatures]:
+    """
+    Build a crop for the roundabout in Town03.
+    
+    Currently only Town03 has a roundabout, hardcoded at:
+    x: [-60, 55]
+    y: [-60, 40]
+    
+    Args:
+        town_name: Name of the CARLA town (only "Town03" has a roundabout)
+        town_json_path: Path to the town's node JSON file
+        min_path_len: Minimum path length for feature computation
+        max_paths: Maximum paths to generate
+        max_depth: Maximum DFS depth for path generation
+        
+    Returns:
+        CropFeatures for the roundabout region, or None if not Town03
+    """
+    if town_name != "Town03":
+        print(f"[WARNING] Roundabout topology only available in Town03, got {town_name}")
+        return None
+    
+    # Hardcoded roundabout bounds for Town03
+    xmin, xmax = -60.0, 55.0
+    ymin, ymax = -60.0, 40.0
+    center_x = (xmin + xmax) / 2  # -2.5
+    center_y = (ymin + ymax) / 2  # -10.0
+    
+    data = glp.load_nodes(town_json_path)
+    segments_full = glp.build_segments(data, min_points=6)
+    adj_full = glp.build_connectivity(segments_full)
+    jcenters = detect_junction_centers(segments_full, adj_full)
+    
+    ck = CropKey(xmin, xmax, ymin, ymax)
+    
+    f = compute_crop_features(
+        town_name=town_name,
+        segments_full=segments_full,
+        junction_centers=jcenters,
+        center_xy=(center_x, center_y),
+        crop=ck,
+        min_path_len=min_path_len,
+        max_paths=max_paths,
+        max_depth=max_depth,
+    )
+    
+    if f is not None:
+        print(f"[INFO] Found roundabout crop in {town_name}: "
+              f"x=[{xmin}, {xmax}], y=[{ymin}, {ymax}], "
+              f"paths={f.n_paths}, dirs={f.dirs}")
+    
+    return f

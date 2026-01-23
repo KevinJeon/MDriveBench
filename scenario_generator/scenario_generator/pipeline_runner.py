@@ -376,6 +376,7 @@ class PipelineRunner:
             save_prompt_file,
             build_segments_detailed_for_path,
         )
+        from pipeline.step_02_legal_paths.segments import crop_segments_t_junction
         from run_path_picker import pick_paths_with_model
         from run_path_refiner import refine_picked_paths_with_model
         from run_object_placer import run_object_placer
@@ -411,7 +412,28 @@ class PipelineRunner:
             (cat_info and cat_info.map.topology == TopologyType.TWO_LANE_CORRIDOR)
         )
         
-        if is_two_lane_corridor:
+        # Check if this is a ROUNDABOUT topology - use hardcoded Town03 crop
+        is_roundabout = (
+            spec.topology == "roundabout" or
+            (cat_info and cat_info.map.topology == TopologyType.ROUNDABOUT)
+        )
+        
+        if is_roundabout:
+            # Roundabout is only available in Town03
+            if town != "Town03":
+                return False, None, f"Roundabout topology only available in Town03, got {town}"
+            print(f"[INFO] Using hardcoded roundabout crop for Town03")
+            roundabout_crop = crop_picker.build_roundabout_crop_for_town(
+                town_name=town,
+                town_json_path=str(nodes_path),
+                min_path_len=20.0,
+                max_paths=100,
+                max_depth=8,
+            )
+            if roundabout_crop is None:
+                return False, None, "Failed to build roundabout crop for Town03"
+            crops = [roundabout_crop]
+        elif is_two_lane_corridor:
             # Use corridor-specific crop generation for TWO_LANE_CORRIDOR topology
             print(f"[INFO] Using corridor-specific crop generation for TWO_LANE_CORRIDOR topology")
             crops = crop_picker.build_corridor_candidate_crops_for_town(
@@ -493,6 +515,9 @@ class PipelineRunner:
         )
 
         assignments = res.detailed.get("assignments", {})
+        junction_center = None  # Track junction center for T-junction filtering
+        is_t_junction = spec.topology == "t_junction"
+        
         if scenario_id not in assignments:
             satisfying = [c for c in crops if crop_satisfies_spec(spec, c)]
             if not satisfying:
@@ -505,13 +530,32 @@ class PipelineRunner:
                 )
             cand = min(satisfying, key=lambda c: c.area)
             crop_vals = [cand.crop.xmin, cand.crop.xmax, cand.crop.ymin, cand.crop.ymax]
+            junction_center = getattr(cand, 'center_xy', None)
         else:
             crop_vals = assignments[scenario_id]["crop"]
+            # Try to find the matching crop to get junction center
+            for c in crops:
+                if (abs(c.crop.xmin - crop_vals[0]) < 0.1 and 
+                    abs(c.crop.xmax - crop_vals[1]) < 0.1 and
+                    abs(c.crop.ymin - crop_vals[2]) < 0.1 and
+                    abs(c.crop.ymax - crop_vals[3]) < 0.1):
+                    junction_center = getattr(c, 'center_xy', None)
+                    break
         crop = CropBox(xmin=crop_vals[0], xmax=crop_vals[1], ymin=crop_vals[2], ymax=crop_vals[3])
 
         data = load_nodes(str(nodes_path))
         all_segments = build_segments(data)
-        cropped_segments = crop_segments(all_segments, crop)
+        
+        # Use T-junction specific cropping to filter out segments from other junctions
+        if is_t_junction and junction_center is not None:
+            print(f"[INFO] Using T-junction segment filtering with center={junction_center}")
+            cropped_segments = crop_segments_t_junction(
+                all_segments, crop, 
+                junction_center=junction_center,
+                junction_radius=30.0,  # Only include segments within 30m of junction center
+            )
+        else:
+            cropped_segments = crop_segments(all_segments, crop)
         if not cropped_segments:
             return False, None, "No segments found in crop region"
 
@@ -605,7 +649,7 @@ class PipelineRunner:
             tokenizer=self._tokenizer,
             max_new_tokens=2048,
             do_sample=True,
-            temperature=0.4,
+            temperature=0.2,
             top_p=0.95,
             require_straight=require_straight,
             require_on_ramp=require_on_ramp,

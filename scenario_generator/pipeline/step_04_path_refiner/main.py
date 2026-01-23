@@ -138,6 +138,47 @@ def refine_picked_paths_with_model(
     )
     print(f"[TIMING] refiner LLM constraint extraction: {time.time() - t0:.2f}s", flush=True)
 
+    # For t-junctions with perpendicular relations, allow spawns a bit outside the crop
+    # so the side-road vehicle can start before merging onto the main road.
+    try:
+        topo = str((schema_payload or {}).get("topology", "")).lower()
+        vehicle_constraints = (schema_payload or {}).get("vehicle_constraints", [])
+        has_perp = any(str(c.get("type", "")).lower() in ("perpendicular_left_of", "perpendicular_right_of") for c in vehicle_constraints)
+        if topo == "t_junction" and has_perp:
+            opts = constraints.setdefault("options", {})
+            current = float(opts.get("start_outside_crop_margin_m", 0.0) or 0.0)
+            # 12m covers the clipped side-road entry in Town02 without impacting other crops
+            opts["start_outside_crop_margin_m"] = max(current, 12.0)
+            # If any ego explicitly enters from the side road, widen further to pull spawn points outside the crop.
+            ego_entries = {
+                str(v.get("vehicle_id")): str(v.get("entry_road", "")).lower()
+                for v in (schema_payload or {}).get("ego_vehicles", [])
+                if isinstance(v, dict) and v.get("vehicle_id")
+            }
+            if any(val == "side" for val in ego_entries.values()):
+                opts["start_outside_crop_margin_m"] = max(opts["start_outside_crop_margin_m"], 50.0)
+            # Remove lane-change macros for vehicles on the side road so their perpendicular approach is preserved.
+            side_road_vehicles = {
+                str(v.get("vehicle_id"))
+                for v in (schema_payload or {}).get("ego_vehicles", [])
+                if str(v.get("entry_road", "")).lower() == "side"
+            }
+            if side_road_vehicles:
+                before = len(constraints.get("lane_changes", []) or [])
+                constraints["lane_changes"] = [
+                    lc
+                    for lc in (constraints.get("lane_changes", []) or [])
+                    if lc.get("vehicle") not in side_road_vehicles and lc.get("target") not in side_road_vehicles
+                ]
+                after = len(constraints.get("lane_changes", []) or [])
+                if before != after:
+                    print(
+                        f"[INFO] refiner: dropped {before - after} lane_change macros for side-road vehicles (t-junction perpendicular)",
+                        flush=True,
+                    )
+    except Exception as e:
+        print(f"[WARN] refiner could not set t-junction spawn margin: {e}", flush=True)
+
     if prompt_out:
         try:
             Path(prompt_out).write_text(

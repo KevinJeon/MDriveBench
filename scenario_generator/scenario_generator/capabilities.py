@@ -49,6 +49,7 @@ class TopologyType(Enum):
     CORRIDOR = "corridor"          # Straight road segment
     TWO_LANE_CORRIDOR = "two_lane_corridor"  # Bidirectional two-lane corridor
     HIGHWAY = "highway"            # Multi-lane high-speed road (3+ lanes)
+    ROUNDABOUT = "roundabout"      # Circular intersection (only Town03)
     UNKNOWN = "unknown"            # Fallback
 
 
@@ -392,6 +393,7 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         must_include=[
             "Static prop fully blocking or partially blocking a lane that a vehicle is travelling in. Only one lane should be blocked.",
             "Vehicle in adjacent lane relative to blocked lane (left/right lane of). Some vehicles may also have a different entry road and turn onto the blocked lane before the blockage.",
+            "Additional vehicles may be oncoming relative to the vehicle travelling in the blocked lane, or in the same lane behind the blockage, or in adjacent lanes.",
         ],
         avoid=[
             "Any lane changes"
@@ -430,21 +432,24 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         intent="Test gap acceptance for side-street entry into busy main road, with possible occlusion/pedestrians.",
         map=MapRequirements(topology=TopologyType.T_JUNCTION),
         must_include=[
-            "Side street vehicle entering main road",
-            "Main road traffic present (follow_route_of or opposite/perpendicular)",
+        "ALWAYS: include Vehicle S from side street entering main road.",
+        "ALWAYS: include Vehicle M on the main road such that S must yield (S merges into lane of M or merges into occupied exit segment).",
+        "WHEN ego_count IN {3,4,5}: you MUST include an oncoming main-road vehicle Vehicle O with constraint OPPOSITE_APPROACH_OF(O, M), going straight through.",
+        "WHEN ego_count IN {4,5}: you MUST include a vehicle Vehicle X that turns from the main road into the side road, creating a conflict with S in the junction or immediate exit.",
         ],
         avoid=[
             "Signals controlling entry",
-            "Props blocking vehicle paths",
+            "ANY lane change by any vehicle",
+            "Static props",
         ],
         vary=[
             VariationAxis("ego_count", ["3", "4", "5"], "total vehicles at the T-junction"),
             VariationAxis("main_road_queue", ["single", "follow_route_of chain 2-4"], "volume of main-road traffic"),
             VariationAxis("side_street_queue", ["single", "follow_route_of chain 2"], "volume of side-street entrants"),
             VariationAxis("side_maneuver", ["left turn", "right turn"], "maneuver performed by the side-street vehicle"),
-            VariationAxis("parked_vehicle", ["none", "parked_vehicle on opposite side of road blocking view"], "occluding parked vehicle presence, which does not block any vehicle paths"),
             VariationAxis("pedestrian", ["none", "walker crossing exit path"], "whether a pedestrian crosses the exit path"),
         ],
+        allow_static_props=False,
     ), 
 
     "Construction Zone": CategoryDefinition(
@@ -453,13 +458,18 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         intent="Create forced merges and constrained paths using static props.",
         map=MapRequirements(topology=TopologyType.CORRIDOR, needs_multi_lane=True),
         must_include=[
-            "Define one area / lane to be the construction zone, and do not place any props outside this area",
+            "Define one exit segment, in one vehicles, lane to be the construction zone, and do not place any props outside this area",
             "Clusters of multiple types of construction related static props in work zone",
             "Construction props must be selected ONLY from the following assets: cones (constructioncone, trafficcone01, trafficcone02), barriers (streetbarrier, barrel, chainbarrier, chainbarrierend), warning sign (trafficwarning), and at most one construction/utility vehicle (truck or van)."
+            "All vehicles exit segments must be either the construction zone lane or an adjacent lane to the construction zone",
+            "Vehicles may turn into the exit segment lane"
             
         ],
         avoid=[
             "Pedestrians or cyclists",
+            "Any static prop that is not directly behind another static prop in the work zone",
+            "Props outside of the lane designated as the construction zone",
+            "Unnecessary lane changes"
         ],
         vary=[
             VariationAxis("ego_count", ["2", "3", "4", "5", "6"], "vehicles traversing the work zone"),

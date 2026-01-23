@@ -494,7 +494,7 @@ def main():
     ap.add_argument("--picker-max-new-tokens", type=int, default=2048)
     ap.add_argument("--picker-do-sample", action="store_true", default=True, help="Enable sampling (default: True)")
     ap.add_argument("--picker-no-sample", dest="picker_do_sample", action="store_false", help="Disable sampling")
-    ap.add_argument("--picker-temperature", type=float, default=0.5)
+    ap.add_argument("--picker-temperature", type=float, default=0.2)
     ap.add_argument("--picker-top-p", type=float, default=0.95)
     ap.add_argument("--allow-fuzzy-match", action="store_true", help="Permit fuzzy path name matching")
 
@@ -507,7 +507,7 @@ def main():
     ap.add_argument("--placer-max-new-tokens", type=int, default=2048)
     ap.add_argument("--placer-do-sample", action="store_true", default=True, help="Enable sampling (default: True)")
     ap.add_argument("--placer-no-sample", dest="placer_do_sample", action="store_false", help="Disable sampling")
-    ap.add_argument("--placer-temperature", type=float, default=0.5)
+    ap.add_argument("--placer-temperature", type=float, default=0.2)
     ap.add_argument("--placer-top-p", type=float, default=0.95)
 
     ap.add_argument("--viz-objects", action="store_true", help="Enable visualization in object placer")

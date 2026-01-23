@@ -118,6 +118,7 @@ def pick_paths_with_model(
                 require_on_ramp=require_on_ramp,
                 lane_counts_by_road=agg.get("lane_counts_by_road") if isinstance(agg, dict) else None,
                 skip_evidence_filter=True,
+                crop_region=agg.get("crop_region") if isinstance(agg, dict) else None,
             )
             parsed = {"vehicles": csp_items}
             print(f"[TIMING] path_picker schema CSP solve: {time_module.time() - t0_csp_stage:.2f}s", flush=True)
@@ -154,6 +155,7 @@ def pick_paths_with_model(
                     require_straight=require_straight,
                     require_on_ramp=require_on_ramp,
                     lane_counts_by_road=agg.get("lane_counts_by_road") if isinstance(agg, dict) else None,
+                    crop_region=agg.get("crop_region") if isinstance(agg, dict) else None,
                 )
                 print(f"[TIMING] path_picker CSP solve: {time_module.time() - t0_csp_solve:.2f}s", flush=True)
                 parsed = {"vehicles": csp_items}

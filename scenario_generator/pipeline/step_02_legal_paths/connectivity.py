@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -42,12 +42,18 @@ def build_connectivity(segments: List[LaneSegment],
 
 def identify_boundary_segments(segments: List[LaneSegment],
                                crop: CropBox,
-                               corridor_mode: bool = False) -> Tuple[List[int], List[int]]:
+                               corridor_mode: bool = False,
+                               boundary_margin: float = 3.0,
+                               adj: Optional[List[List[int]]] = None) -> Tuple[List[int], List[int]]:
     """
-    Identify segments that cross the crop boundary.
+    Identify segments that cross or are near the crop boundary.
 
-    Entry segments: start outside, enter inside
-    Exit segments: start inside, exit outside
+    Entry segments: start outside (or near boundary), enter inside
+    Exit segments: start inside, exit outside (or near boundary)
+    
+    Additionally, "terminal" segments (one end has no connectivity) are also
+    treated as entry/exit. This handles cases where roads end within the crop
+    region (e.g., dead ends or roads that were clipped).
     
     Args:
         segments: List of lane segments
@@ -56,23 +62,77 @@ def identify_boundary_segments(segments: List[LaneSegment],
                        middle inside) to be classified as BOTH entry AND exit.
                        This is needed for corridor topologies where a road runs
                        entirely through the crop region.
+        boundary_margin: Distance from boundary to consider as "at the boundary".
+                        This handles segments that start/end slightly inside the crop
+                        but should still be treated as entry/exit segments.
+        adj: Adjacency list for segment connectivity. If provided, segments with
+             terminal endpoints (no incoming/outgoing connections) are also
+             classified as entry/exit segments.
     """
     entry_segments = []
     exit_segments = []
+    
+    def is_near_boundary(pt: np.ndarray) -> bool:
+        """Check if a point is near (within margin of) any crop boundary."""
+        x, y = float(pt[0]), float(pt[1])
+        near_xmin = abs(x - crop.xmin) < boundary_margin
+        near_xmax = abs(x - crop.xmax) < boundary_margin
+        near_ymin = abs(y - crop.ymin) < boundary_margin
+        near_ymax = abs(y - crop.ymax) < boundary_margin
+        return near_xmin or near_xmax or near_ymin or near_ymax
+    
+    def is_deeply_inside(pt: np.ndarray) -> bool:
+        """Check if point is well inside the crop (not near any boundary)."""
+        return crop.contains(pt) and not is_near_boundary(pt)
+    
+    # Build reverse adjacency to detect incoming connections
+    incoming = [[] for _ in segments] if adj else None
+    if adj:
+        for i, neighbors in enumerate(adj):
+            for j in neighbors:
+                incoming[j].append(i)
+    
+    def has_no_incoming(seg_idx: int) -> bool:
+        """Check if segment has no incoming connections (terminal start)."""
+        if incoming is None:
+            return False
+        return len(incoming[seg_idx]) == 0
+    
+    def has_no_outgoing(seg_idx: int) -> bool:
+        """Check if segment has no outgoing connections (terminal end)."""
+        if adj is None:
+            return False
+        return len(adj[seg_idx]) == 0
 
     for i, seg in enumerate(segments):
-        start_inside = crop.contains(seg.points[0])
-        end_inside = crop.contains(seg.points[-1])
+        start_pt = seg.points[0]
+        end_pt = seg.points[-1]
+        
+        start_inside = crop.contains(start_pt)
+        end_inside = crop.contains(end_pt)
+        start_at_boundary = is_near_boundary(start_pt)
+        end_at_boundary = is_near_boundary(end_pt)
 
+        # Entry segment: starts outside/at-boundary, ends inside
         if not start_inside and end_inside:
+            entry_segments.append(i)
+        elif start_inside and start_at_boundary and is_deeply_inside(end_pt):
+            # Start is technically inside but very near boundary, end is deep inside
             entry_segments.append(i)
         elif not start_inside and not end_inside:
             for pt in seg.points[1:-1]:
                 if crop.contains(pt):
                     entry_segments.append(i)
                     break
+        elif start_inside and end_inside and has_no_incoming(i):
+            # Fully inside but no incoming connections - terminal start = entry
+            entry_segments.append(i)
 
+        # Exit segment: starts inside, ends outside/at-boundary
         if start_inside and not end_inside:
+            exit_segments.append(i)
+        elif is_deeply_inside(start_pt) and end_inside and end_at_boundary:
+            # Start is deep inside, end is technically inside but very near boundary
             exit_segments.append(i)
         elif not start_inside and not end_inside:
             # Pass-through segment: starts outside, ends outside, but passes through crop
@@ -91,6 +151,10 @@ def identify_boundary_segments(segments: List[LaneSegment],
                         if crop.contains(pt):
                             exit_segments.append(i)
                             break
+        elif start_inside and end_inside and has_no_outgoing(i):
+            # Fully inside but no outgoing connections - terminal end = exit
+            if i not in exit_segments:
+                exit_segments.append(i)
 
     return entry_segments, exit_segments
 
@@ -120,7 +184,7 @@ def generate_legal_paths(segments: List[LaneSegment],
     """
     legal_paths: List[LegalPath] = []
 
-    entry_segments, exit_segments = identify_boundary_segments(segments, crop, corridor_mode=corridor_mode)
+    entry_segments, exit_segments = identify_boundary_segments(segments, crop, corridor_mode=corridor_mode, adj=adj)
     print(f"[INFO] Found {len(entry_segments)} entry segments and {len(exit_segments)} exit segments")
 
     if len(entry_segments) == 0 or len(exit_segments) == 0:

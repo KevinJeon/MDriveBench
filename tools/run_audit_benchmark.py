@@ -380,6 +380,9 @@ def _resolve_town_for_category(
             return t_junction_town
         if two_lane_corridor_town and info.map.topology == TopologyType.TWO_LANE_CORRIDOR:
             return two_lane_corridor_town
+        # Roundabout is only available in Town03
+        if info.map.topology == TopologyType.ROUNDABOUT:
+            return "Town03"
     return default_town
 
 
@@ -1237,7 +1240,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default="Qwen/Qwen2.5-32B-Instruct-AWQ")
     parser.add_argument("--schema-max-new-tokens", type=int, default=1024)
-    parser.add_argument("--schema-temperature", type=float, default=0.6)
+    parser.add_argument("--schema-temperature", type=float, default=0.3)
     parser.add_argument("--schema-top-p", type=float, default=0.9)
     parser.add_argument("--schema-repetition-penalty", type=float, default=1.1)
     parser.add_argument("--schema-max-retries", type=int, default=3)
@@ -1368,7 +1371,13 @@ def main() -> None:
         allow_template_fallback=False,
     )
 
-    model, tokenizer = _load_shared_model(args.model)
+    # Skip local model loading for OpenAI API models
+    is_openai_model = args.model.startswith("gpt-") or args.model.startswith("o1-") or args.model.startswith("o3-") or args.model.startswith("o5-")
+    if is_openai_model:
+        model, tokenizer = None, None
+        print(f"[INFO] Using OpenAI API model: {args.model}")
+    else:
+        model, tokenizer = _load_shared_model(args.model)
     generator = SchemaScenarioGenerator(
         schema_config,
         model=model,

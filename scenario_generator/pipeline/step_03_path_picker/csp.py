@@ -6,6 +6,7 @@ from .candidates import (
     _candidate_all_road_ids,
     _candidate_entry_cardinal,
     _candidate_entry_heading_rad,
+    _candidate_entry_in_crop,
     _candidate_entry_lane_id,
     _candidate_entry_point,
     _candidate_entry_road_id,
@@ -174,6 +175,7 @@ def _solve_paths_csp(
     require_on_ramp: bool = False,
     lane_counts_by_road: Optional[Dict[int, int]] = None,
     skip_evidence_filter: bool = False,
+    crop_region: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Soft CSP/backtracking over candidate paths.
@@ -181,7 +183,21 @@ def _solve_paths_csp(
     Soft penalties are applied for constraint violations; the best-scoring assignment is chosen.
     
     If require_straight=True, heavily penalizes paths with turns (for CORRIDOR topology).
+    
+    If crop_region is provided, ALL candidates are filtered to only those whose
+    entry point is strictly inside the crop region. This ensures role inference
+    and path selection only consider the intended junction/area.
     """
+    # EARLY CROP FILTERING: Filter candidates to only those inside the crop region.
+    # This must happen BEFORE role inference so we don't confuse side/main classification.
+    if crop_region:
+        original_count = len(candidates)
+        candidates = [c for c in candidates if _candidate_entry_in_crop(c, crop_region, margin=0)]
+        filtered_count = len(candidates)
+        print(f"[INFO] CSP: Crop region filter: {original_count} -> {filtered_count} candidates (margin=0, strict)")
+        if not candidates:
+            raise ValueError("No candidates have entry points inside the crop region.")
+    
     if require_straight:
         print("[INFO] CSP: require_straight=True, filtering to straight paths only")
     norm = _normalize_constraints_obj(constraints_obj)
@@ -590,6 +606,7 @@ def _solve_paths_csp(
         if require_on_ramp and er == "side" and man == "straight":
             man = "unknown"
         dom = [c for c in candidates if _candidate_matches_unary(c, man, er, xr, role_sets)]
+        
         if require_on_ramp:
             if er == "side" and ramp_candidates:
                 dom_side = [c for c in dom if c.get("name") in ramp_candidates]

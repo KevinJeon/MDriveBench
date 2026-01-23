@@ -549,12 +549,14 @@ def _ensure_direction_and_lane_constraints(spec: ScenarioSpec) -> ScenarioSpec:
 class SchemaGenerationConfig:
     model_id: str = "Qwen/Qwen2.5-32B-Instruct-AWQ"
     max_new_tokens: int = 1024
-    temperature: float = 0.6
+    temperature: float = 0.3
     top_p: float = 0.9
     repetition_penalty: float = 1.1
     do_sample: bool = True
     max_retries: int = 3
     allow_template_fallback: bool = False
+    use_openai: bool = False  # If True, use OpenAI API instead of local model
+    openai_api_key: Optional[str] = None  # Set via env OPENAI_API_KEY if None
 
 
 class TemplateSchemaGenerator:
@@ -665,7 +667,74 @@ class SchemaScenarioGenerator:
         )
         self._model.eval()
 
+    def _generate_text_openai(self, prompt: str, temperature_override: Optional[float] = None) -> str:
+        """Generate text using OpenAI API (GPT-4o-mini, GPT-5-nano, etc.)."""
+        import os
+        from openai import OpenAI
+        
+        api_key = self.config.openai_api_key or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OpenAI API key not set. Set OPENAI_API_KEY env var or pass openai_api_key in config.")
+        
+        client = OpenAI(api_key=api_key)
+        effective_temp = temperature_override if temperature_override is not None else self.config.temperature
+        
+        messages = [
+            {"role": "system", "content": build_schema_system_prompt()},
+            {"role": "user", "content": prompt},
+        ]
+        
+        # GPT-5 and reasoning models have different API requirements
+        is_restricted_model = any(x in self.config.model_id for x in ["gpt-5", "o1-", "o3-", "o5-"])
+        
+        create_kwargs = {
+            "model": self.config.model_id,
+            "messages": messages,
+        }
+        
+        if is_restricted_model:
+            # These models use max_completion_tokens, don't support custom temperature
+            # Reasoning models consume tokens for internal chain-of-thought, so we need
+            # a much larger budget (e.g., 1024 reasoning + 1024 output = 2048 minimum)
+            reasoning_budget = max(self.config.max_new_tokens * 4, 4096)
+            create_kwargs["max_completion_tokens"] = reasoning_budget
+            # Don't use response_format for restricted models - they may not support it
+        else:
+            # Older models (gpt-4o, gpt-4o-mini, etc.)
+            create_kwargs["max_tokens"] = self.config.max_new_tokens
+            create_kwargs["temperature"] = effective_temp
+            create_kwargs["response_format"] = {"type": "json_object"}
+        
+        response = client.chat.completions.create(**create_kwargs)
+        
+        # Handle various response structures
+        choice = response.choices[0]
+        
+        # Debug: log finish reason
+        finish_reason = getattr(choice, 'finish_reason', 'unknown')
+        print(f"[DEBUG OpenAI] finish_reason={finish_reason}, model={self.config.model_id}")
+        
+        content = choice.message.content
+        
+        # Some models return None content but have refusal or other fields
+        if content is None or content == "":
+            # Check for refusal
+            if hasattr(choice.message, 'refusal') and choice.message.refusal:
+                error_msg = f"Model refused request: {choice.message.refusal}"
+                print(f"[ERROR OpenAI] {error_msg}")
+                raise ValueError(error_msg)
+            # Log full response for debugging
+            error_msg = f"Empty response from model. finish_reason={finish_reason}, full_response={response}"
+            print(f"[ERROR OpenAI] {error_msg}")
+            raise ValueError(error_msg)
+        
+        return content.strip()
+
     def _generate_text(self, prompt: str, temperature_override: Optional[float] = None) -> str:
+        # Route to OpenAI if configured
+        if self.config.use_openai or self.config.model_id.startswith("gpt-"):
+            return self._generate_text_openai(prompt, temperature_override)
+        
         self._load_model()
         import torch
 

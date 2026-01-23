@@ -27,11 +27,16 @@ def _candidate_speeds(base: float) -> List[float]:
     return out
 
 
-def _default_start_end_in_crop(segments_detailed: List[Dict[str, Any]], crop: CropBox) -> Optional[Tuple[int, int, List[Tuple[float, float]]]]:
+def _default_start_end_in_crop(
+    segments_detailed: List[Dict[str, Any]],
+    crop: CropBox,
+    start_crop: Optional[CropBox] = None,
+) -> Optional[Tuple[int, int, List[Tuple[float, float]]]]:
     pts, _ = _segments_to_polyline_with_map(segments_detailed)
     if not pts:
         return None
-    se = _first_last_idx_in_crop(pts, crop)
+    scrop = start_crop or crop
+    se = _first_last_idx_in_crop(pts, scrop)
     if se is None:
         return None
     s, e = se
@@ -99,11 +104,19 @@ def refine_spawn_and_speeds_soft_csp(
     """
     vehicles = list(per_vehicle.keys())
 
+    start_outside_margin_m = float((constraints.get("options", {}) or {}).get("start_outside_crop_margin_m", 0.0))
+    start_crop = CropBox(
+        xmin=crop.xmin - start_outside_margin_m,
+        xmax=crop.xmax + start_outside_margin_m,
+        ymin=crop.ymin - start_outside_margin_m,
+        ymax=crop.ymax + start_outside_margin_m,
+    )
+
     # Build base polylines and default start/end indices (in crop)
     base = {}
     for v in vehicles:
         segs = per_vehicle[v]["segments_detailed"]
-        d = _default_start_end_in_crop(segs, crop)
+        d = _default_start_end_in_crop(segs, crop, start_crop=start_crop)
         if d is None:
             # fallback: use entire polyline
             pts, _ = _segments_to_polyline_with_map(segs)
@@ -140,7 +153,7 @@ def refine_spawn_and_speeds_soft_csp(
         s0 = base[v]["start"]
         e0 = base[v]["end"]
         # allowable starts: inside crop, and keep at least 2 points before end
-        inside = [i for i, (x, y) in enumerate(pts) if crop.contains(x, y)]
+        inside = [i for i, (x, y) in enumerate(pts) if start_crop.contains(x, y)]
         if not inside:
             inside = list(range(len(pts)))
         # bound by window: within +/- 25m of default start in arc-length

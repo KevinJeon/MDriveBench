@@ -1413,12 +1413,12 @@ class SceneValidator:
         if category:
             cat = CATEGORY_DEFINITIONS.get(category)
             if cat:
-                if flags["required_topology"] is None:
-                    flags["required_topology"] = cat.map.topology
-                flags["needs_oncoming"] = flags["needs_oncoming"] or cat.map.needs_oncoming
-                flags["needs_on_ramp"] = flags["needs_on_ramp"] or cat.map.needs_on_ramp
-                flags["needs_merge"] = flags["needs_merge"] or cat.map.needs_merge
-                flags["needs_multi_lane"] = flags["needs_multi_lane"] or cat.map.needs_multi_lane
+                # Category definition is authoritative - override LLM spec flags
+                flags["required_topology"] = cat.map.topology
+                flags["needs_oncoming"] = cat.map.needs_oncoming
+                flags["needs_on_ramp"] = cat.map.needs_on_ramp
+                flags["needs_merge"] = cat.map.needs_merge
+                flags["needs_multi_lane"] = cat.map.needs_multi_lane
                 if "weaving" in cat.name.lower():
                     flags["needs_lane_change"] = True
                 if "lane drop" in cat.name.lower():
