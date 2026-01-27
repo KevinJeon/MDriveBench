@@ -563,6 +563,7 @@ def validate_spec(spec: ScenarioSpec) -> Tuple[bool, List[str]]:
         TopologyType.CORRIDOR,
         TopologyType.TWO_LANE_CORRIDOR,
         TopologyType.HIGHWAY,
+        TopologyType.ROUNDABOUT,
     }:
         errors.append(f"Topology '{spec.topology.value}' is not supported")
     

@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import random
 import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -44,6 +46,7 @@ STATES = [
     "scenario_generation",
     "repair_loops",
     "route_generation",
+    "baseline_validation",
     "carla_simulation",
     "video_generation",
     "csv_commit",
@@ -485,6 +488,602 @@ def _collect_route_files(routes_dir: Path) -> List[str]:
     return files
 
 
+# =============================================================================
+# CARLA baseline validation helpers
+# =============================================================================
+
+
+def _load_carla_module(carla_root: Path):
+    """
+    Best-effort import of the CARLA egg bundled under repo_root/carla.
+    Returns the imported module or raises the original ImportError.
+    """
+    try:
+        import carla  # type: ignore
+        return carla
+    except Exception:
+        pass
+
+    dist_dir = carla_root / "PythonAPI" / "carla" / "dist"
+    eggs = sorted(dist_dir.glob("carla-*.egg"))
+    if not eggs:
+        raise FileNotFoundError(f"No CARLA egg found under {dist_dir}")
+    py3_eggs = [egg for egg in eggs if "-py3" in egg.name]
+    egg_path = str(py3_eggs[0] if py3_eggs else eggs[0])
+    if egg_path not in sys.path:
+        sys.path.append(egg_path)
+    import carla  # type: ignore  # noqa: E401
+    return carla
+
+
+def _load_actor_manifest(routes_dir: Path) -> Dict[str, List[Dict[str, Any]]]:
+    manifest_path = routes_dir / "actors_manifest.json"
+    if not manifest_path.exists():
+        return {}
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _parse_route_file(route_path: Path, carla_module) -> List[Any]:
+    """
+    Parse a simple route XML into a list of carla.Transform.
+    """
+    import xml.etree.ElementTree as ET
+
+    tree = ET.parse(route_path)
+    root = tree.getroot()
+    route_nodes = list(root.iter("route"))
+    if not route_nodes:
+        return []
+    waypoints = []
+    for wp in route_nodes[0].iter("waypoint"):
+        x = float(wp.get("x", "0"))
+        y = float(wp.get("y", "0"))
+        z = float(wp.get("z", "0"))
+        yaw = float(wp.get("yaw", "0"))
+        transform = carla_module.Transform(
+            carla_module.Location(x=x, y=y, z=z),
+            carla_module.Rotation(yaw=yaw),
+        )
+        waypoints.append(transform)
+    return waypoints
+
+
+def _destroy_actors(actors: List[Any]) -> None:
+    for actor in actors:
+        try:
+            actor.destroy()
+        except Exception:
+            pass
+
+
+def validate_spawn(world, expected_actor_ids: List[int]) -> Tuple[bool, str]:
+    """
+    Check that all expected actor ids resolve to live actors in the world.
+    """
+    for aid in expected_actor_ids:
+        actor = world.get_actor(aid)
+        if actor is None:
+            return False, f"missing_actor_{aid}"
+        if not actor.is_alive:
+            return False, f"dead_actor_{aid}"
+    return True, ""
+
+
+def _bounding_sphere_radius(actor) -> float:
+    try:
+        bb = actor.bounding_box
+        # Use the smaller footprint dimension to avoid over-flagging tailgating as collision.
+        return max(min(bb.extent.x, bb.extent.y), 0.8)
+    except Exception:
+        return 1.5
+
+
+def _actor_velocity(actor):
+    try:
+        vel = actor.get_velocity()
+        return vel
+    except Exception:
+        return None
+
+
+def _project_location(loc, vel, dt, carla_module):
+    if vel is None:
+        return loc
+    return carla_module.Location(
+        x=loc.x + vel.x * dt,
+        y=loc.y + vel.y * dt,
+        z=loc.z + vel.z * dt,
+    )
+
+
+def _unit_vector(vec) -> Tuple[float, float, float]:
+    mag = math.sqrt(vec.x * vec.x + vec.y * vec.y + vec.z * vec.z)
+    if mag < 1e-6:
+        return (0.0, 0.0, 0.0)
+    return (vec.x / mag, vec.y / mag, vec.z / mag)
+
+
+def _actor_radius(actor, margin: float = 0.2) -> float:
+    try:
+        bb = actor.bounding_box
+        r = max(bb.extent.x, bb.extent.y) + margin
+        return max(r, 0.4)  # light floor for walkers/bikes
+    except Exception:
+        return 1.5
+
+
+def _closing_speed(ego_loc, ego_vel, other_loc, other_vel) -> float:
+    if ego_vel is None or other_vel is None:
+        return 0.0
+    dx = ego_loc.x - other_loc.x
+    dy = ego_loc.y - other_loc.y
+    dz = ego_loc.z - other_loc.z
+    mag = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if mag < 1e-6:
+        return 0.0
+    ux, uy, uz = dx / mag, dy / mag, dz / mag
+    relx = other_vel.x - ego_vel.x
+    rely = other_vel.y - ego_vel.y
+    relz = other_vel.z - ego_vel.z
+    return relx * ux + rely * uy + relz * uz
+
+
+def _compute_near_miss(
+    ego_actor,
+    other_actors,
+    carla_module,
+    horizon_s: float,
+    step_s: float,
+    ttc_thresh: float,
+    ttc_severe: float,
+    closing_min: float,
+) -> Tuple[bool, bool, float]:
+    """
+    Returns (hit_this_tick, severe_hit, min_ttc_local).
+    hit_this_tick is True if any projected collision within ttc_thresh AND closing_speed>closing_min.
+    severe_hit if any TTC <= ttc_severe with the same closing condition.
+    """
+    ego_loc = ego_actor.get_location()
+    ego_vel = _actor_velocity(ego_actor)
+    ego_r = _actor_radius(ego_actor)
+
+    min_ttc = float("inf")
+    hit = False
+    severe = False
+
+    for other in other_actors:
+        if other.id == ego_actor.id:
+            continue
+        other_loc = other.get_location()
+        other_vel = _actor_velocity(other)
+        closing = _closing_speed(ego_loc, ego_vel, other_loc, other_vel)
+        if closing <= closing_min:
+            continue
+        other_r = _actor_radius(other)
+        r_sum = ego_r + other_r
+        steps = max(1, int(horizon_s / step_s))
+        for i in range(1, steps + 1):
+            t = i * step_s
+            p_ego = _project_location(ego_loc, ego_vel, t, carla_module)
+            p_other = _project_location(other_loc, other_vel, t, carla_module)
+            dist = p_ego.distance(p_other)
+            if dist <= r_sum:
+                min_ttc = min(min_ttc, t)
+                if t <= ttc_thresh:
+                    hit = True
+                if t <= ttc_severe:
+                    severe = True
+                break
+    return hit, severe, min_ttc
+
+
+def _run_baseline_constant_velocity(
+    carla_module,
+    world,
+    routes_dir: Path,
+    args: argparse.Namespace,
+    log_fn,
+) -> Dict[str, Any]:
+    """
+    Spawn actors from routes_dir and run a constant-velocity baseline controller.
+    Returns a result dict with keys: status, reason, rc, ds, near_miss, min_ttc, tags.
+    """
+    manifest = _load_actor_manifest(routes_dir)
+    if not manifest:
+        return {"status": "reject", "reason": "missing_manifest"}
+
+    blueprint_library = world.get_blueprint_library()
+    spawned: List[Any] = []
+    sensors: List[Any] = []
+    expected_ids: List[int] = []
+    ego_actors: List[Any] = []
+
+    def pick_blueprint(role: str, model: Optional[str] = None):
+        """
+        Choose a sensible blueprint per role with fallbacks.
+        """
+        if model:
+            try:
+                return blueprint_library.find(model)
+            except Exception:
+                pass
+        if role == "pedestrian":
+            walkers = [bp for bp in blueprint_library.filter("walker.pedestrian.*")]
+            if walkers:
+                return random.choice(walkers)
+        if role == "static":
+            props = [bp for bp in blueprint_library.filter("static.prop.*")]
+            if props:
+                return random.choice(props)
+        # default vehicle
+        vehicles = [bp for bp in blueprint_library.filter("vehicle.*model3*")] or blueprint_library.filter("vehicle.*")
+        return random.choice(vehicles)
+
+    def _spawn_with_retries(bp, transform, role_name, retries=5):
+        last_actor = None
+        for i in range(retries):
+            tf = carla_module.Transform(
+                carla_module.Location(
+                    x=transform.location.x,
+                    y=transform.location.y,
+                    z=transform.location.z + 0.2 * i,
+                ),
+                transform.rotation,
+            )
+            if bp.has_attribute("role_name"):
+                bp.set_attribute("role_name", role_name)
+            try:
+                actor = world.try_spawn_actor(bp, tf)
+            except Exception:
+                actor = None
+            if actor:
+                return actor
+            time.sleep(0.05)
+        return last_actor
+
+    try:
+        # Cleanup any leftover heroes from previous attempts to avoid collisions
+        leftovers = [a for a in world.get_actors().filter("vehicle.*") if a.attributes.get("role_name", "").startswith("hero")]
+        if leftovers:
+            log_fn(f"[BASELINE] destroying {len(leftovers)} leftover hero vehicles before spawn")
+        _destroy_actors(leftovers)
+
+        # Spawn order: statics, pedestrians, npc, ego
+        spawn_plan = [
+            ("static", manifest.get("static", [])),
+            ("pedestrian", manifest.get("pedestrian", [])),
+            ("npc", manifest.get("npc", [])),
+            ("ego", manifest.get("ego", [])),
+        ]
+
+        def _spawn_candidates_from_map(start_tf: Any, offsets: List[float], carla_map) -> List[Any]:
+            """
+            Use CARLA map to walk forward along the lane from the first aligned pose.
+            Offsets are distances in meters.
+            """
+            if start_tf is None or carla_map is None:
+                return []
+            try:
+                wp0 = carla_map.get_waypoint(start_tf.location, project_to_road=True, lane_type=carla_module.LaneType.Driving)
+            except Exception:
+                return [start_tf]
+
+            candidates: List[Any] = []
+            for offset in offsets:
+                if offset <= 0:
+                    candidates.append(wp0.transform)
+                    continue
+                try:
+                    nxt = wp0.next(offset)
+                    if nxt:
+                        candidates.append(nxt[0].transform)
+                    else:
+                        candidates.append(wp0.transform)
+                except Exception:
+                    candidates.append(wp0.transform)
+
+            # de-duplicate while preserving order
+            uniq = []
+            seen = set()
+            for tf in candidates:
+                key = (round(tf.location.x, 3), round(tf.location.y, 3), round(tf.location.z, 3), round(tf.rotation.yaw, 3))
+                if key not in seen:
+                    seen.add(key)
+                    uniq.append(tf)
+            return uniq
+
+        spawn_offsets = [0.0, 5.0, 10.0]
+
+        for role_group, entries in spawn_plan:
+            for idx, entry in enumerate(entries):
+                route_rel = entry.get("file")
+                if not route_rel:
+                    continue
+                route_path = (routes_dir / route_rel).resolve()
+                waypoints = _parse_route_file(route_path, carla_module)
+                if not waypoints:
+                    return {"status": "reject", "reason": f"empty_route_{route_rel}"}
+                spawn_tf_candidates = _spawn_candidates_from_map(waypoints[0], spawn_offsets, world.get_map()) if waypoints else []
+                model = entry.get("model")
+                bp = pick_blueprint(role_group, model)
+                role_name = entry.get("kind") or role_group
+                if role_group == "ego":
+                    role_name = f"hero_{len(ego_actors)}"
+                actor = None
+                for cand_tf in spawn_tf_candidates:
+                    log_fn(f"[BASELINE] spawning {role_group} idx={idx} model={model} role={role_name} at {cand_tf.location}")
+                    actor = _spawn_with_retries(bp, cand_tf, role_name)
+                    if actor:
+                        break
+                    else:
+                        log_fn(f"[BASELINE] spawn attempt failed for {role_group} idx={idx} at {cand_tf.location}")
+                if actor is None:
+                    log_fn(f"[BASELINE] spawn failed for {role_group} idx={idx} model={model} role={role_name} after {len(spawn_tf_candidates)} candidates")
+                    return {"status": "reject", "reason": f"spawn_failed_{role_group}_{idx}"}
+                spawned.append(actor)
+                expected_ids.append(actor.id)
+                if role_group == "ego":
+                    ego_actors.append(actor)
+
+        ok, reason = validate_spawn(world, expected_ids)
+        if not ok:
+            return {"status": "reject", "reason": f"spawn_validation_{reason}"}
+
+        # Warmup ticks: ensure motion for egos
+        warmup_ticks = max(1, int(args.baseline_warmup_ticks))
+        ego_initial = [actor.get_transform() for actor in ego_actors]
+        moved_flags = [False for _ in ego_actors]
+        for _ in range(warmup_ticks):
+            for ego in ego_actors:
+                ego.apply_control(carla_module.VehicleControl(throttle=0.2, steer=0.0, brake=0.0))
+            world.tick()
+            for i, actor in enumerate(ego_actors):
+                now_tf = actor.get_transform()
+                vel = _actor_velocity(actor)
+                speed = 0.0
+                if vel:
+                    speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+                if now_tf.location.distance(ego_initial[i].location) > args.baseline_min_motion or speed > args.baseline_min_motion:
+                    moved_flags[i] = True
+        if ego_actors and not all(moved_flags):
+            bad = [i for i, m in enumerate(moved_flags) if not m]
+            return {"status": "reject", "reason": f"ego_stuck_{bad}"}
+
+        # Baseline control loop
+        waypoint_cache: Dict[int, List[Any]] = {}
+        route_lengths: Dict[int, float] = {}
+        wp_reached: Dict[int, int] = {}
+        collisions: Dict[int, bool] = {}
+        near_miss_triggered = False
+        min_ttc = float("inf")
+        severe_trigger = False
+        consecutive_hits: Dict[int, int] = {}
+        hit_streak_needed = 3
+        ttc_severe = min(args.baseline_ttc_thresh, 0.65)
+        closing_min = 1.0
+
+        # Preload waypoints for egos
+        for idx, entry in enumerate(manifest.get("ego", [])):
+            route_rel = entry.get("file")
+            route_path = (routes_dir / route_rel).resolve()
+            waypoints = _parse_route_file(route_path, carla_module)
+            waypoint_cache[idx] = waypoints
+            wp_reached[idx] = 0
+            route_lengths[idx] = max(1.0, float(len(waypoints)))
+            collisions[idx] = False
+            consecutive_hits[idx] = 0
+
+        # Attach collision sensors to egos
+        for ego_idx, ego in enumerate(ego_actors):
+            col_bp = blueprint_library.find("sensor.other.collision")
+            sensor = world.spawn_actor(col_bp, carla_module.Transform(), attach_to=ego)
+            sensors.append(sensor)
+
+            def _make_cb(ei):
+                def _on_col(event):
+                    collisions[ei] = True
+                return _on_col
+
+            sensor.listen(_make_cb(ego_idx))
+
+        def compute_control(actor, ego_idx):
+            waypoints = waypoint_cache[ego_idx]
+            if not waypoints:
+                return None
+            idx = wp_reached[ego_idx]
+            idx = min(idx, len(waypoints) - 1)
+            target_idx = min(len(waypoints) - 1, idx + args.baseline_waypoint_lookahead)
+            target = waypoints[target_idx]
+            loc = actor.get_transform().location
+            vec = target.location - loc
+            desired_yaw = math.atan2(vec.y, vec.x)
+            current_yaw = math.radians(actor.get_transform().rotation.yaw)
+            yaw_err = desired_yaw - current_yaw
+            while yaw_err > math.pi:
+                yaw_err -= 2 * math.pi
+            while yaw_err < -math.pi:
+                yaw_err += 2 * math.pi
+            steer = max(-1.0, min(1.0, args.baseline_steer_kp * yaw_err))
+
+            vel = _actor_velocity(actor)
+            speed = 0.0
+            if vel:
+                speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+            desired = min(args.baseline_target_speed, args.baseline_speed_cap)
+            if speed < desired:
+                throttle = max(0.0, min(1.0, args.baseline_speed_kp * (desired - speed)))
+                brake = 0.0
+            else:
+                throttle = 0.0
+                brake = max(0.0, min(1.0, (speed - desired) * 0.2))
+
+            ctrl = carla_module.VehicleControl(
+                throttle=throttle,
+                steer=steer,
+                brake=brake,
+                hand_brake=False,
+                reverse=False,
+            )
+            return ctrl
+
+        max_ticks = max(1, int(args.baseline_max_ticks))
+        waypoint_thresh = args.baseline_waypoint_thresh
+
+        for tick_idx in range(max_ticks):
+            for ego_idx, ego in enumerate(ego_actors):
+                ctrl = compute_control(ego, ego_idx)
+                if ctrl:
+                    ego.apply_control(ctrl)
+
+            world.tick()
+
+            # update progress + near miss
+            for ego_idx, ego in enumerate(ego_actors):
+                others = [a for a in spawned if a.id != ego.id]
+                waypoints = waypoint_cache[ego_idx]
+                if not waypoints:
+                    continue
+                next_idx = wp_reached[ego_idx]
+                next_idx = min(next_idx, len(waypoints) - 1)
+                if ego.get_location().distance(waypoints[next_idx].location) < waypoint_thresh:
+                    wp_reached[ego_idx] = min(len(waypoints) - 1, next_idx + 1)
+
+                hit, severe, ttc = _compute_near_miss(
+                    ego,
+                    others,
+                    carla_module,
+                    args.baseline_ttc_horizon,
+                    args.baseline_ttc_step,
+                    args.baseline_ttc_thresh,
+                    ttc_severe,
+                    closing_min,
+                )
+                if hit:
+                    consecutive_hits[ego_idx] += 1
+                else:
+                    consecutive_hits[ego_idx] = 0
+
+                if severe:
+                    severe_trigger = True
+
+                min_ttc = min(min_ttc, ttc)
+
+            # early exit if all egos reached goal
+            if all(wp_reached[i] >= len(waypoint_cache[i]) - 1 for i in wp_reached):
+                break
+
+        # near miss decision with persistence/severity
+        hit_streak = max(consecutive_hits.values()) if consecutive_hits else 0
+        if severe_trigger or hit_streak >= hit_streak_needed:
+            near_miss_triggered = True
+        # Metrics
+        rc_vals = []
+        ds_vals = []
+        for ego_idx in waypoint_cache.keys():
+            rc = wp_reached[ego_idx] / route_lengths[ego_idx]
+            collided = collisions.get(ego_idx, False)
+            ds = rc if not collided else rc * 0.5
+            rc_vals.append(rc)
+            ds_vals.append(ds)
+
+        rc_min = min(rc_vals) if rc_vals else 0.0
+        ds_min = min(ds_vals) if ds_vals else 0.0
+
+        easy = rc_min >= args.baseline_easy_rc and ds_min >= args.baseline_easy_ds
+        tags: List[str] = []
+        status = "accept"
+        reason = ""
+        verbose_baseline = getattr(args, "show_pipeline", False)
+        if verbose_baseline:
+            log_fn(
+                f"[BASELINE][TTC] min_ttc={min_ttc:.3f} severe={severe_trigger} "
+                f"hit_streak={hit_streak if 'hit_streak' in locals() else 0} "
+                f"needed={hit_streak_needed}"
+            )
+        if easy:
+            if near_miss_triggered:
+                tags.append("accepted_due_to_ttc_nearmiss")
+                reason = "accepted_due_to_ttc_nearmiss"
+            else:
+                status = "reject"
+                reason = "rejected_easy_no_nearmiss"
+                tags.append("rejected_easy_no_nearmiss")
+        else:
+            tags.append("baseline_ok")
+
+        return {
+            "status": status,
+            "reason": reason or ("accepted_due_to_ttc_nearmiss" if near_miss_triggered and easy else ""),
+            "rc": rc_min,
+            "ds": ds_min,
+            "near_miss": near_miss_triggered,
+            "min_ttc": min_ttc if near_miss_triggered else float("inf"),
+            "tags": tags,
+        }
+    finally:
+        _destroy_actors(sensors + spawned)
+
+
+def _run_baseline_validation(args: argparse.Namespace, routes_dir: Path, log_fn) -> Dict[str, Any]:
+    """
+    Connect to CARLA, enforce synchronous mode, spawn actors, run baseline.
+    """
+    carla_root = REPO_ROOT / "carla"
+    try:
+        carla_module = _load_carla_module(carla_root)
+    except Exception as exc:  # noqa: BLE001
+        log_fn(f"[BASELINE] Failed to import CARLA: {exc}")
+        return {"status": "reject", "reason": f"carla_import_failed_{exc}"}
+
+    client = carla_module.Client(args.carla_host, args.carla_port)
+    client.set_timeout(5.0)
+
+    desired_town = None
+    manifest = _load_actor_manifest(routes_dir)
+    for role_group in ("ego", "npc", "pedestrian", "static"):
+        entries = manifest.get(role_group, [])
+        if entries:
+            desired_town = entries[0].get("town")
+            break
+    if not desired_town:
+        desired_town = args.town
+
+    try:
+        world = client.get_world()
+        current_map = world.get_map().name
+        log_fn(f"[BASELINE] current map: {current_map}, desired: {desired_town}")
+        if desired_town and desired_town.lower() not in current_map.lower():
+            world = client.load_world(desired_town)
+            log_fn(f"[BASELINE] loaded map: {world.get_map().name}")
+    except Exception as exc:  # noqa: BLE001
+        log_fn(f"[BASELINE] Failed to get/load world: {exc}")
+        return {"status": "reject", "reason": f"carla_world_failed_{exc}"}
+
+    original_settings = world.get_settings()
+    try:
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        if args.baseline_delta_seconds:
+            settings.fixed_delta_seconds = args.baseline_delta_seconds
+        world.apply_settings(settings)
+        log_fn(f"[BASELINE] world settings -> sync={settings.synchronous_mode} delta={settings.fixed_delta_seconds}")
+
+        result = _run_baseline_constant_velocity(
+            carla_module=carla_module,
+            world=world,
+            routes_dir=routes_dir,
+            args=args,
+            log_fn=log_fn,
+        )
+        return result
+    finally:
+        try:
+            world.apply_settings(original_settings)
+        except Exception:
+            pass
+
+
 def _init_status(run_id: str, run_key: str, category: str, run_tag: str, variant_index: int) -> Dict[str, Any]:
     return {
         "run_id": run_id,
@@ -546,6 +1145,8 @@ def _rank_and_mark_best(statuses: List[Dict[str, Any]], top_k: int) -> List[Dict
     candidates: List[Dict[str, Any]] = []
     for status in statuses:
         if not status:
+            continue
+        if status.get("failure_state"):
             continue
         scene_path = status.get("scene_objects_path")
         output_hash = _compute_scene_output_hash(scene_path) if scene_path else None
@@ -970,9 +1571,49 @@ def _run_single(
             _complete_state(status, "route_generation")
             save_status()
 
+    # ------------------------------------------------------------------
+    # Baseline validation gate (constant-velocity + TTC near-miss + spawn checks)
+    # ------------------------------------------------------------------
     if (
         status.get("route_generation_success")
         and not args.skip_carla
+        and "baseline_validation" not in status.get("completed_states", [])
+    ):
+        _set_state(status, "baseline_validation")
+        save_status()
+
+        routes_dir = Path(status.get("routes_dir", ""))
+        if not routes_dir.exists():
+            _fail_state(status, "baseline_validation", "routes directory missing for baseline")
+            save_status()
+        else:
+            log("[BASELINE] Starting baseline validation (constant velocity).")
+            baseline_result = _run_baseline_validation(args, routes_dir, log)
+            status.setdefault("metrics", {})["baseline"] = baseline_result
+            try:
+                log(
+                    "[BASELINE] rc={:.3f} ds={:.3f} near_miss={} status={} reason={}".format(
+                        float(baseline_result.get("rc", 0.0)),
+                        float(baseline_result.get("ds", 0.0)),
+                        baseline_result.get("near_miss"),
+                        baseline_result.get("status"),
+                        baseline_result.get("reason", ""),
+                    )
+                )
+            except Exception:
+                log(f"[BASELINE] summary {baseline_result}")
+            if baseline_result.get("status") == "reject":
+                reason = baseline_result.get("reason", "baseline_rejected")
+                _fail_state(status, "baseline_validation", reason)
+                save_status()
+            else:
+                _complete_state(status, "baseline_validation")
+                save_status()
+
+    if (
+        status.get("route_generation_success")
+        and not args.skip_carla
+        and not status.get("failure_state")
         and "carla_simulation" not in status.get("completed_states", [])
     ):
         _set_state(status, "carla_simulation")
@@ -992,6 +1633,7 @@ def _run_single(
             results_root = REPO_ROOT / "results" / "results_driving_custom" / results_tag
             status["carla_results_tag"] = results_tag
             status["carla_results_dir"] = str(results_root)
+            log(f"[CARLA] results dir: {results_root}")
 
             image_root = results_root / "image"
             image_dir = _find_latest_image_dir(image_root)
@@ -1055,6 +1697,7 @@ def _run_single(
                         save_status()
                     else:
                         status["carla_image_dir"] = str(image_dir)
+                        log(f"[CARLA] image dir: {image_dir}")
                         status["carla_simulation_success"] = True
                         _complete_state(status, "carla_simulation")
                         save_status()
@@ -1092,7 +1735,8 @@ def _run_single(
                 ]
                 rc = _run_cmd(cmd, log_path)
                 if rc != 0 or not video_path.exists():
-                    _fail_state(status, "video_generation", f"video generation failed (exit {rc})")
+                    log(f"[VIDEO] generation failed (exit {rc}); marking video_generation_success=false but not failing run")
+                    status["video_generation_success"] = False
                     save_status()
                 else:
                     status["video_path"] = str(video_path)
@@ -1273,6 +1917,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-carla", action="store_true")
     parser.add_argument("--no-skip-existed", action="store_true")
     parser.add_argument("--dry-run-carla", action="store_true")
+    # Baseline validation knobs
+    parser.add_argument("--baseline-delta-seconds", type=float, default=0.05)
+    parser.add_argument("--baseline-warmup-ticks", type=int, default=15)
+    parser.add_argument("--baseline-min-motion", type=float, default=0.05)
+    parser.add_argument("--baseline-target-speed", type=float, default=8.0)
+    parser.add_argument("--baseline-speed-cap", type=float, default=12.0)
+    parser.add_argument("--baseline-speed-kp", type=float, default=0.4)
+    parser.add_argument("--baseline-steer-kp", type=float, default=0.6)
+    parser.add_argument("--baseline-waypoint-lookahead", type=int, default=4)
+    parser.add_argument("--baseline-waypoint-thresh", type=float, default=2.5)
+    parser.add_argument("--baseline-max-ticks", type=int, default=600)
+    parser.add_argument("--baseline-easy-ds", type=float, default=0.95)
+    parser.add_argument("--baseline-easy-rc", type=float, default=0.95)
+    parser.add_argument("--baseline-ttc-thresh", type=float, default=0.9)
+    parser.add_argument("--baseline-ttc-horizon", type=float, default=1.8)
+    parser.add_argument("--baseline-ttc-step", type=float, default=0.15)
     parser.add_argument(
         "--carla-python",
         default="/data/miniconda3/envs/colmdrivermarco2/bin/python3",

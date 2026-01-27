@@ -22,6 +22,131 @@ import inspect
 import numpy as np
 
 
+# =============================================================================
+# CUSTOM WEATHER PRESETS
+# =============================================================================
+
+NIGHT_PRESETS = [
+    ("Night1_MoonlessClear", dict(
+        cloudiness=5.0,
+        precipitation=0.0,
+        precipitation_deposits=0.0,
+        wind_intensity=5.0,
+        sun_azimuth_angle=0.0,
+        sun_altitude_angle=-90.0,
+        fog_density=0.0,
+        fog_distance=0.0,
+        wetness=0.0,
+        fog_falloff=0.2,
+    )),
+    ("Night2_Overcast", dict(
+        cloudiness=95.0,
+        precipitation=0.0,
+        precipitation_deposits=0.0,
+        wind_intensity=15.0,
+        sun_azimuth_angle=90.0,
+        sun_altitude_angle=-90.0,
+        fog_density=8.0,
+        fog_distance=30.0,
+        wetness=5.0,
+        fog_falloff=0.3,
+    )),
+    ("Night3_BlueHour", dict(
+        cloudiness=40.0,
+        precipitation=0.0,
+        precipitation_deposits=0.0,
+        wind_intensity=10.0,
+        sun_azimuth_angle=180.0,
+        sun_altitude_angle=-15.0,
+        fog_density=2.0,
+        fog_distance=80.0,
+        wetness=0.0,
+        fog_falloff=0.2,
+    )),
+]
+
+FOG_PRESETS = [
+    ("Fog1_DaytimeWhiteout", dict(
+        cloudiness=80.0,
+        precipitation=0.0,
+        precipitation_deposits=0.0,
+        wind_intensity=5.0,
+        sun_azimuth_angle=0.0,
+        sun_altitude_angle=35.0,
+        fog_density=95.0,
+        fog_distance=5.0,
+        wetness=10.0,
+        fog_falloff=0.15,
+    )),
+    ("Fog2_GroundFog", dict(
+        cloudiness=60.0,
+        precipitation=0.0,
+        precipitation_deposits=0.0,
+        wind_intensity=0.0,
+        sun_azimuth_angle=90.0,
+        sun_altitude_angle=20.0,
+        fog_density=85.0,
+        fog_distance=10.0,
+        wetness=20.0,
+        fog_falloff=0.8,
+    )),
+    ("Fog3_NightFog", dict(
+        cloudiness=70.0,
+        precipitation=0.0,
+        precipitation_deposits=0.0,
+        wind_intensity=10.0,
+        sun_azimuth_angle=180.0,
+        sun_altitude_angle=-90.0,
+        fog_density=90.0,
+        fog_distance=8.0,
+        wetness=15.0,
+        fog_falloff=0.25,
+    )),
+]
+
+RAIN_PRESETS = [
+    ("Rain1_Storm", dict(
+        cloudiness=100.0,
+        precipitation=100.0,
+        precipitation_deposits=90.0,
+        wind_intensity=60.0,
+        sun_azimuth_angle=0.0,
+        sun_altitude_angle=45.0,
+        fog_density=10.0,
+        fog_distance=15.0,
+        wetness=90.0,
+        fog_falloff=0.2,
+    )),
+    ("Rain2_TropicalDownpour", dict(
+        cloudiness=100.0,
+        precipitation=100.0,
+        precipitation_deposits=100.0,
+        wind_intensity=25.0,
+        sun_azimuth_angle=90.0,
+        sun_altitude_angle=25.0,
+        fog_density=25.0,
+        fog_distance=8.0,
+        wetness=100.0,
+        fog_falloff=0.25,
+    )),
+    ("Rain3_WindySquall", dict(
+        cloudiness=95.0,
+        precipitation=90.0,
+        precipitation_deposits=70.0,
+        wind_intensity=90.0,
+        sun_azimuth_angle=180.0,
+        sun_altitude_angle=35.0,
+        fog_density=15.0,
+        fog_distance=12.0,
+        wetness=85.0,
+        fog_falloff=0.2,
+    )),
+]
+
+# All 9 custom presets combined
+CUSTOM_PRESETS = NIGHT_PRESETS + FOG_PRESETS + RAIN_PRESETS
+
+
 def _add_carla_to_path(carla_root: Path) -> None:
     """Append CARLA Python API egg to sys.path."""
     egg_pattern = str(carla_root / "PythonAPI" / "carla" / "dist" / "carla-*py3*.egg")
@@ -115,6 +240,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Only capture these specific presets (space-separated). If not provided, captures all.",
     )
+    ap.add_argument(
+        "--custom",
+        action="store_true",
+        help="Use custom weather presets (9 total: 3 night, 3 fog, 3 rain) instead of CARLA built-in presets.",
+    )
     return ap.parse_args()
 
 
@@ -149,9 +279,14 @@ def main() -> None:
     original_settings = world.get_settings()
     print(f"[INFO] Connected to map: {world.get_map().name}")
 
-    presets = _discover_presets(carla)
-    if not presets:
-        raise SystemExit("No WeatherParameters presets discovered from CARLA API.")
+    # Choose between custom presets or built-in CARLA presets
+    if args.custom:
+        print("[INFO] Using custom weather presets (9 total: 3 night, 3 fog, 3 rain)")
+        presets = [(name, carla.WeatherParameters(**params)) for name, params in CUSTOM_PRESETS]
+    else:
+        presets = _discover_presets(carla)
+        if not presets:
+            raise SystemExit("No WeatherParameters presets discovered from CARLA API.")
     
     # Filter presets if specific ones requested
     if args.presets:

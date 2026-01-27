@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover
     AutoModelForCausalLM = None
 
 from .csp import refine_spawn_and_speeds_soft_csp
-from .geometry import CropBox, _segments_to_polyline_with_map, _slice_segments_detailed, find_conflict_between_polylines
+from .geometry import CropBox, _segments_to_polyline_with_map, _slice_segments_detailed, find_conflict_between_polylines, split_corridor_path_segments
 from .lane_change import apply_merge_into_lane_of
 from .llm import extract_refinement_constraints
 from .viz import visualize_refinement
@@ -137,6 +137,16 @@ def refine_picked_paths_with_model(
         schema_payload=schema_payload,
     )
     print(f"[TIMING] refiner LLM constraint extraction: {time.time() - t0:.2f}s", flush=True)
+
+    # If many vehicles share a corridor, allow starts slightly outside the crop
+    # to improve feasible spawn separation without changing semantics.
+    try:
+        if len(vehicles) >= 4:
+            opts = constraints.setdefault("options", {})
+            current = float(opts.get("start_outside_crop_margin_m", 0.0) or 0.0)
+            opts["start_outside_crop_margin_m"] = max(current, 20.0)
+    except Exception as e:
+        print(f"[WARN] refiner could not set start_outside_crop_margin_m: {e}", flush=True)
 
     # For t-junctions with perpendicular relations, allow spawns a bit outside the crop
     # so the side-road vehicle can start before merging onto the main road.
@@ -274,6 +284,23 @@ def refine_picked_paths_with_model(
         }
         refined_picked.append(p2)
     print(f"[TIMING] refiner apply slicing: {time.time() - t0:.2f}s", flush=True)
+
+    # Apply corridor segment splitting for TWO_LANE_CORRIDOR topologies
+    # This splits long single-segment paths into multiple virtual sub-segments
+    # so that the object placer has multiple segment_index values to work with.
+    t0 = time.time()
+    topo = str((schema_payload or {}).get("topology", "")).lower()
+    if topo in ("two_lane_corridor", "corridor"):
+        print(f"[INFO] Applying corridor segment splitting for topology: {topo}")
+        split_picked = []
+        for p in refined_picked:
+            split_p = split_corridor_path_segments(p, target_length_m=25.0, min_splits=3)
+            split_picked.append(split_p)
+            if split_p.get("corridor_split_applied"):
+                n_segs = len((split_p.get("signature") or {}).get("segments_detailed", []))
+                print(f"  {p.get('vehicle')}: split into {n_segs} sub-segments")
+        refined_picked = split_picked
+        print(f"[TIMING] refiner corridor splitting: {time.time() - t0:.2f}s", flush=True)
 
     out_payload = dict(data)
     out_payload["source_picked_paths"] = picked_paths_json

@@ -204,13 +204,13 @@ class PipelineCapabilities:
     
     # === TOPOLOGY MATCHING ===
     # The pipeline matches descriptions to existing map regions
-    # It can detect: intersection, t_junction, corridor, highway
-    # It CANNOT create: roundabouts (no detection), signalized intersections
+    # It can detect: intersection, t_junction, corridor, highway, roundabout
     supported_topologies: Set[TopologyType] = field(default_factory=lambda: {
         TopologyType.INTERSECTION,
         TopologyType.T_JUNCTION,
         TopologyType.CORRIDOR,
         TopologyType.HIGHWAY,
+        TopologyType.ROUNDABOUT,
     })
     
     # Map feature detection
@@ -232,7 +232,6 @@ class PipelineCapabilities:
     # === WHAT THE PIPELINE CANNOT DO ===
     hard_limitations: List[str] = field(default_factory=lambda: [
         # Map/Topology limitations
-        "CANNOT create roundabouts - no roundabout detection in CropFeatures",
         "CANNOT create signalized intersections - no signal phase control",
         "CANNOT create highway diverge/off-ramps - only on-ramp heuristic exists",
         
@@ -458,7 +457,7 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         intent="Create forced merges and constrained paths using static props.",
         map=MapRequirements(topology=TopologyType.CORRIDOR, needs_multi_lane=True),
         must_include=[
-            "Define one exit segment, in one vehicles, lane to be the construction zone, and do not place any props outside this area",
+            "Define one exit segment, in one vehicles lane to be the construction zone, and do not place any props outside this area",
             "Clusters of multiple types of construction related static props in work zone",
             "Construction props must be selected ONLY from the following assets: cones (constructioncone, trafficcone01, trafficcone02), barriers (streetbarrier, barrel, chainbarrier, chainbarrierend), warning sign (trafficwarning), and at most one construction/utility vehicle (truck or van)."
             "All vehicles exit segments must be either the construction zone lane or an adjacent lane to the construction zone",
@@ -473,10 +472,7 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         ],
         vary=[
             VariationAxis("ego_count", ["2", "3", "4", "5", "6"], "vehicles traversing the work zone"),
-            VariationAxis("cone_count", ["3", "5", "7"], "number of cones placed"),
-            VariationAxis("cone_pattern", ["along_lane", "diagonal"], "layout of the cone line"),
-            VariationAxis("cone_lateral", ["center","left edge","right edge"], "lateral placement of cones"),
-            VariationAxis("work_vehicle", ["none", "parked_vehicle"], "presence of a construction vehicle prop near the cones"),
+            VariationAxis("number_of_prop_types", ["2", "3", "4","5"], "how many different types of construction props are used in the work zone"),
         ],
     ),
 
@@ -484,23 +480,26 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         name="Pedestrian Crosswalk",
         summary="Corridor crossing with pedestrian(s) interacting with vehicles.",
         intent="Test vehicle response to pedestrians crossing, with optional occlusion.",
-        map=MapRequirements(topology=TopologyType.CORRIDOR),
+        map=MapRequirements(topology=TopologyType.INTERSECTION),
         must_include=[
-            "Pedestrian crossing perpendicular to vehicle path",
+            "Atleast one walker crossing perpendicular to an ego lane.",
+            #"One static occluder (parked_vehicle) positioned ONLY if occlusion is set to parked vehicle blocking view at the right edge of the lane being crossed (lateral = right_edge/half_right), affects_vehicle=null, motion=static, timing_phase=on_approach.",
+           # "At least one ego whose path is to the left of the occluder (same road, left of occluder vehicle) so the occluder sits on that ego’s right side.",
         ],
         avoid=[
-            "Moving NPC vehicles or cyclists beyond egos",
-            "Static props blocking vehicle path",
-            "Static props not contributing to occlusion of pedestrian",
+            #"Any ego or NPC in the lane to the right of the occluder (i.e., no vehicle shares the occluder’s lane).",
+            #"Occluder overlapping an ego path or anywhere left of the walker’s crossing lane.",
+            #"ANY Static prop besides the occluder.",
         ],
         vary=[
             VariationAxis("ego_count", ["2", "3", "4"], "vehicles approaching the crosswalk"),
             VariationAxis("walker_count", ["1", "2", "3"], "number of pedestrians crossing"),
-            VariationAxis("walker_start", ["right sidewalk", "left sidewalk"], "which side the pedestrian starts from"),
-            VariationAxis("occlusion", ["none", "parked_vehicle blocking view"], "whether an occluder exists blocking the view of a crossing pedestrian. this occluder must not block the paths of any vehicles"),
-            VariationAxis("occlusion_type", ["box truck", "van", "bus", "delivery truck"], "type of occluding vehicle"),
+           #VariationAxis("occlusion", ["none", "parked_vehicle blocking view"], "whether an occluder exists blocking the view of a crossing pedestrian. this occluder must not block the paths of any vehicles"),
+            #VariationAxis("occlusion_type", ["box truck", "van", "bus", "delivery truck"], "type of occluding vehicle"),
         ],
+        allow_static_props=False,
     ), 
+
 
     "Overtaking on Two-Lane Road": CategoryDefinition(
         name="Overtaking on Two-Lane Road",
@@ -509,19 +508,43 @@ CATEGORY_DEFINITIONS: Dict[str, CategoryDefinition] = {
         map=MapRequirements(topology=TopologyType.TWO_LANE_CORRIDOR, needs_multi_lane=False, needs_oncoming=True),
         must_include=[
             "Static prop, such as a parked vehicle, blocking lane in Vehicle 1's path",
-            "Vehicle 2 approaches from the opposite direction as Vehicle 1",
+            "Vehicle 2 approaches MUST be opposite_approach_as Vehicle 1 (oncoming traffic)",
         ],
         avoid=[
             "Props on either side of the road that do not contribute to the overtaking scenario",
             "Having all vehicles travel in the same direction",
             "Any lane changes"
             "This is a two lane road - no additional lanes may be referenced or used beyond the two lanes (one per direction)",
+            "Do not include ANY opposite_approach_as constraint besides between Vehicle 1 and Vehicle 2"
         ],
         vary=[
             VariationAxis("ego_count", ["2", "3", "4"], "vehicles involved in the overtake scenario"),
             VariationAxis("pedestrian", ["none", "walker crossing from sidewalk left or sidewalk right"], "pedestrian involvement during pass"),
-            VariationAxis("cyclist", ["none", "cyclist riding in the lane opposite of the one that has the obstacle"], "cyclist involvement during pass"),
         ],
+    ),
+
+    "Roundabout Navigation": CategoryDefinition(
+        name="Roundabout Navigation",
+        summary="Multi-vehicle negotiation at a roundabout with yielding and merging.",
+        intent="Test yield-on-entry and gap acceptance in circular traffic flow with multiple vehicles navigating the roundabout simultaneously.",
+        map=MapRequirements(topology=TopologyType.ROUNDABOUT),
+        must_include=[
+            "At least one pair of vehicles MUST have routes that overlap in the roundabout region (not disjoint). Concretely, for some pair (A,B), at least one of these must be true:",
+            "  - Same exit: exit_dir(A) == exit_dir(B) (they end up competing/queueing for the same outbound leg), OR",
+            "  - Swap/merge: exit_dir(A) == entry_dir(B) OR exit_dir(B) == entry_dir(A) (one enters where the other is headed), OR",
+            "  - Shared travel through the circle: A and B use different exits, but their routes are long enough that they would be in the circle at the same time (not 'enter and immediately exit' for both).",
+            "For that overlapping pair, at least one vehicle must slow/yield because of the other. It cannot be two independent drives that just happen to be nearby.",
+            "No vehicle may complete its route without being constrained by at least one other vehicle (slowdown, yield, brief stop, or spacing adjustment).",
+        ],
+        avoid=[
+            "Static props of any kind",
+            "Pedestrians or cyclists",
+            "ANY Lane changes)",
+        ],
+        vary=[
+            VariationAxis("ego_count", ["2", "3", "4", "5"], "vehicles navigating the roundabout"),
+        ],
+        allow_static_props=False,
     ),
 }
 

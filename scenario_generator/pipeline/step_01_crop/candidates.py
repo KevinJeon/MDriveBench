@@ -63,6 +63,7 @@ def build_corridor_candidate_crops_for_town(
     min_path_len: float = 15.0,
     max_paths: int = 100,
     max_depth: int = 5,
+    junction_margin: float = 8.0,  # Distance from junction to crop edge
 ) -> List[CropFeatures]:
     """
     Build corridor-specific crop candidates by sampling from long straight road segments.
@@ -147,7 +148,7 @@ def build_corridor_candidate_crops_for_town(
             'dist_to_junction': min_dist_to_junction,
         })
     
-    # Generate corridor crops
+    # Generate corridor crops - extend to full road length between junctions
     feats: List[CropFeatures] = []
     
     for cand in corridor_candidates:
@@ -157,42 +158,51 @@ def build_corridor_candidate_crops_for_town(
         y_min_road, y_max_road = cand['y_range']
         
         # Create elongated crop along the road direction
+        # Extend to full road length, only stopping near junctions
         if is_horizontal:
             # Horizontal road: wide X, narrow Y
-            # Find safe X range that avoids junctions
+            # Start with full road extent
             safe_x_min = x_min_road
             safe_x_max = x_max_road
-            for jc in jcenters:
-                if y_min_road - 20 <= jc[1] <= y_max_road + 20:
-                    # Junction is near this road's Y range
-                    if jc[0] < cx:
-                        safe_x_min = max(safe_x_min, jc[0] + 15)
-                    else:
-                        safe_x_max = min(safe_x_max, jc[0] - 15)
             
-            # Create crop in the safe zone
-            crop_x_min = safe_x_min + 5
-            crop_x_max = safe_x_max - 5
+            # Only limit if junction is in the road's Y range
+            for jc in jcenters:
+                if y_min_road - 15 <= jc[1] <= y_max_road + 15:
+                    # Junction is near this road's Y range - limit the crop
+                    if jc[0] < cx:
+                        safe_x_min = max(safe_x_min, jc[0] + junction_margin)
+                    else:
+                        safe_x_max = min(safe_x_max, jc[0] - junction_margin)
+            
+            # Create crop with minimal margins to maximize length
+            crop_x_min = safe_x_min + 2
+            crop_x_max = safe_x_max - 2
             crop_y_min = cy - crop_width
             crop_y_max = cy + crop_width
         else:
             # Vertical road: narrow X, wide Y
             safe_y_min = y_min_road
             safe_y_max = y_max_road
+            
             for jc in jcenters:
-                if x_min_road - 20 <= jc[0] <= x_max_road + 20:
+                if x_min_road - 15 <= jc[0] <= x_max_road + 15:
                     if jc[1] < cy:
-                        safe_y_min = max(safe_y_min, jc[1] + 15)
+                        safe_y_min = max(safe_y_min, jc[1] + junction_margin)
                     else:
-                        safe_y_max = min(safe_y_max, jc[1] - 15)
+                        safe_y_max = min(safe_y_max, jc[1] - junction_margin)
             
             crop_x_min = cx - crop_width
             crop_x_max = cx + crop_width
-            crop_y_min = safe_y_min + 5
-            crop_y_max = safe_y_max - 5
+            crop_y_min = safe_y_min + 2
+            crop_y_max = safe_y_max - 2
         
-        # Validate crop dimensions
-        if crop_x_max - crop_x_min < 40 or crop_y_max - crop_y_min < 10:
+        # Calculate corridor length (main axis length)
+        corridor_length = (crop_x_max - crop_x_min) if is_horizontal else (crop_y_max - crop_y_min)
+        
+        # Validate crop dimensions - corridor must be long enough
+        if corridor_length < 50:
+            continue
+        if crop_x_max - crop_x_min < 20 or crop_y_max - crop_y_min < 10:
             continue
             
         crop = CropKey(crop_x_min, crop_x_max, crop_y_min, crop_y_max)
@@ -277,12 +287,13 @@ def build_roundabout_crop_for_town(
     
     # Hardcoded roundabout bounds for Town03
     xmin, xmax = -60.0, 55.0
-    ymin, ymax = -60.0, 40.0
+    ymin, ymax = -35.0, 40.0
     center_x = (xmin + xmax) / 2  # -2.5
-    center_y = (ymin + ymax) / 2  # -10.0
+    center_y = (ymin + ymax) / 2  # 2.5
     
     data = glp.load_nodes(town_json_path)
-    segments_full = glp.build_segments(data, min_points=6)
+    # Use min_points=2 to include short connector segments in the roundabout
+    segments_full = glp.build_segments(data, min_points=2)
     adj_full = glp.build_connectivity(segments_full)
     jcenters = detect_junction_centers(segments_full, adj_full)
     
@@ -297,6 +308,7 @@ def build_roundabout_crop_for_town(
         min_path_len=min_path_len,
         max_paths=max_paths,
         max_depth=max_depth,
+        roundabout_mode=True,  # Enable roundabout-specific path filtering
     )
     
     if f is not None:

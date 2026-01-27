@@ -256,6 +256,7 @@ def _candidate_lane_inconsistency(cand: Dict[str, Any]) -> int:
     This applies to ALL maneuvers (straight, left, right) and penalizes paths where:
     1. Entry and exit are in different lanes (unexpected lane change)
     2. Intermediate segments deviate from expected lane progression
+    3. Any mid-path lane jump (e.g., [-2, -1, -2] jumps to different lane then back)
     
     Returns a penalty count (0 = clean, 1+ = has issues).
     """
@@ -288,21 +289,27 @@ def _candidate_lane_inconsistency(cand: Dict[str, Any]) -> int:
     if len(unique_lanes) > 2:
         return len(unique_lanes) - 1
     
-    # For straight paths, entry should equal exit
-    if man == "straight" and entry_lane != exit_lane:
-        return 1
-    
-    # For turns, check if the exit segment lane is consistent
-    # (i.e., doesn't change lanes AFTER completing the turn)
-    if man in ("left", "right") and len(lanes) >= 3:
-        # Check if the last two segments are in the same lane (no post-turn lane change)
+    # Check for mid-path lane jumps: any lane change within the path is suspicious
+    # e.g., [-2, -1, -2] has a jump even though entry == exit
+    # Count the number of lane transitions
+    lane_transitions = 0
+    for i in range(1, len(lanes)):
         try:
-            last_lane = int(lanes[-1])
-            second_last = int(lanes[-2])
-            if last_lane != second_last:
-                return 1  # Lane change after turn
+            prev_lane = int(lanes[i - 1])
+            curr_lane = int(lanes[i])
+            if curr_lane != prev_lane:
+                lane_transitions += 1
         except Exception:
             pass
+    
+    # For straight paths, any lane transition is bad
+    if man == "straight" and lane_transitions > 0:
+        return lane_transitions
+    
+    # For turns, we expect exactly 1 transition (at the turn itself where roads change)
+    # More than 1 transition means there's an unexpected lane jump
+    if man in ("left", "right") and lane_transitions > 1:
+        return lane_transitions - 1  # Subtract the expected turn transition
     
     return 0
 

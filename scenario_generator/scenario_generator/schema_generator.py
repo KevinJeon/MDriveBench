@@ -624,7 +624,8 @@ class TemplateSchemaGenerator:
             actors=actors,
         )
         spec = _ensure_direction_and_lane_constraints(spec)
-        spec.description = description_from_spec(spec)
+        # Leave description empty; downstream prompts rely on structured schema, not prose.
+        spec.description = ""
         return spec
 
 
@@ -972,7 +973,8 @@ class SchemaScenarioGenerator:
                             valid = False
                             errors = [f"Spec reuses banned constraints: {sorted(banned_constraints)}"]
                     if valid:
-                        spec.description = description_from_spec(spec)
+                        # Leave description empty; rely on structured schema, not generated prose.
+                        spec.description = ""
                         sig = self._signature(spec)
                         duplicate_sig = sig in self.generated_signatures.get(category, set())
                         failed_sig = exclude_signatures and sig in exclude_signatures

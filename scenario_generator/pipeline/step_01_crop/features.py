@@ -157,6 +157,7 @@ def compute_crop_features(
     max_paths: int,
     max_depth: int,
     corridor_mode: bool = False,
+    roundabout_mode: bool = False,
 ) -> Optional[CropFeatures]:
     """
     Compute features for a crop region.
@@ -166,6 +167,8 @@ def compute_crop_features(
                        - Minimum 2 segments (one per lane) instead of 6
                        - Minimum 2 paths instead of 6
                        - Enable corridor_mode in path generation to handle pass-through segments
+        roundabout_mode: If True, apply roundabout-specific path filtering to remove
+                         jittery paths and keep only smoothest paths per cardinal combo.
     """
     cb = glp.CropBox(crop.xmin, crop.xmax, crop.ymin, crop.ymax)
     segs_crop = glp.crop_segments(segments_full, cb)
@@ -184,6 +187,7 @@ def compute_crop_features(
         max_depth=max_depth,
         allow_within_region_fallback=False,
         corridor_mode=corridor_mode,
+        roundabout_mode=roundabout_mode,
     )
     
     # Corridor mode: allow minimum 2 paths (one per direction for bidirectional road)

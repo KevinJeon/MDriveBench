@@ -191,10 +191,13 @@ def _solve_paths_csp(
     # EARLY CROP FILTERING: Filter candidates to only those inside the crop region.
     # This must happen BEFORE role inference so we don't confuse side/main classification.
     if crop_region:
+        # Intersection/topology (non-corridor/on-ramp) needs a margin so entries just outside
+        # the crop aren’t dropped; corridor/on-ramp stays strict.
+        margin = 10.0 if (not require_straight and not require_on_ramp) else 0.0
         original_count = len(candidates)
-        candidates = [c for c in candidates if _candidate_entry_in_crop(c, crop_region, margin=0)]
+        candidates = [c for c in candidates if _candidate_entry_in_crop(c, crop_region, margin=margin)]
         filtered_count = len(candidates)
-        print(f"[INFO] CSP: Crop region filter: {original_count} -> {filtered_count} candidates (margin=0, strict)")
+        print(f"[INFO] CSP: Crop region filter: {original_count} -> {filtered_count} candidates (margin={margin}, strict=True)")
         if not candidates:
             raise ValueError("No candidates have entry points inside the crop region.")
     
@@ -388,12 +391,26 @@ def _solve_paths_csp(
                     return base + 100.0  # Large bonus for correct phase
             return base
         
-        # Geometric discontinuity (gaps between segments) is the PRIMARY indicator
-        # If geometry is smooth (geo=0), the path is good regardless of lane IDs
+        # Lane inconsistency: penalize paths that jump between lanes unexpectedly.
+        # The refiner handles intentional lane changes, so the path picker should
+        # prefer lane-consistent paths. This prevents selecting paths that randomly
+        # jump through junction connectors to different lanes.
+        # ONLY apply for intersection scenarios (not corridor or on-ramp).
+        is_intersection = not require_straight and not require_on_ramp
+        inconsistency = _candidate_lane_inconsistency(cand)
+        if inconsistency > 0:
+            print(f"[DEBUG LANE] {cand.get('name','?')[:40]} incon={inconsistency} is_int={is_intersection} req_str={require_straight} req_ramp={require_on_ramp}")
+        if is_intersection and inconsistency > 0:
+            # Heavy penalty for lane jumps - prefer staying in same lane
+            penalized = max(0.0, base - 300.0 * inconsistency)
+            print(f"[DEBUG LANE] -> PENALIZED from {base:.1f} to {penalized:.1f}")
+            return penalized
+        
+        # Geometric discontinuity (gaps between segments) as secondary check
         geo_gap = _candidate_geometric_discontinuity(cand, threshold_m=2.0)
         
         if geo_gap == 0:
-            # Geometrically smooth path - minimal penalty
+            # Geometrically smooth and lane-consistent path
             # Only penalize if there's actual lane drift in straight paths
             drift_count = _candidate_straight_lateral_drift(cand)
             if drift_count > 0:
@@ -403,7 +420,6 @@ def _solve_paths_csp(
         # Path has geometric gaps - apply penalties
         lc_count = _candidate_lane_change_count(cand)
         drift_count = _candidate_straight_lateral_drift(cand)
-        inconsistency = _candidate_lane_inconsistency(cand)
         
         # Combine penalties
         lane_penalty = max(lc_count + drift_count, inconsistency) * 200.0
@@ -639,6 +655,25 @@ def _solve_paths_csp(
                 dom = dom_adj
             else:
                 print(f"[WARN] No candidates with a {adj_req} adjacent lane for {v}; keeping all.")
+
+        # For straight maneuvers without an explicit lane_change intent, drop
+        # lane-inconsistent paths (e.g., [-2,-1,-2]) to avoid mid-intersection hops.
+        # ONLY for INTERSECTION topology (not corridor or on-ramp)
+        # Also apply to turn maneuvers to avoid weird lane jumps during turns
+        is_intersection_topology = not require_straight and not require_on_ramp
+        if is_intersection_topology and v not in vehicles_with_lane_change:
+            dom_clean = [c for c in dom if _candidate_lane_inconsistency(c) == 0]
+            # Write debug to file since prints are suppressed
+            with open("csp_debug.log", "a") as f:
+                f.write(f"[DEBUG FILTER] {v}: man={man}, dom={len(dom)}, clean={len(dom_clean)}, is_int={is_intersection_topology}\n")
+            if dom_clean:
+                with open("csp_debug.log", "a") as f:
+                    f.write(f"[DEBUG FILTER] {v}: Using {len(dom_clean)} clean paths instead of {len(dom)}\n")
+                dom = dom_clean
+            else:
+                with open("csp_debug.log", "a") as f:
+                    f.write(f"[WARN] {v}: No lane-consistent paths available; keeping all {len(dom)} paths\n")
+
         dom.sort(key=lambda c: (-_candidate_effective_length(c, v), str(c.get("name", ""))))
         domains[v] = dom
 

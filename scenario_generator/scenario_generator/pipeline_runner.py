@@ -519,18 +519,24 @@ class PipelineRunner:
         is_t_junction = spec.topology == "t_junction"
         
         if scenario_id not in assignments:
-            satisfying = [c for c in crops if crop_satisfies_spec(spec, c)]
-            if not satisfying:
-                return False, None, (
-                    f"No crops satisfy geometry spec; "
-                    f"needs_on_ramp={spec.needs_on_ramp}, "
-                    f"needs_merge_onto_same_road={spec.needs_merge_onto_same_road}, "
-                    f"needs_multi_lane={spec.needs_multi_lane}, "
-                    f"needs_oncoming={spec.needs_oncoming}"
-                )
-            cand = min(satisfying, key=lambda c: c.area)
-            crop_vals = [cand.crop.xmin, cand.crop.xmax, cand.crop.ymin, cand.crop.ymax]
-            junction_center = getattr(cand, 'center_xy', None)
+            if is_roundabout:
+                # For roundabout we already picked the hardcoded crop; skip constraint filtering.
+                cand = crops[0]
+                crop_vals = [cand.crop.xmin, cand.crop.xmax, cand.crop.ymin, cand.crop.ymax]
+                junction_center = getattr(cand, 'center_xy', None)
+            else:
+                satisfying = [c for c in crops if crop_satisfies_spec(spec, c)]
+                if not satisfying:
+                    return False, None, (
+                        f"No crops satisfy geometry spec; "
+                        f"needs_on_ramp={spec.needs_on_ramp}, "
+                        f"needs_merge_onto_same_road={spec.needs_merge_onto_same_road}, "
+                        f"needs_multi_lane={spec.needs_multi_lane}, "
+                        f"needs_oncoming={spec.needs_oncoming}"
+                    )
+                cand = min(satisfying, key=lambda c: c.area)
+                crop_vals = [cand.crop.xmin, cand.crop.xmax, cand.crop.ymin, cand.crop.ymax]
+                junction_center = getattr(cand, 'center_xy', None)
         else:
             crop_vals = assignments[scenario_id]["crop"]
             # Try to find the matching crop to get junction center
@@ -544,7 +550,11 @@ class PipelineRunner:
         crop = CropBox(xmin=crop_vals[0], xmax=crop_vals[1], ymin=crop_vals[2], ymax=crop_vals[3])
 
         data = load_nodes(str(nodes_path))
-        all_segments = build_segments(data)
+        # Roundabouts need shorter segments (min_points=2) to keep the circle intact
+        if is_roundabout:
+            all_segments = build_segments(data, min_points=2)
+        else:
+            all_segments = build_segments(data)
         
         # Use T-junction specific cropping to filter out segments from other junctions
         if is_t_junction and junction_center is not None:
@@ -563,6 +573,11 @@ class PipelineRunner:
             cropped_segments,
             connect_radius_m=6.0,
             connect_yaw_tol_deg=60.0,
+            # Non-roundabout: keep same-lane stitching and strict endpoint distance
+            # to avoid mid-route lateral jumps across the intersection.
+            # Roundabout: allow cross-lane connections but keep endpoint gating.
+            allow_cross_lane=True if is_roundabout else False,
+            strict_endpoint_dist_m=4.5,
         )
         max_paths = 200 if spec.needs_on_ramp else 100
         max_depth = 8 if spec.needs_on_ramp else 5
@@ -574,9 +589,11 @@ class PipelineRunner:
             crop,
             min_path_length=15.0 if is_two_lane_corridor else 20.0,
             max_paths=max_paths,
-            max_depth=max_depth,
-            allow_within_region_fallback=False,
+            max_depth=10 if is_roundabout else max_depth,
+            allow_within_region_fallback=True if is_roundabout else False,
             corridor_mode=is_two_lane_corridor,
+            roundabout_mode=is_roundabout,
+            t_junction_mode=is_t_junction,
         )
         if not legal_paths:
             return False, None, "No legal paths found for this crop"
@@ -656,21 +673,25 @@ class PipelineRunner:
             schema_constraints=schema_constraints,
         )
 
-        refine_picked_paths_with_model(
-            picked_paths_json=str(picked_paths_path),
-            description=scenario_text,
-            out_json=str(refined_paths_path),
-            model=self._model,
-            tokenizer=self._tokenizer,
-            max_new_tokens=self.refiner_max_new_tokens,
-            carla_assets=str(parent_dir / "carla_assets.json"),
-            schema_payload=scenario_schema,
-        )
+        # Skip refiner for roundabouts to avoid fabricated lane-change cuts; use picked paths directly.
+        refined_path_for_placer = picked_paths_path
+        if not is_roundabout:
+            refine_picked_paths_with_model(
+                picked_paths_json=str(picked_paths_path),
+                description=scenario_text,
+                out_json=str(refined_paths_path),
+                model=self._model,
+                tokenizer=self._tokenizer,
+                max_new_tokens=self.refiner_max_new_tokens,
+                carla_assets=str(parent_dir / "carla_assets.json"),
+                schema_payload=scenario_schema,
+            )
+            refined_path_for_placer = refined_paths_path
 
         from types import SimpleNamespace
         placer_args = SimpleNamespace(
             model="",
-            picked_paths=str(refined_paths_path),
+            picked_paths=str(refined_path_for_placer),
             carla_assets=str(parent_dir / "carla_assets.json"),
             description=scenario_text,
             out=str(scene_json_path),
