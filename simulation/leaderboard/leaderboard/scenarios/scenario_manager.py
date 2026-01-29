@@ -225,6 +225,7 @@ class ScenarioManager(object):
                     ego = CarlaDataProvider.get_hero_actor(hero_id=vehicle_num)
                     if ego:
                         if ego.is_alive:
+                            print(f"[DEBUG SCENARIO_MGR] Applying control to ego {vehicle_num}: throttle={ego_action[vehicle_num].throttle:.3f}, brake={ego_action[vehicle_num].brake:.3f}, steer={ego_action[vehicle_num].steer:.3f}")
                             self.ego_vehicles[vehicle_num].apply_control(ego_action[vehicle_num])
                 except:
                     pass

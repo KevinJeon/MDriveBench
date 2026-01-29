@@ -23,6 +23,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+try:
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    HAS_IMAGE_SUPPORT = True
+except ImportError:
+    HAS_IMAGE_SUPPORT = False
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -887,6 +894,67 @@ def _run_baseline_constant_velocity(
 
             sensor.listen(_make_cb(ego_idx))
 
+        # Setup traffic manager for autopilot
+        use_autopilot = getattr(args, "baseline_use_autopilot", True)
+        if use_autopilot:
+            try:
+                tm_port = getattr(args, "traffic_manager_port", 8000)
+                traffic_manager = world.client.get_trafficmanager(tm_port)
+                traffic_manager.set_synchronous_mode(True)
+                traffic_manager.set_random_device_seed(0)
+                log_fn(f"[BASELINE] using CARLA traffic manager autopilot on port {tm_port}")
+                
+                for ego_idx, ego in enumerate(ego_actors):
+                    # Enable autopilot for this vehicle
+                    ego.set_autopilot(True, tm_port)
+                    # Configure traffic manager for "ghost mode" - ignore everything, follow route exactly
+                    traffic_manager.ignore_lights_percentage(ego, 100.0)  # Ignore all traffic lights
+                    traffic_manager.ignore_walkers_percentage(ego, 100.0)  # Ignore all pedestrians
+                    traffic_manager.ignore_vehicles_percentage(ego, 100.0)  # Ignore all vehicles
+                    traffic_manager.ignore_signs_percentage(ego, 100.0)  # Ignore all traffic signs
+                    traffic_manager.distance_to_leading_vehicle(ego, 0.0)  # No following distance
+                    traffic_manager.collision_detection(ego, other_actor=None, detect_collision=False)  # Disable collision avoidance
+                    # Set constant speed (convert from m/s to % over speed limit)
+                    target_speed_ms = args.baseline_target_speed  # e.g., 8.0 m/s
+                    # Negative percentage means go slower than speed limit
+                    # We want constant speed, so set based on target
+                    speed_diff = -20.0  # This will be overridden by auto_lane_change=False behavior
+                    traffic_manager.vehicle_percentage_speed_difference(ego, speed_diff)
+                    traffic_manager.auto_lane_change(ego, False)  # Never change lanes
+                    traffic_manager.keep_right_rule_percentage(ego, 100.0)  # Don't follow lane rules
+                    log_fn(f"[BASELINE] enabled ghost-mode autopilot for ego {ego_idx}")
+            except Exception as exc:
+                log_fn(f"[BASELINE] failed to setup traffic manager autopilot: {exc}")
+                use_autopilot = False
+
+        # Attach camera sensors if baseline image saving is enabled
+        camera_data: Dict[int, Any] = {}
+        baseline_image_dir = getattr(args, "baseline_image_dir", None)
+        if baseline_image_dir and HAS_IMAGE_SUPPORT:
+            baseline_image_dir = Path(baseline_image_dir)
+            baseline_image_dir.mkdir(parents=True, exist_ok=True)
+            log_fn(f"[BASELINE] saving images to {baseline_image_dir}")
+            
+            for ego_idx, ego in enumerate(ego_actors):
+                cam_bp = blueprint_library.find("sensor.camera.rgb")
+                cam_bp.set_attribute("image_size_x", "800")
+                cam_bp.set_attribute("image_size_y", "600")
+                cam_bp.set_attribute("fov", "90")
+                cam_transform = carla_module.Transform(
+                    carla_module.Location(x=1.5, z=2.4),
+                    carla_module.Rotation(pitch=-15)
+                )
+                camera = world.spawn_actor(cam_bp, cam_transform, attach_to=ego)
+                sensors.append(camera)
+                camera_data[ego_idx] = {"latest_image": None, "frame_count": 0}
+
+                def _make_cam_cb(ei):
+                    def _on_image(image):
+                        camera_data[ei]["latest_image"] = image
+                    return _on_image
+
+                camera.listen(_make_cam_cb(ego_idx))
+
         def compute_control(actor, ego_idx):
             waypoints = waypoint_cache[ego_idx]
             if not waypoints:
@@ -929,14 +997,65 @@ def _run_baseline_constant_velocity(
 
         max_ticks = max(1, int(args.baseline_max_ticks))
         waypoint_thresh = args.baseline_waypoint_thresh
+        save_interval = getattr(args, "baseline_save_interval", 10)  # Save every N frames
 
         for tick_idx in range(max_ticks):
-            for ego_idx, ego in enumerate(ego_actors):
-                ctrl = compute_control(ego, ego_idx)
-                if ctrl:
-                    ego.apply_control(ctrl)
+            # Only apply manual controls if not using autopilot
+            if not use_autopilot:
+                for ego_idx, ego in enumerate(ego_actors):
+                    ctrl = compute_control(ego, ego_idx)
+                    if ctrl:
+                        ego.apply_control(ctrl)
 
             world.tick()
+            
+            # Save camera frames with event labels
+            if baseline_image_dir and HAS_IMAGE_SUPPORT and (tick_idx % save_interval == 0 or tick_idx < 5):
+                for ego_idx, ego in enumerate(ego_actors):
+                    if ego_idx not in camera_data:
+                        continue
+                    img = camera_data[ego_idx]["latest_image"]
+                    if img is None:
+                        continue
+                    
+                    # Convert CARLA image to numpy array
+                    array = np.frombuffer(img.raw_data, dtype=np.uint8)
+                    array = array.reshape((img.height, img.width, 4))[:, :, :3]
+                    pil_img = Image.fromarray(array)
+                    
+                    # Add event labels
+                    draw = ImageDraw.Draw(pil_img)
+                    try:
+                        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+                    except Exception:
+                        font = ImageFont.load_default()
+                    
+                    labels = []
+                    if collisions.get(ego_idx, False):
+                        labels.append("COLLISION")
+                    if consecutive_hits.get(ego_idx, 0) >= 2:
+                        labels.append(f"NEAR-MISS (streak={consecutive_hits[ego_idx]})")
+                    
+                    # Draw labels on image
+                    y_offset = 10
+                    for label in labels:
+                        bbox = draw.textbbox((0, 0), label, font=font)
+                        text_width = bbox[2] - bbox[0]
+                        text_height = bbox[3] - bbox[1]
+                        x = img.width - text_width - 20
+                        draw.rectangle([x - 5, y_offset - 5, x + text_width + 5, y_offset + text_height + 5], 
+                                       fill=(255, 0, 0, 200))
+                        draw.text((x, y_offset), label, fill=(255, 255, 255), font=font)
+                        y_offset += text_height + 15
+                    
+                    # Add frame info
+                    info_text = f"Ego {ego_idx} | Tick {tick_idx} | RC {wp_reached[ego_idx]}/{len(waypoint_cache[ego_idx])}"
+                    draw.text((10, 10), info_text, fill=(255, 255, 255), font=font)
+                    
+                    # Save frame
+                    frame_path = baseline_image_dir / f"ego{ego_idx}_frame{tick_idx:06d}.jpg"
+                    pil_img.save(frame_path, quality=85)
+                    camera_data[ego_idx]["frame_count"] += 1
 
             # update progress + near miss
             for ego_idx, ego in enumerate(ego_actors):
@@ -1029,7 +1148,7 @@ def _run_baseline_validation(args: argparse.Namespace, routes_dir: Path, log_fn)
     """
     Connect to CARLA, enforce synchronous mode, spawn actors, run baseline.
     """
-    carla_root = REPO_ROOT / "carla"
+    carla_root = REPO_ROOT / "carla912"
     try:
         carla_module = _load_carla_module(carla_root)
     except Exception as exc:  # noqa: BLE001
@@ -1588,6 +1707,10 @@ def _run_single(
             save_status()
         else:
             log("[BASELINE] Starting baseline validation (constant velocity).")
+            if args.baseline_save_images:
+                baseline_image_dir = run_root / run_key / "baseline_images"
+                args.baseline_image_dir = str(baseline_image_dir)
+                status["baseline_image_dir"] = str(baseline_image_dir)
             baseline_result = _run_baseline_validation(args, routes_dir, log)
             status.setdefault("metrics", {})["baseline"] = baseline_result
             try:
@@ -1613,6 +1736,7 @@ def _run_single(
     if (
         status.get("route_generation_success")
         and not args.skip_carla
+        and not args.baseline_only
         and not status.get("failure_state")
         and "carla_simulation" not in status.get("completed_states", [])
     ):
@@ -1705,6 +1829,7 @@ def _run_single(
     if (
         status.get("carla_simulation_success")
         and not args.skip_video
+        and not args.baseline_only
         and "video_generation" not in status.get("completed_states", [])
     ):
         _set_state(status, "video_generation")
@@ -1921,6 +2046,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-delta-seconds", type=float, default=0.05)
     parser.add_argument("--baseline-warmup-ticks", type=int, default=15)
     parser.add_argument("--baseline-min-motion", type=float, default=0.05)
+    parser.add_argument("--baseline-use-manual-control", dest="baseline_use_autopilot", action="store_false", default=True, help="Use simple waypoint-following controller instead of autopilot (default: use autopilot)")
     parser.add_argument("--baseline-target-speed", type=float, default=8.0)
     parser.add_argument("--baseline-speed-cap", type=float, default=12.0)
     parser.add_argument("--baseline-speed-kp", type=float, default=0.4)
@@ -1933,12 +2059,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-ttc-thresh", type=float, default=0.9)
     parser.add_argument("--baseline-ttc-horizon", type=float, default=1.8)
     parser.add_argument("--baseline-ttc-step", type=float, default=0.15)
+    parser.add_argument("--baseline-save-images", action="store_true", help="Save camera frames from baseline validation")
+    parser.add_argument("--baseline-save-interval", type=int, default=10, help="Save every Nth frame (lower = more frames)")
     parser.add_argument(
         "--carla-python",
         default="/data/miniconda3/envs/colmdrivermarco2/bin/python3",
         help="Python interpreter to use for CARLA evaluation (defaults to colmdrivermarco2 env).",
     )
     parser.add_argument("--skip-carla", action="store_true")
+    parser.add_argument("--baseline-only", action="store_true", help="Run only baseline validation, skip main planner simulation")
     parser.add_argument("--skip-video", action="store_true")
     parser.add_argument("--force-carla", action="store_true")
     parser.add_argument("--force-video", action="store_true")

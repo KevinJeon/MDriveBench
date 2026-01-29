@@ -31,6 +31,13 @@ import time
 import json
 import yaml
 import numpy as np
+# Patch for numpy 1.24+ compatibility with older libraries (like networkx < 2.6)
+if not hasattr(np, 'int'):
+    np.int = int
+if not hasattr(np, 'float'):
+    np.float = float
+if not hasattr(np, 'bool'):
+    np.bool = bool
 import random
 import shutil
 
@@ -299,7 +306,10 @@ class LeaderboardEvaluator(object):
         else:
             self.world.wait_for_tick()
 
-        if CarlaDataProvider.get_map().name != town:
+        # CARLA 9.12 compatibility: map name might include full path like "/Game/Carla/Maps/Town05"
+        current_map_name = CarlaDataProvider.get_map().name
+        if town not in current_map_name:
+            print(f"[DEBUG] Current map: {current_map_name}, Required: {town}")
             raise Exception("The CARLA server uses the wrong map!"
                             "This scenario requires to use map {}".format(town))
 

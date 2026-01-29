@@ -1055,8 +1055,9 @@ class RouteScenario(BasicScenario):
         if world_map is not None:
             try:
                 dao = GlobalRoutePlannerDAO(world_map, 1.0)
-                planner = GlobalRoutePlanner(dao)
-                planner.setup()
+                # CARLA 9.12: GlobalRoutePlanner takes (wmap, sampling_resolution) directly
+                planner = GlobalRoutePlanner(world.get_map(), 1.0)
+                # Note: setup() is no longer needed in CARLA 9.12 - done in __init__
             except Exception:  # pylint: disable=broad-except
                 planner = None
 

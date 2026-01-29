@@ -73,6 +73,10 @@ class PlannerSpec:
 
 
 PLANNER_SPECS: dict[str, PlannerSpec] = {
+    "autopilot": PlannerSpec(
+        agent="simulation/leaderboard/team_code/auto_pilot.py",
+        agent_config="simulation/leaderboard/team_code/agent_config/colmdriver_config.yaml",
+    ),
     "colmdriver": PlannerSpec(
         agent="simulation/leaderboard/team_code/colmdriver_agent.py",
         agent_config="simulation/leaderboard/team_code/agent_config/colmdriver_config.yaml",
@@ -181,6 +185,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--track", default="SENSORS", help="Leaderboard track name.")
     parser.add_argument("--timeout", type=float, default=600.0, help="Route timeout.")
     parser.add_argument("--debug", action="store_true", help="Enable debug output.")
+    parser.add_argument(
+        "--llm-port",
+        type=int,
+        default=8888,
+        help="Port for LLM server (CoLMDriver only, default: 8888).",
+    )
+    parser.add_argument(
+        "--vlm-port",
+        type=int,
+        default=1111,
+        help="Port for VLM server (CoLMDriver only, default: 1111).",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -526,7 +542,7 @@ def main() -> None:
             )
         )
 
-    carla_root = repo_root / "carla"
+    carla_root = repo_root / "carla912"
     leaderboard_root = repo_root / "simulation" / "leaderboard"
     scenario_runner_root = repo_root / "simulation" / "scenario_runner"
     data_root = repo_root / "simulation" / "assets" / "v2xverse_debug"
@@ -538,6 +554,7 @@ def main() -> None:
     env_template["DATA_ROOT"] = str(data_root)
     env_template.setdefault("COLMDRIVER_OFFLINE", "0")
 
+    append_pythonpath(env_template, repo_root)
     append_pythonpath(env_template, scenario_runner_root)
     append_pythonpath(env_template, leaderboard_root)
     append_pythonpath(env_template, leaderboard_root / "team_code")
@@ -622,6 +639,10 @@ def main() -> None:
                 env["COLMDRIVER_DISABLE_NEGOTIATION"] = "1"
             else:
                 env.pop("COLMDRIVER_DISABLE_NEGOTIATION", None)
+
+            # Set LLM/VLM ports for CoLMDriver
+            env["COLMDRIVER_LLM_PORT"] = str(args.llm_port)
+            env["COLMDRIVER_VLM_PORT"] = str(args.vlm_port)
 
             suffix_parts: list[str] = []
             if spec.suffix:
