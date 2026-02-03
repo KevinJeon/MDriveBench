@@ -1054,10 +1054,16 @@ class RouteScenario(BasicScenario):
         planner = None
         if world_map is not None:
             try:
-                dao = GlobalRoutePlannerDAO(world_map, 1.0)
-                # CARLA 9.12: GlobalRoutePlanner takes (wmap, sampling_resolution) directly
+                # Try CARLA 9.12+ API first (takes wmap, sampling_resolution directly)
                 planner = GlobalRoutePlanner(world.get_map(), 1.0)
-                # Note: setup() is no longer needed in CARLA 9.12 - done in __init__
+            except TypeError:
+                # Fall back to older CARLA API (uses DAO pattern)
+                try:
+                    dao = GlobalRoutePlannerDAO(world_map, 1.0)
+                    planner = GlobalRoutePlanner(dao)
+                    planner.setup()
+                except Exception:  # pylint: disable=broad-except
+                    planner = None
             except Exception:  # pylint: disable=broad-except
                 planner = None
 

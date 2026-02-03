@@ -85,6 +85,14 @@ class ScenarioManager(object):
         self.first_entry = []
         self.set_flag = True
 
+        # Position-based stall detection (conservative fallback)
+        # Tracks position history to detect when ALL vehicles are stuck
+        self._stall_position_history = {}  # {ego_id: [(time, x, y, z), ...]}
+        self._stall_check_interval = 5.0   # Check every 5 seconds
+        self._stall_last_check_time = 0.0
+        self._stall_threshold_time = 90.0  # 90 seconds of minimal movement = stall
+        self._stall_min_distance = 0.5     # Must move at least 0.5 meters in threshold_time
+
         # record simulation time cost
         self.time_record = []
         self.c_time_record = []
@@ -337,6 +345,14 @@ class ScenarioManager(object):
                 print(f"[DEBUG] ALL EGOS DONE - setting _running = False")
                 self._running = False
 
+            # Position-based stall detection (conservative fallback)
+            # Only check if still running after criteria checks
+            if self._running:
+                stall_detected = self._check_position_stall()
+                if stall_detected:
+                    print(f"\n[STALL DETECTION] All vehicles have been stationary for {self._stall_threshold_time}s - terminating scenario")
+                    self._running = False
+
         if self._running and self.get_running_status():
             CarlaDataProvider.get_world().tick(self._timeout)
 
@@ -346,6 +362,108 @@ class ScenarioManager(object):
            bool: False if watchdog exception occured, True otherwise
         """
         return self._watchdog.get_status()
+
+    def _check_position_stall(self):
+        """
+        Conservative position-based stall detection.
+        Returns True if ALL ego vehicles have been stationary (moved < threshold) 
+        for the stall threshold time.
+        
+        This is a fallback mechanism in case velocity-based detection fails.
+        """
+        import math
+        
+        current_time = time.time()
+        
+        # Only check periodically to reduce overhead
+        if current_time - self._stall_last_check_time < self._stall_check_interval:
+            return False
+        self._stall_last_check_time = current_time
+        
+        # Record current positions for all active egos
+        active_ego_count = 0
+        for vehicle_num in range(self.ego_vehicles_num):
+            ego = CarlaDataProvider.get_hero_actor(hero_id=vehicle_num)
+            if ego and ego.is_alive:
+                active_ego_count += 1
+                loc = ego.get_location()
+                if vehicle_num not in self._stall_position_history:
+                    self._stall_position_history[vehicle_num] = []
+                self._stall_position_history[vehicle_num].append((current_time, loc.x, loc.y, loc.z))
+                
+                # Keep only positions within the threshold window (plus some buffer)
+                cutoff_time = current_time - self._stall_threshold_time - 10.0
+                self._stall_position_history[vehicle_num] = [
+                    p for p in self._stall_position_history[vehicle_num] if p[0] >= cutoff_time
+                ]
+        
+        # If no active egos, don't report stall (let other logic handle termination)
+        if active_ego_count == 0:
+            return False
+        
+        # Check if ALL active egos have been stationary for the threshold time
+        all_stalled = True
+        for vehicle_num in range(self.ego_vehicles_num):
+            ego = CarlaDataProvider.get_hero_actor(hero_id=vehicle_num)
+            if not ego or not ego.is_alive:
+                continue  # Skip inactive egos
+                
+            history = self._stall_position_history.get(vehicle_num, [])
+            if not history:
+                all_stalled = False
+                break
+            
+            # Need at least threshold_time worth of history
+            oldest_time = history[0][0]
+            if current_time - oldest_time < self._stall_threshold_time:
+                all_stalled = False
+                break
+            
+            # Calculate max displacement from oldest position in threshold window
+            oldest_in_window = None
+            for t, x, y, z in history:
+                if current_time - t <= self._stall_threshold_time:
+                    if oldest_in_window is None:
+                        oldest_in_window = (x, y, z)
+                    break
+            
+            if oldest_in_window is None:
+                all_stalled = False
+                break
+            
+            # Calculate displacement from oldest to current
+            current_pos = history[-1]
+            dx = current_pos[1] - oldest_in_window[0]
+            dy = current_pos[2] - oldest_in_window[1]
+            dz = current_pos[3] - oldest_in_window[2]
+            distance = math.sqrt(dx*dx + dy*dy + dz*dz)
+            
+            # Also check current velocity - if moving at all, not stalled
+            vel = ego.get_velocity()
+            speed = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
+            
+            if distance >= self._stall_min_distance or speed > 0.1:
+                # This ego has moved enough OR is currently moving, not stalled
+                all_stalled = False
+                # Debug: print which vehicle is NOT stalled
+                print(f"[STALL DEBUG] Ego {vehicle_num} NOT stalled: distance={distance:.2f}m, speed={speed:.2f}m/s")
+                break
+        
+        # Debug: if all stalled, print warning before triggering
+        if all_stalled:
+            print(f"[STALL DEBUG] All {active_ego_count} egos appear stalled. Checking one more time...")
+            # Double-check: verify ALL velocities are near zero right now
+            for vehicle_num in range(self.ego_vehicles_num):
+                ego = CarlaDataProvider.get_hero_actor(hero_id=vehicle_num)
+                if ego and ego.is_alive:
+                    vel = ego.get_velocity()
+                    speed = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
+                    if speed > 0.1:
+                        print(f"[STALL DEBUG] Wait - Ego {vehicle_num} has speed={speed:.2f}m/s, NOT stalled!")
+                        all_stalled = False
+                        break
+        
+        return all_stalled
 
     def stop_scenario(self):
         """

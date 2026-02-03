@@ -146,7 +146,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Override the number of ego vehicles (auto-detected otherwise).",
     )
-    parser.add_argument("--port", type=int, default=2002, help="CARLA server port.")
+    parser.add_argument("--port", type=int, default=2014, help="CARLA server port.")
     parser.add_argument(
         "--traffic-manager-port",
         type=int,
@@ -273,14 +273,47 @@ def append_pythonpath(env: Dict[str, str], path: Path) -> None:
 
 
 def find_carla_egg(carla_root: Path) -> Path:
-    dist_dir = carla_root / "PythonAPI" / "carla" / "dist"
-    eggs = sorted(dist_dir.glob("carla-*.egg"))
-    if not eggs:
-        raise FileNotFoundError(f"No CARLA egg found under {dist_dir}")
-    py3_eggs = [egg for egg in eggs if "-py3" in egg.name]
-    if py3_eggs:
-        return py3_eggs[0]
-    return eggs[0]
+    """
+    Locate a CARLA Python client build compatible with the current interpreter.
+
+    Priority:
+    1) Wheels/eggs under PythonAPI/carla/dist whose filename matches our py3{minor} or cp3{minor}.
+    2) Same search in PythonAPI_docker/carla/dist (useful when only docker-built eggs exist).
+    3) Any py3*/cp3* egg/wheel under those dirs.
+    4) Fallback to the first available artifact.
+    """
+    search_dirs = [
+        carla_root / "PythonAPI" / "carla" / "dist",
+        carla_root / "PythonAPI_docker" / "carla" / "dist",
+    ]
+    artifacts: list[Path] = []
+    for dist_dir in search_dirs:
+        artifacts.extend(sorted(dist_dir.glob("carla-*.egg")))
+        artifacts.extend(sorted(dist_dir.glob("carla-*.whl")))
+
+    if not artifacts:
+        raise FileNotFoundError(
+            f"No CARLA egg/wheel found under {search_dirs[0]} or {search_dirs[1]}"
+        )
+
+    minor = sys.version_info.minor
+    def matches_minor(art: Path) -> bool:
+        name = art.name
+        return (
+            f"cp3{minor}" in name
+            or f"py3{minor}" in name
+            or f"py3.{minor}" in name
+        )
+
+    preferred = [art for art in artifacts if matches_minor(art)]
+    if preferred:
+        return preferred[0]
+
+    py3 = [art for art in artifacts if "py3" in art.name or "cp3" in art.name]
+    if py3:
+        return py3[0]
+
+    return artifacts[0]
 
 
 def detect_ego_routes(routes_dir: Path) -> int:
@@ -542,7 +575,13 @@ def main() -> None:
             )
         )
 
-    carla_root = repo_root / "carla912"
+    # Allow overriding CARLA install via environment; fallback to bundled carla912.
+    carla_root = Path(os.environ.get("CARLA_ROOT", repo_root / "carla912")).expanduser().resolve()
+    if not carla_root.exists():
+        raise FileNotFoundError(
+            f"CARLA_ROOT '{carla_root}' does not exist. "
+            "Set CARLA_ROOT to a valid CARLA installation (with PythonAPI/carla/dist)."
+        )
     leaderboard_root = repo_root / "simulation" / "leaderboard"
     scenario_runner_root = repo_root / "simulation" / "scenario_runner"
     data_root = repo_root / "simulation" / "assets" / "v2xverse_debug"
