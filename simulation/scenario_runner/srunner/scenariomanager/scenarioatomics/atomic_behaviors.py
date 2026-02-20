@@ -1498,7 +1498,8 @@ class WaypointFollower(AtomicBehavior):
     """
 
     def __init__(self, actor, target_speed=None, plan=None, blackboard_queue_name=None,
-                 avoid_collision=False, speed_callback=None, name="FollowWaypoints"):
+                 avoid_collision=False, speed_callback=None, name="FollowWaypoints",
+                 initial_speed=None):
         """
         Set up actor and local planner
         """
@@ -1516,6 +1517,8 @@ class WaypointFollower(AtomicBehavior):
         self._avoid_collision = avoid_collision
         self._speed_callback = speed_callback
         self._unique_id = 0
+        self._initial_speed = float(initial_speed) if initial_speed is not None else None
+        self._initial_speed_applied = False
 
     def initialise(self):
         """
@@ -1542,6 +1545,21 @@ class WaypointFollower(AtomicBehavior):
 
         for actor in self._actor_dict:
             self._apply_local_planner(actor)
+        
+        # Apply initial velocity to avoid PID warmup delay
+        if not self._initial_speed_applied and self._initial_speed is not None and self._initial_speed > 0.1:
+            try:
+                actor = self._actor
+                if not isinstance(actor, carla.Walker):
+                    transform = actor.get_transform()
+                    yaw = transform.rotation.yaw * (math.pi / 180.0)
+                    vx = math.cos(yaw) * self._initial_speed
+                    vy = math.sin(yaw) * self._initial_speed
+                    actor.set_target_velocity(carla.Vector3D(vx, vy, 0))
+                self._initial_speed_applied = True
+            except Exception:  # pylint: disable=broad-except
+                pass
+        
         return True
 
     def _apply_local_planner(self, actor):

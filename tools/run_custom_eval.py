@@ -116,8 +116,10 @@ PLANNER_SPECS: dict[str, PlannerSpec] = {
         agent_config="simulation/leaderboard/team_code/agent_config/tcp_5_10_config.yaml",
     ),
     "log-replay": PlannerSpec(
-        agent="simulation/leaderboard/team_code/tcp_agent.py",
-        agent_config="simulation/leaderboard/team_code/agent_config/tcp_5_10_config.yaml",
+        # Minimal agent that returns neutral controls; actual movement is handled by
+        # LogReplayFollower in route_scenario.py when CUSTOM_EGO_LOG_REPLAY=1 is set
+        agent="simulation/leaderboard/team_code/logreplay_agent.py",
+        agent_config="simulation/leaderboard/team_code/agent_config/colmdriver_config.yaml",
     ),
     "vad": PlannerSpec(
         agent="simulation/leaderboard/team_code/vad_b2d_agent.py",
@@ -455,6 +457,16 @@ def parse_args() -> argparse.Namespace:
         "--log-replay-actors",
         action="store_true",
         help="Replay custom actors using per-waypoint timing if present in XML.",
+    )
+    parser.add_argument(
+        "--custom-actor-control-mode",
+        choices=("policy", "replay"),
+        default="policy",
+        help=(
+            "Control mode for custom actors. "
+            "'policy' uses regular controller behavior (WaypointFollower). "
+            "'replay' uses transform/timing log replay."
+        ),
     )
     parser.add_argument(
         "--smooth-log-replay-vehicles",
@@ -1293,6 +1305,11 @@ def main() -> None:
                         new_cmd.append("--normalize-actor-z")
                     if args.normalize_ego_z:
                         new_cmd.append("--normalize-ego-z")
+                    if args.log_replay_actors:
+                        new_cmd.append("--log-replay-actors")
+                    new_cmd.extend(
+                        ["--custom-actor-control-mode", str(args.custom_actor_control_mode)]
+                    )
 
                     timeout_seconds = None
                     if not args.dry_run and args.carla_crash_multiplier > 0:
@@ -1671,15 +1688,17 @@ def main() -> None:
                     env["TCP_BEV_HEIGHT"] = str(args.bev_height)
                 if args.bev_fov is not None:
                     env["TCP_BEV_FOV"] = str(args.bev_fov)
-                if args.log_replay_actors:
+                actor_replay_enabled = bool(
+                    args.log_replay_actors or args.custom_actor_control_mode == "replay"
+                )
+                if args.planner == "log-replay":
+                    env["CUSTOM_EGO_LOG_REPLAY"] = "1"
+                else:
+                    env.pop("CUSTOM_EGO_LOG_REPLAY", None)
+                if actor_replay_enabled:
                     env["CUSTOM_ACTOR_LOG_REPLAY"] = "1"
                 else:
                     env.pop("CUSTOM_ACTOR_LOG_REPLAY", None)
-                if args.planner == "log-replay":
-                    env["CUSTOM_EGO_LOG_REPLAY"] = "1"
-                    env["CUSTOM_ACTOR_LOG_REPLAY"] = "1"
-                else:
-                    env.pop("CUSTOM_EGO_LOG_REPLAY", None)
                 if args.smooth_log_replay_vehicles is not None:
                     env["CUSTOM_LOG_REPLAY_SMOOTH_VEHICLES"] = (
                         "1" if args.smooth_log_replay_vehicles else "0"
@@ -1820,6 +1839,10 @@ def main() -> None:
                     variant_name = f"{variant_name} (no negotiation)"
                 print(f"\n=== Running variant: {variant_name} ===")
                 print("Scenario parameter:", scenario_parameter_path)
+                print(
+                    "Custom actor control mode:",
+                    "replay" if actor_replay_enabled else "policy",
+                )
                 if spec.weather:
                     print("Weather override applied via:", variant_routes_dir)
                 print("Results will be stored under:", result_root)

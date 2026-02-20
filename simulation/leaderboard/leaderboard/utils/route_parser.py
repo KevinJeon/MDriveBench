@@ -28,8 +28,10 @@ _EGO_VEHICLE_MODELS_CACHE = None  # Cache for ego vehicle models from manifest
 ROLE_DEFAULTS: Dict[str, Dict[str, object]] = {
     "npc": {"model": "vehicle.tesla.model3", "speed": 8.0},
     "pedestrian": {"model": "walker.pedestrian.0001", "speed": 1.5},
+    "walker": {"model": "walker.pedestrian.0001", "speed": 1.5},  # Alias for pedestrian
     "bicycle": {"model": "vehicle.diamondback.century", "speed": 4.0},
     "bike": {"model": "vehicle.diamondback.century", "speed": 4.0},
+    "cyclist": {"model": "vehicle.diamondback.century", "speed": 4.0},  # Alias for bicycle
     "static": {"model": "static.prop.trafficcone01", "speed": 0.0},
     "static_prop": {"model": "static.prop.trafficcone01", "speed": 0.0},
 }
@@ -301,6 +303,7 @@ def _build_custom_actor_configs(route_id: str, town: str) -> List[Dict[str, obje
         plan_locations: List[carla.Location] = []
         plan_transforms: List[carla.Transform] = []
         plan_time_candidates: List[float | None] = []
+        plan_speed_candidates: List[float | None] = []
         spawn_transform = None
         # Optional opt-out: route attribute snap_to_road="false" disables road snapping for this actor
         snap_attr = str(route_node.attrib.get("snap_to_road", "true")).lower()
@@ -322,6 +325,7 @@ def _build_custom_actor_configs(route_id: str, town: str) -> List[Dict[str, obje
             roll = _safe_float(waypoint.attrib.get("roll")) or 0.0
             plan_transforms.append(carla.Transform(loc, carla.Rotation(pitch=pitch, yaw=yaw, roll=roll)))
             plan_time_candidates.append(_safe_float(waypoint.attrib.get("time") or waypoint.attrib.get("t")))
+            plan_speed_candidates.append(_safe_float(waypoint.attrib.get("speed")))
 
             if index == 0:
                 spawn_transform = plan_transforms[-1]
@@ -332,6 +336,10 @@ def _build_custom_actor_configs(route_id: str, town: str) -> List[Dict[str, obje
         plan_times = None
         if plan_time_candidates and all(t is not None for t in plan_time_candidates):
             plan_times = [float(t) for t in plan_time_candidates]
+
+        plan_speeds = None
+        if plan_speed_candidates and all(s is not None for s in plan_speed_candidates):
+            plan_speeds = [float(s) for s in plan_speed_candidates]
 
         role = (entry.get("kind") or entry.get("role") or "npc").lower()
         role_defaults = ROLE_DEFAULTS.get(role, {})
@@ -352,6 +360,7 @@ def _build_custom_actor_configs(route_id: str, town: str) -> List[Dict[str, obje
                 "plan": plan_locations,
                 "plan_transforms": plan_transforms,
                 "plan_times": plan_times,
+                "plan_speeds": plan_speeds,
                 "target_speed": target_speed,
                 "avoid_collision": entry.get("avoid_collision", False),
                 "snap_to_road": snap_to_road,

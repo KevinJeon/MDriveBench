@@ -206,10 +206,130 @@ CHILD_WALKER_BLUEPRINTS = {
     "walker.pedestrian.0001",
     "walker.pedestrian.0010",
 }
+WALKER_MODEL_NEAR_DISTANCE_M = 1.8
 
 
 def _is_child_walker_blueprint(bp_id: str) -> bool:
     return str(bp_id) in CHILD_WALKER_BLUEPRINTS
+
+
+def _is_adult_walker_blueprint(bp_id: str) -> bool:
+    return str(bp_id) in ADULT_WALKER_BLUEPRINTS
+
+
+def _walker_model_index_seed(actor_id: int) -> int:
+    """
+    Stable integer seed for deterministic model fallback selection per actor id.
+    """
+    return (int(actor_id) * 1103515245 + 12345) & 0x7FFFFFFF
+
+
+def _diversify_nearby_walker_models(
+    actor_meta_by_id: Dict[int, Dict[str, object]],
+    vehicles: Dict[int, List[Waypoint]],
+    near_distance_m: float = WALKER_MODEL_NEAR_DISTANCE_M,
+) -> Dict[str, int]:
+    """
+    Reduce same-model adjacency for walkers by reassigning nearby walkers to different adult models.
+    Uses a deterministic greedy coloring-like pass over a proximity graph.
+    """
+    walker_ids: List[int] = []
+    walker_xy: Dict[int, Tuple[float, float]] = {}
+    raw_models: Dict[int, str] = {}
+
+    for vid, meta in actor_meta_by_id.items():
+        kind = str(meta.get("kind") or "")
+        if not kind.startswith("walker"):
+            continue
+        traj = vehicles.get(vid) or []
+        if not traj:
+            continue
+        first_wp = traj[0]
+        walker_ids.append(int(vid))
+        walker_xy[int(vid)] = (float(first_wp.x), float(first_wp.y))
+        raw_models[int(vid)] = str(meta.get("model") or "").strip()
+
+    if len(walker_ids) < 2:
+        return {
+            "walkers": len(walker_ids),
+            "near_pairs": 0,
+            "same_pairs_before": 0,
+            "same_pairs_after": 0,
+            "models_changed": 0,
+        }
+
+    neighbors: Dict[int, List[int]] = {vid: [] for vid in walker_ids}
+    near_pairs = 0
+    for idx, a in enumerate(walker_ids):
+        ax, ay = walker_xy[a]
+        for b in walker_ids[idx + 1 :]:
+            bx, by = walker_xy[b]
+            if math.hypot(ax - bx, ay - by) <= float(near_distance_m):
+                neighbors[a].append(b)
+                neighbors[b].append(a)
+                near_pairs += 1
+    neighbor_sets: Dict[int, set] = {vid: set(ids) for vid, ids in neighbors.items()}
+
+    initial_models: Dict[int, str] = {}
+    for vid in walker_ids:
+        current = raw_models[vid]
+        if _is_adult_walker_blueprint(current):
+            initial_models[vid] = current
+            continue
+        fallback_idx = _walker_model_index_seed(vid) % len(ADULT_WALKER_BLUEPRINTS)
+        initial_models[vid] = ADULT_WALKER_BLUEPRINTS[fallback_idx]
+
+    def _same_model_pairs(models: Dict[int, str]) -> int:
+        total = 0
+        for i, a in enumerate(walker_ids):
+            ma = models.get(a, "")
+            for b in walker_ids[i + 1 :]:
+                if models.get(b, "") != ma:
+                    continue
+                if b in neighbor_sets[a]:
+                    total += 1
+        return total
+
+    same_pairs_before = _same_model_pairs(initial_models)
+
+    order = sorted(walker_ids, key=lambda vid: (-len(neighbors[vid]), vid))
+    assigned: Dict[int, str] = {}
+    usage: Dict[str, int] = {model: 0 for model in ADULT_WALKER_BLUEPRINTS}
+
+    for vid in order:
+        original_model = initial_models[vid]
+        neighbor_models = {assigned[nid] for nid in neighbors[vid] if nid in assigned}
+        candidates = [m for m in ADULT_WALKER_BLUEPRINTS if m not in neighbor_models]
+        if not candidates:
+            candidates = list(ADULT_WALKER_BLUEPRINTS)
+
+        def _score(model_id: str) -> Tuple[int, int, int, int]:
+            same_neighbor = sum(1 for nid in neighbors[vid] if assigned.get(nid) == model_id)
+            model_usage = usage.get(model_id, 0)
+            change_penalty = 0 if model_id == original_model else 1
+            stable_tie = (_walker_model_index_seed(vid) + ADULT_WALKER_BLUEPRINTS.index(model_id)) % 997
+            return (same_neighbor, model_usage, change_penalty, stable_tie)
+
+        best_model = min(candidates, key=_score)
+        assigned[vid] = best_model
+        usage[best_model] = usage.get(best_model, 0) + 1
+
+    same_pairs_after = _same_model_pairs(assigned)
+    models_changed = 0
+    for vid in walker_ids:
+        new_model = assigned.get(vid, initial_models[vid])
+        prev_model = raw_models[vid]
+        if prev_model != new_model:
+            models_changed += 1
+        actor_meta_by_id[vid]["model"] = new_model
+
+    return {
+        "walkers": len(walker_ids),
+        "near_pairs": near_pairs,
+        "same_pairs_before": same_pairs_before,
+        "same_pairs_after": same_pairs_after,
+        "models_changed": models_changed,
+    }
 
 
 def map_obj_type(obj_type: str | None) -> str:
@@ -359,6 +479,13 @@ class SpawnCandidate:
     align_stats: Optional[Dict[str, float]] = None
 
 
+@dataclass
+class BoxSample2D:
+    cx: float
+    cy: float
+    corners: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float], Tuple[float, float]]
+
+
 def _path_distance(traj: List[Waypoint]) -> float:
     dist = 0.0
     for a, b in zip(traj, traj[1:]):
@@ -366,20 +493,114 @@ def _path_distance(traj: List[Waypoint]) -> float:
     return dist
 
 
-def _classify_actor_kind(traj: List[Waypoint], obj_type_raw: str) -> Tuple[str, bool]:
+def _trajectory_motion_stats(
+    traj: List[Waypoint],
+    times: Optional[List[float]] = None,
+    *,
+    default_dt: float = 0.1,
+) -> Dict[str, float]:
+    if not traj:
+        return {
+            "path_dist": 0.0,
+            "net_disp_xy": 0.0,
+            "bbox_extent_xy": 0.0,
+            "duration_s": 0.0,
+            "avg_speed_mps": 0.0,
+        }
+
+    path_dist = 0.0
+    for a, b in zip(traj, traj[1:]):
+        path_dist += math.hypot(float(b.x) - float(a.x), float(b.y) - float(a.y))
+
+    if len(traj) >= 2:
+        net_disp_xy = math.hypot(
+            float(traj[-1].x) - float(traj[0].x),
+            float(traj[-1].y) - float(traj[0].y),
+        )
+    else:
+        net_disp_xy = 0.0
+
+    xs = [float(wp.x) for wp in traj]
+    ys = [float(wp.y) for wp in traj]
+    bbox_extent_xy = max(max(xs) - min(xs), max(ys) - min(ys)) if xs and ys else 0.0
+
+    if times and len(times) == len(traj):
+        try:
+            t0 = float(times[0])
+            t1 = float(times[-1])
+            duration_s = max(0.0, t1 - t0)
+        except Exception:
+            duration_s = max(0.0, float(default_dt) * max(0, len(traj) - 1))
+    else:
+        duration_s = max(0.0, float(default_dt) * max(0, len(traj) - 1))
+
+    avg_speed_mps = float(path_dist) / max(1e-6, float(duration_s))
+    return {
+        "path_dist": float(path_dist),
+        "net_disp_xy": float(net_disp_xy),
+        "bbox_extent_xy": float(bbox_extent_xy),
+        "duration_s": float(duration_s),
+        "avg_speed_mps": float(avg_speed_mps),
+    }
+
+
+def _is_heavy_vehicle_obj_type(obj_type_raw: str) -> bool:
+    obj_lower = str(obj_type_raw or "").lower()
+    heavy_keywords = ("truck", "bus", "trailer", "tractor")
+    return any(token in obj_lower for token in heavy_keywords)
+
+
+def _classify_actor_kind(
+    traj: List[Waypoint],
+    obj_type_raw: str,
+    *,
+    times: Optional[List[float]] = None,
+    default_dt: float = 0.1,
+    static_path_threshold: float = 1.2,
+    static_net_disp_threshold: float = 0.8,
+    static_bbox_extent_threshold: float = 0.9,
+    static_avg_speed_threshold: float = 0.8,
+    static_heavy_path_threshold: float = 8.0,
+    static_heavy_bbox_extent_threshold: float = 1.2,
+    static_heavy_avg_speed_threshold: float = 0.8,
+) -> Tuple[str, bool, Dict[str, float]]:
     is_pedestrian = is_pedestrian_type(obj_type_raw)
+    is_heavy_vehicle = _is_heavy_vehicle_obj_type(obj_type_raw)
+    motion_stats = _trajectory_motion_stats(traj, times, default_dt=default_dt)
     if is_pedestrian:
         kind = "walker"
-        if len(traj) >= 2 and _path_distance(traj) < 0.5:
+        if len(traj) <= 1:
             kind = "walker_static"
-        return kind, True
+        elif motion_stats["path_dist"] < 0.5:
+            kind = "walker_static"
+        return kind, True, motion_stats
 
     kind = "npc"
     if len(traj) <= 1:
         kind = "static"
-    elif len(traj) >= 2 and _path_distance(traj) < 0.5:
+    elif (
+        motion_stats["path_dist"] <= float(static_path_threshold)
+        and motion_stats["net_disp_xy"] <= float(static_net_disp_threshold)
+    ):
         kind = "static"
-    return kind, False
+    elif (
+        motion_stats["net_disp_xy"] <= float(static_net_disp_threshold)
+        and motion_stats["bbox_extent_xy"] <= float(static_bbox_extent_threshold)
+        and motion_stats["avg_speed_mps"] <= float(static_avg_speed_threshold)
+    ):
+        # Robust fallback for noisy lidar trajectories that jitter in place.
+        kind = "static"
+    elif (
+        is_heavy_vehicle
+        and motion_stats["net_disp_xy"] <= float(static_net_disp_threshold)
+        and motion_stats["bbox_extent_xy"] <= float(static_heavy_bbox_extent_threshold)
+        and motion_stats["avg_speed_mps"] <= float(static_heavy_avg_speed_threshold)
+        and motion_stats["path_dist"] <= float(static_heavy_path_threshold)
+    ):
+        # Trucks/buses often have larger parked jitter envelopes; keep them static
+        # when motion stays compact and start/end displacement is small.
+        kind = "static"
+    return kind, False, motion_stats
 
 
 def _actor_radius(kind: str, length: Optional[float], width: Optional[float], model: str) -> float:
@@ -1197,6 +1418,551 @@ def _build_time_grid(all_times: List[float], sample_dt: float) -> List[float]:
     return [i * sample_dt for i in range(n + 1)]
 
 
+def _lerp_yaw_deg(yaw0: float, yaw1: float, alpha: float) -> float:
+    delta = (float(yaw1) - float(yaw0) + 180.0) % 360.0 - 180.0
+    return float(yaw0) + float(alpha) * delta
+
+
+def _sample_pose_xyyaw(
+    traj: List[Waypoint],
+    times: List[float],
+    sample_times: List[float],
+    always_active: bool,
+) -> List[Optional[Tuple[float, float, float]]]:
+    if not traj:
+        return [None for _ in sample_times]
+    if not times:
+        times = [float(i) for i in range(len(traj))]
+    if len(traj) == 1:
+        pose = (float(traj[0].x), float(traj[0].y), float(traj[0].yaw))
+        if always_active:
+            return [pose for _ in sample_times]
+        t0 = float(times[0])
+        out: List[Optional[Tuple[float, float, float]]] = []
+        for t in sample_times:
+            out.append(pose if float(t) >= t0 - 1e-6 else None)
+        return out
+
+    out: List[Optional[Tuple[float, float, float]]] = []
+    idx = 0
+    last = len(times) - 1
+    t_first = float(times[0])
+    t_last = float(times[-1])
+    for t in sample_times:
+        tt = float(t)
+        if tt < t_first - 1e-9:
+            if always_active:
+                wp0 = traj[0]
+                out.append((float(wp0.x), float(wp0.y), float(wp0.yaw)))
+            else:
+                out.append(None)
+            continue
+        if tt > t_last + 1e-9:
+            if always_active:
+                wpn = traj[-1]
+                out.append((float(wpn.x), float(wpn.y), float(wpn.yaw)))
+            else:
+                out.append(None)
+            continue
+        while idx + 1 < last and float(times[idx + 1]) < tt:
+            idx += 1
+        if idx + 1 >= len(times):
+            wpn = traj[-1]
+            out.append((float(wpn.x), float(wpn.y), float(wpn.yaw)))
+            continue
+        t0 = float(times[idx])
+        t1 = float(times[idx + 1])
+        wp0 = traj[idx]
+        wp1 = traj[idx + 1]
+        if t1 <= t0:
+            alpha = 0.0
+        else:
+            alpha = (tt - t0) / (t1 - t0)
+        alpha = max(0.0, min(1.0, float(alpha)))
+        x = float(wp0.x) + (float(wp1.x) - float(wp0.x)) * alpha
+        y = float(wp0.y) + (float(wp1.y) - float(wp0.y)) * alpha
+        yaw = _lerp_yaw_deg(float(wp0.yaw), float(wp1.yaw), alpha)
+        out.append((float(x), float(y), float(yaw)))
+    return out
+
+
+def _actor_bbox_dims(kind: str, length: Optional[float], width: Optional[float], model: str) -> Tuple[float, float]:
+    base_len: Optional[float] = None
+    base_wid: Optional[float] = None
+    if length is not None:
+        try:
+            val = float(length)
+            if val > 0.05:
+                base_len = val
+        except Exception:
+            base_len = None
+    if width is not None:
+        try:
+            val = float(width)
+            if val > 0.05:
+                base_wid = val
+        except Exception:
+            base_wid = None
+
+    model_lower = str(model or "").lower()
+    if kind.startswith("walker"):
+        default_len, default_wid = 0.6, 0.6
+    elif ("bicycle" in model_lower) or ("cycl" in model_lower):
+        default_len, default_wid = 1.8, 0.6
+    elif ("motor" in model_lower) or ("bike" in model_lower):
+        default_len, default_wid = 2.1, 0.75
+    elif ("bus" in model_lower) or ("sprinter" in model_lower):
+        default_len, default_wid = 10.5, 2.55
+    elif ("truck" in model_lower) or ("firetruck" in model_lower):
+        default_len, default_wid = 8.0, 2.45
+    elif ("van" in model_lower) or ("t2" in model_lower):
+        default_len, default_wid = 5.9, 2.1
+    else:
+        default_len, default_wid = 4.8, 2.0
+
+    if base_len is None and base_wid is None:
+        return float(default_len), float(default_wid)
+    if base_len is None:
+        base_wid = float(base_wid or default_wid)
+        base_len = max(1.0, 2.3 * base_wid)
+    if base_wid is None:
+        base_len = float(base_len or default_len)
+        base_wid = max(0.6, 0.42 * base_len)
+    return float(max(0.2, base_len)), float(max(0.2, base_wid))
+
+
+def _oriented_box_corners_xy(
+    cx: float,
+    cy: float,
+    yaw_deg: float,
+    length: float,
+    width: float,
+) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
+    yaw_rad = math.radians(float(yaw_deg))
+    c = math.cos(yaw_rad)
+    s = math.sin(yaw_rad)
+    hl = 0.5 * float(length)
+    hw = 0.5 * float(width)
+    local = [
+        (hl, hw),
+        (hl, -hw),
+        (-hl, -hw),
+        (-hl, hw),
+    ]
+    corners = []
+    for lx, ly in local:
+        wx = float(cx) + lx * c - ly * s
+        wy = float(cy) + lx * s + ly * c
+        corners.append((float(wx), float(wy)))
+    return (corners[0], corners[1], corners[2], corners[3])
+
+
+def _sat_project(poly: Sequence[Tuple[float, float]], axis_x: float, axis_y: float) -> Tuple[float, float]:
+    lo = None
+    hi = None
+    for px, py in poly:
+        val = float(px) * float(axis_x) + float(py) * float(axis_y)
+        if lo is None or val < lo:
+            lo = val
+        if hi is None or val > hi:
+            hi = val
+    return float(lo if lo is not None else 0.0), float(hi if hi is not None else 0.0)
+
+
+def _boxes_intersect_sat(
+    poly_a: Sequence[Tuple[float, float]],
+    poly_b: Sequence[Tuple[float, float]],
+) -> bool:
+    for poly in (poly_a, poly_b):
+        n = len(poly)
+        for i in range(n):
+            x0, y0 = poly[i]
+            x1, y1 = poly[(i + 1) % n]
+            ex = float(x1) - float(x0)
+            ey = float(y1) - float(y0)
+            ax = -ey
+            ay = ex
+            norm = math.hypot(ax, ay)
+            if norm <= 1e-9:
+                continue
+            ax /= norm
+            ay /= norm
+            a0, a1 = _sat_project(poly_a, ax, ay)
+            b0, b1 = _sat_project(poly_b, ax, ay)
+            if a1 < b0 - 1e-6 or b1 < a0 - 1e-6:
+                return False
+    return True
+
+
+def _sample_actor_boxes(
+    traj: List[Waypoint],
+    times: List[float],
+    sample_times: List[float],
+    *,
+    always_active: bool,
+    length: float,
+    width: float,
+) -> List[Optional[BoxSample2D]]:
+    poses = _sample_pose_xyyaw(
+        traj=traj,
+        times=times,
+        sample_times=sample_times,
+        always_active=always_active,
+    )
+    out: List[Optional[BoxSample2D]] = []
+    for pose in poses:
+        if pose is None:
+            out.append(None)
+            continue
+        x, y, yaw = pose
+        corners = _oriented_box_corners_xy(
+            cx=float(x),
+            cy=float(y),
+            yaw_deg=float(yaw),
+            length=float(length),
+            width=float(width),
+        )
+        out.append(BoxSample2D(cx=float(x), cy=float(y), corners=corners))
+    return out
+
+
+def _series_has_overlap(
+    series_a: List[Optional[BoxSample2D]],
+    series_b: List[Optional[BoxSample2D]],
+    *,
+    radius_a: float,
+    radius_b: float,
+    shift_a_dx: float = 0.0,
+    shift_a_dy: float = 0.0,
+) -> Tuple[bool, Optional[int]]:
+    n = min(len(series_a), len(series_b))
+    if n <= 0:
+        return False, None
+    max_center_dist = float(radius_a) + float(radius_b) + 0.25
+    max_center_dist_sq = max_center_dist * max_center_dist
+    shift_dx = float(shift_a_dx)
+    shift_dy = float(shift_a_dy)
+    needs_shift = abs(shift_dx) > 1e-9 or abs(shift_dy) > 1e-9
+    for idx in range(n):
+        a = series_a[idx]
+        b = series_b[idx]
+        if a is None or b is None:
+            continue
+        dx = (float(a.cx) + shift_dx) - float(b.cx)
+        dy = (float(a.cy) + shift_dy) - float(b.cy)
+        if dx * dx + dy * dy > max_center_dist_sq:
+            continue
+        if needs_shift:
+            a_poly = tuple((float(px) + shift_dx, float(py) + shift_dy) for px, py in a.corners)
+        else:
+            a_poly = a.corners
+        if _boxes_intersect_sat(a_poly, b.corners):
+            return True, idx
+    return False, None
+
+
+def _apply_parked_vehicle_path_clearance(
+    vehicles_aligned: Dict[int, List[Waypoint]],
+    vehicle_times_aligned: Dict[int, List[float]],
+    vehicles_original: Dict[int, List[Waypoint]],
+    vehicle_times_original: Dict[int, List[float]],
+    actor_meta: Dict[int, Dict[str, object]],
+    args: argparse.Namespace,
+) -> Tuple[Dict[int, List[Waypoint]], Dict[str, object]]:
+    report: Dict[str, object] = {
+        "enabled": bool(getattr(args, "parked_clearance", True)),
+        "applied": False,
+        "parked_candidates": 0,
+        "moving_actors": 0,
+        "moved_actors": 0,
+        "unresolved_actors": 0,
+        "total_shift_m": 0.0,
+        "max_shift_m": 0.0,
+        "actors": {},
+    }
+    if not bool(getattr(args, "parked_clearance", True)):
+        report["reason"] = "disabled_by_flag"
+        return vehicles_aligned, report
+
+    parked_ids: List[int] = []
+    moving_ids: List[int] = []
+    for vid, meta in actor_meta.items():
+        kind = str(meta.get("kind") or "")
+        if kind == "static":
+            parked_ids.append(int(vid))
+        elif kind == "npc":
+            moving_ids.append(int(vid))
+    parked_ids.sort()
+    moving_ids.sort()
+    report["parked_candidates"] = len(parked_ids)
+    report["moving_actors"] = len(moving_ids)
+    if not parked_ids or not moving_ids:
+        report["reason"] = "insufficient_actors"
+        return vehicles_aligned, report
+
+    sample_dt = max(0.05, float(getattr(args, "parked_clearance_sample_dt", 0.2)))
+    max_shift = max(0.0, float(getattr(args, "parked_clearance_max_shift", 1.0)))
+    shift_step = max(0.05, float(getattr(args, "parked_clearance_shift_step", 0.15)))
+    angle_count = max(8, int(getattr(args, "parked_clearance_angle_count", 16)))
+    default_dt = float(getattr(args, "dt", 0.1))
+
+    all_ids = sorted(set(parked_ids + moving_ids))
+    all_times: List[float] = []
+    for vid in all_ids:
+        traj_cur = vehicles_aligned.get(int(vid)) or []
+        if traj_cur:
+            all_times.extend(
+                _ensure_times(traj_cur, vehicle_times_aligned.get(int(vid)), default_dt)
+            )
+        traj_org = vehicles_original.get(int(vid)) or []
+        if traj_org:
+            all_times.extend(
+                _ensure_times(traj_org, vehicle_times_original.get(int(vid)), default_dt)
+            )
+    sample_times = _build_time_grid(all_times, sample_dt)
+    if not sample_times:
+        sample_times = [0.0]
+
+    dims_by_id: Dict[int, Tuple[float, float]] = {}
+    radii_by_id: Dict[int, float] = {}
+    for vid in all_ids:
+        meta = actor_meta.get(int(vid), {})
+        length, width = _actor_bbox_dims(
+            kind=str(meta.get("kind") or "npc"),
+            length=meta.get("length"),
+            width=meta.get("width"),
+            model=str(meta.get("model") or ""),
+        )
+        dims_by_id[int(vid)] = (float(length), float(width))
+        radii_by_id[int(vid)] = 0.5 * math.hypot(float(length), float(width))
+
+    boxes_current: Dict[int, List[Optional[BoxSample2D]]] = {}
+    boxes_original: Dict[int, List[Optional[BoxSample2D]]] = {}
+    for vid in all_ids:
+        meta = actor_meta.get(int(vid), {})
+        kind = str(meta.get("kind") or "")
+        always_active = kind in ("static", "walker_static")
+        length, width = dims_by_id[int(vid)]
+
+        traj_cur = vehicles_aligned.get(int(vid)) or []
+        times_cur = _ensure_times(traj_cur, vehicle_times_aligned.get(int(vid)), default_dt)
+        boxes_current[int(vid)] = _sample_actor_boxes(
+            traj=traj_cur,
+            times=times_cur,
+            sample_times=sample_times,
+            always_active=always_active,
+            length=float(length),
+            width=float(width),
+        )
+
+        traj_org = vehicles_original.get(int(vid)) or []
+        times_org = _ensure_times(traj_org, vehicle_times_original.get(int(vid)), default_dt)
+        boxes_original[int(vid)] = _sample_actor_boxes(
+            traj=traj_org,
+            times=times_org,
+            sample_times=sample_times,
+            always_active=always_active,
+            length=float(length),
+            width=float(width),
+        )
+
+    total_shift = 0.0
+    max_shift_seen = 0.0
+    moved_count = 0
+    unresolved_count = 0
+
+    for pid in parked_ids:
+        parked_series_cur = boxes_current.get(int(pid)) or []
+        parked_series_org = boxes_original.get(int(pid)) or []
+        traj_cur = vehicles_aligned.get(int(pid)) or []
+        if not parked_series_cur or not traj_cur:
+            continue
+
+        orig_overlap_by_mid: Dict[int, bool] = {}
+        cur_overlap_by_mid: Dict[int, bool] = {}
+        first_new_overlap_idx: Dict[int, int] = {}
+        blockers: List[int] = []
+        for mid in moving_ids:
+            moving_cur = boxes_current.get(int(mid)) or []
+            moving_org = boxes_original.get(int(mid)) or []
+            if not moving_cur:
+                continue
+            orig_overlap, _ = _series_has_overlap(
+                parked_series_org,
+                moving_org,
+                radius_a=float(radii_by_id.get(int(pid), 2.5)),
+                radius_b=float(radii_by_id.get(int(mid), 2.5)),
+            )
+            cur_overlap, cur_idx = _series_has_overlap(
+                parked_series_cur,
+                moving_cur,
+                radius_a=float(radii_by_id.get(int(pid), 2.5)),
+                radius_b=float(radii_by_id.get(int(mid), 2.5)),
+            )
+            orig_overlap_by_mid[int(mid)] = bool(orig_overlap)
+            cur_overlap_by_mid[int(mid)] = bool(cur_overlap)
+            if cur_overlap and not orig_overlap:
+                blockers.append(int(mid))
+                if cur_idx is not None:
+                    first_new_overlap_idx[int(mid)] = int(cur_idx)
+
+        baseline_introduced = len(blockers)
+        actor_entry: Dict[str, object] = {
+            "baseline_introduced": int(baseline_introduced),
+            "blockers": [int(v) for v in sorted(blockers)],
+            "applied": False,
+            "shift": [0.0, 0.0],
+            "shift_m": 0.0,
+        }
+        if baseline_introduced <= 0:
+            report["actors"][str(pid)] = actor_entry
+            continue
+
+        candidate_set: set[Tuple[int, int]] = {(0, 0)}
+        if max_shift > 0.0:
+            r = shift_step
+            while r <= max_shift + 1e-9:
+                for ai in range(angle_count):
+                    theta = 2.0 * math.pi * float(ai) / float(angle_count)
+                    dx = r * math.cos(theta)
+                    dy = r * math.sin(theta)
+                    candidate_set.add((int(round(dx * 1000.0)), int(round(dy * 1000.0))))
+                r += shift_step
+            for mid in blockers:
+                idx = first_new_overlap_idx.get(int(mid))
+                if idx is None or idx < 0 or idx >= len(parked_series_cur):
+                    continue
+                p_sample = parked_series_cur[idx]
+                m_sample = (boxes_current.get(int(mid)) or [None] * len(parked_series_cur))[idx]
+                if p_sample is None or m_sample is None:
+                    continue
+                vx = float(p_sample.cx) - float(m_sample.cx)
+                vy = float(p_sample.cy) - float(m_sample.cy)
+                norm = math.hypot(vx, vy)
+                if norm <= 1e-6:
+                    yaw_ref = float(traj_cur[0].yaw) if traj_cur else 0.0
+                    vx = math.cos(math.radians(yaw_ref + 90.0))
+                    vy = math.sin(math.radians(yaw_ref + 90.0))
+                    norm = math.hypot(vx, vy)
+                if norm <= 1e-6:
+                    continue
+                ux = vx / norm
+                uy = vy / norm
+                px = -uy
+                py = ux
+                for dist in (shift_step, min(max_shift, shift_step * 2.0), max_shift):
+                    if dist <= 1e-6:
+                        continue
+                    for sx, sy in (
+                        (ux, uy),
+                        (px, py),
+                        (-px, -py),
+                    ):
+                        candidate_set.add(
+                            (
+                                int(round(float(sx) * float(dist) * 1000.0)),
+                                int(round(float(sy) * float(dist) * 1000.0)),
+                            )
+                        )
+
+        candidates = [
+            (float(ix) / 1000.0, float(iy) / 1000.0)
+            for ix, iy in sorted(
+                candidate_set,
+                key=lambda item: math.hypot(float(item[0]), float(item[1])),
+            )
+        ]
+
+        best_dx = 0.0
+        best_dy = 0.0
+        best_score = (baseline_introduced, baseline_introduced, 0.0)
+        for cand_dx, cand_dy in candidates:
+            introduced = 0
+            overlap_total = 0
+            for mid in moving_ids:
+                moving_cur = boxes_current.get(int(mid)) or []
+                if not moving_cur:
+                    continue
+                has_overlap, _ = _series_has_overlap(
+                    parked_series_cur,
+                    moving_cur,
+                    radius_a=float(radii_by_id.get(int(pid), 2.5)),
+                    radius_b=float(radii_by_id.get(int(mid), 2.5)),
+                    shift_a_dx=float(cand_dx),
+                    shift_a_dy=float(cand_dy),
+                )
+                if has_overlap:
+                    overlap_total += 1
+                    if not bool(orig_overlap_by_mid.get(int(mid), False)):
+                        introduced += 1
+            cand_mag = math.hypot(float(cand_dx), float(cand_dy))
+            cand_score = (int(introduced), int(overlap_total), float(cand_mag))
+            if cand_score < best_score:
+                best_score = cand_score
+                best_dx = float(cand_dx)
+                best_dy = float(cand_dy)
+                if introduced == 0:
+                    # Keep searching same-radius options, but prefer early exact clears.
+                    if overlap_total <= 0 and cand_mag <= max(shift_step, 0.10) + 1e-9:
+                        break
+
+        introduced_after = int(best_score[0])
+        if introduced_after < baseline_introduced and (abs(best_dx) > 1e-9 or abs(best_dy) > 1e-9):
+            for wp in traj_cur:
+                wp.x = float(wp.x) + float(best_dx)
+                wp.y = float(wp.y) + float(best_dy)
+            boxes_current[int(pid)] = [
+                None
+                if sample is None
+                else BoxSample2D(
+                    cx=float(sample.cx) + float(best_dx),
+                    cy=float(sample.cy) + float(best_dy),
+                    corners=tuple(
+                        (float(px) + float(best_dx), float(py) + float(best_dy))
+                        for px, py in sample.corners
+                    ),
+                )
+                for sample in parked_series_cur
+            ]
+            shift_mag = math.hypot(float(best_dx), float(best_dy))
+            total_shift += float(shift_mag)
+            max_shift_seen = max(max_shift_seen, float(shift_mag))
+            moved_count += 1
+            actor_entry["applied"] = True
+            actor_entry["shift"] = [float(best_dx), float(best_dy)]
+            actor_entry["shift_m"] = float(shift_mag)
+            actor_entry["introduced_after"] = int(introduced_after)
+            actor_entry["remaining_overlap_total"] = int(best_score[1])
+        else:
+            unresolved_count += 1
+            actor_entry["introduced_after"] = int(introduced_after)
+            actor_entry["remaining_overlap_total"] = int(best_score[1])
+            actor_entry["reason"] = "no_improving_shift_found"
+
+        report["actors"][str(pid)] = actor_entry
+
+    report["applied"] = moved_count > 0
+    report["moved_actors"] = int(moved_count)
+    report["unresolved_actors"] = int(unresolved_count)
+    report["total_shift_m"] = float(total_shift)
+    report["max_shift_m"] = float(max_shift_seen)
+
+    if moved_count > 0 or unresolved_count > 0:
+        avg_shift = float(total_shift) / float(max(1, moved_count))
+        print(
+            "[PARKED_CLEARANCE] parked={} moving={} moved={} unresolved={} "
+            "avg_shift={:.3f}m max_shift={:.3f}m".format(
+                len(parked_ids),
+                len(moving_ids),
+                int(moved_count),
+                int(unresolved_count),
+                float(avg_shift),
+                float(max_shift_seen),
+            )
+        )
+    return vehicles_aligned, report
+
+
 def _sample_positions(
     traj: List[Waypoint],
     times: List[float],
@@ -1649,12 +2415,54 @@ def _candidate_waypoints_from_continuous_lane(
     return candidates
 
 
+def _trajectory_direction_and_hint(
+    traj: List[Waypoint],
+    idx: int,
+    *,
+    back_steps: int = 2,
+    forward_steps: int = 6,
+) -> Tuple[float, float, float, Tuple[float, float]]:
+    """
+    Estimate a stable trajectory direction + lookahead hint around index idx.
+    Uses a local-to-future window so lane-locking follows path shape over time,
+    not just the immediate previous step.
+    """
+    if not traj:
+        return 1.0, 0.0, 1.0, (0.0, 0.0)
+
+    n = len(traj)
+    i = max(0, min(n - 1, int(idx)))
+    back_idx = max(0, i - max(0, int(back_steps)))
+    fwd_idx = min(n - 1, i + max(1, int(forward_steps)))
+
+    base = traj[i]
+    hint = traj[fwd_idx]
+    dx = float(hint.x) - float(traj[back_idx].x)
+    dy = float(hint.y) - float(traj[back_idx].y)
+    norm = math.hypot(dx, dy)
+    if norm <= 1e-6:
+        yaw_rad = math.radians(float(base.yaw))
+        dir_x = math.cos(yaw_rad)
+        dir_y = math.sin(yaw_rad)
+    else:
+        dir_x = dx / norm
+        dir_y = dy / norm
+
+    forward_dist = math.hypot(float(hint.x) - float(base.x), float(hint.y) - float(base.y))
+    forward_dist = max(0.5, float(forward_dist))
+    return float(dir_x), float(dir_y), float(forward_dist), (float(hint.x), float(hint.y))
+
+
 def _select_lane_locked_waypoint(
     prev_wp,
     raw_wp: Waypoint,
     raw_step_dx: float,
     raw_step_dy: float,
     local_best_info: Optional[Dict[str, float]],
+    desired_dir_x: Optional[float] = None,
+    desired_dir_y: Optional[float] = None,
+    future_hint_xy: Optional[Tuple[float, float]] = None,
+    future_lookahead_dist: Optional[float] = None,
 ) -> object:
     """
     Follow the previous snapped lane centerline (via waypoint graph) and pick
@@ -1667,13 +2475,22 @@ def _select_lane_locked_waypoint(
     if not candidates:
         return None
 
-    raw_dir_norm = math.hypot(float(raw_step_dx), float(raw_step_dy))
-    if raw_dir_norm <= 1e-6:
-        raw_dir_x = math.cos(math.radians(float(raw_wp.yaw)))
-        raw_dir_y = math.sin(math.radians(float(raw_wp.yaw)))
+    if (
+        desired_dir_x is not None
+        and desired_dir_y is not None
+        and math.hypot(float(desired_dir_x), float(desired_dir_y)) > 1e-6
+    ):
+        dnorm = math.hypot(float(desired_dir_x), float(desired_dir_y))
+        raw_dir_x = float(desired_dir_x) / dnorm
+        raw_dir_y = float(desired_dir_y) / dnorm
     else:
-        raw_dir_x = float(raw_step_dx) / raw_dir_norm
-        raw_dir_y = float(raw_step_dy) / raw_dir_norm
+        raw_dir_norm = math.hypot(float(raw_step_dx), float(raw_step_dy))
+        if raw_dir_norm <= 1e-6:
+            raw_dir_x = math.cos(math.radians(float(raw_wp.yaw)))
+            raw_dir_y = math.sin(math.radians(float(raw_wp.yaw)))
+        else:
+            raw_dir_x = float(raw_step_dx) / raw_dir_norm
+            raw_dir_y = float(raw_step_dy) / raw_dir_norm
 
     try:
         prev_loc = prev_wp.transform.location
@@ -1717,6 +2534,47 @@ def _select_lane_locked_waypoint(
                 score += 0.70 * math.hypot(cx - ax, cy - ay)
             except Exception:
                 pass
+
+        # Lookahead branch scoring against future trajectory hint to choose
+        # the correct lane-node branch at intersections/curves.
+        if future_hint_xy is not None:
+            hint_x, hint_y = future_hint_xy
+            probe_dist = float(future_lookahead_dist) if future_lookahead_dist is not None else max(1.5, 2.0 * step_dist)
+            probe_dist = max(1.0, min(10.0, probe_dist))
+            branch_score: Optional[float] = None
+            try:
+                future_nodes = list(cand_wp.next(probe_dist))
+            except Exception:
+                future_nodes = []
+
+            if future_nodes:
+                for next_wp in future_nodes:
+                    try:
+                        nloc = next_wp.transform.location
+                        nx = float(nloc.x)
+                        ny = float(nloc.y)
+                    except Exception:
+                        continue
+                    dist_hint = math.hypot(nx - float(hint_x), ny - float(hint_y))
+                    fvx = nx - cx
+                    fvy = ny - cy
+                    fvn = math.hypot(fvx, fvy)
+                    if fvn <= 1e-6:
+                        dir_pen = 1.0
+                    else:
+                        cos_future = max(-1.0, min(1.0, float((fvx * raw_dir_x + fvy * raw_dir_y) / fvn)))
+                        dir_pen = 1.0 - max(0.0, cos_future)
+                    cand_branch_score = 0.40 * float(dist_hint) + 1.25 * float(dir_pen)
+                    if branch_score is None or cand_branch_score < branch_score:
+                        branch_score = cand_branch_score
+            else:
+                # Fallback: project candidate heading forward when graph expansion fails.
+                proj_x = cx + probe_dist * math.cos(math.radians(float(cyaw)))
+                proj_y = cy + probe_dist * math.sin(math.radians(float(cyaw)))
+                branch_score = 0.30 * math.hypot(proj_x - float(hint_x), proj_y - float(hint_y))
+
+            if branch_score is not None:
+                score += float(branch_score)
 
         if best_score is None or score < best_score:
             best_score = score
@@ -1780,12 +2638,22 @@ def _compute_piecewise_ego_offsets(
             prev_raw = traj[idx - 1] if idx > 0 else wp
             raw_step_dx = float(wp.x) - float(prev_raw.x)
             raw_step_dy = float(wp.y) - float(prev_raw.y)
+            traj_dir_x, traj_dir_y, traj_forward_dist, traj_future_xy = _trajectory_direction_and_hint(
+                traj,
+                idx,
+                back_steps=2,
+                forward_steps=6,
+            )
             lane_locked_wp = _select_lane_locked_waypoint(
                 prev_wp=prev_snap_wp,
                 raw_wp=wp,
                 raw_step_dx=raw_step_dx,
                 raw_step_dy=raw_step_dy,
                 local_best_info=best,
+                desired_dir_x=traj_dir_x,
+                desired_dir_y=traj_dir_y,
+                future_hint_xy=traj_future_xy,
+                future_lookahead_dist=traj_forward_dist,
             )
             if lane_locked_wp is None:
                 lane_lock_fallbacks += 1
@@ -1952,6 +2820,8 @@ def _compute_piecewise_actor_offsets(
     max_step_delta: float,
     bridge_max_gap_steps: int,
     bridge_straight_thresh_deg: float,
+    early_lane_lock_seconds: float,
+    early_lane_switch_override_margin: float,
 ) -> Tuple[List[Tuple[float, float]], Dict[str, object]]:
     """
     Compute per-waypoint XY offsets around a global base offset.
@@ -1960,11 +2830,12 @@ def _compute_piecewise_actor_offsets(
     if world_map is None or not traj:
         return [], {"status": "no_map_or_traj"}
 
-    lane_names_all = (
-        ["Driving", "Shoulder", "Parking"]
-        if role in ("npc", "static")
-        else ["Sidewalk", "Shoulder", "Driving"]
-    )
+    if role == "npc":
+        lane_names_all = ["Driving", "Shoulder", "Parking"]
+    elif role == "static":
+        lane_names_all = ["Parking", "Shoulder", "Driving"]
+    else:
+        lane_names_all = ["Sidewalk", "Shoulder", "Driving"]
     sample_count = max(8, min(len(traj), 24))
     samples = _select_alignment_samples(traj, times, sample_count)
     sample_projections: List[Dict[str, Dict[str, float]]] = []
@@ -1988,10 +2859,15 @@ def _compute_piecewise_actor_offsets(
     yaws: List[float] = []
     lane_switches_raw = 0
     prev_lane_key: Optional[Tuple[int, int]] = None
+    initial_lane_key: Optional[Tuple[int, int]] = None
     lane_dists: List[float] = []
     yaw_diffs: List[float] = []
+    early_lane_lock_forced = 0
+    t0 = float(times[0]) if times else 0.0
+    early_lane_lock_seconds = max(0.0, float(early_lane_lock_seconds))
+    early_lane_switch_override_margin = max(0.0, float(early_lane_switch_override_margin))
 
-    for wp in traj:
+    for idx, wp in enumerate(traj):
         loc = carla.Location(
             x=float(wp.x + base_dx),
             y=float(wp.y + base_dy),
@@ -2002,6 +2878,8 @@ def _compute_piecewise_actor_offsets(
         best_lane_key: Optional[Tuple[int, int]] = None
         best_score = None
         best_lane_name = None
+        initial_lane_best = None
+        initial_lane_best_score = None
         for lane_name in candidate_lanes:
             info = proj.get(lane_name)
             if info is None:
@@ -2011,16 +2889,28 @@ def _compute_piecewise_actor_offsets(
             score = float(info["dist"]) + 0.35 * (yaw_diff / 90.0)
             if prev_lane_key is not None and lane_key != prev_lane_key:
                 score += 0.15
-            if role in ("npc", "static"):
+            if role == "npc":
                 if lane_name == "Shoulder":
                     score += 0.08
                 elif lane_name == "Parking":
                     score += 0.20
+            elif role == "static":
+                if lane_name == "Driving":
+                    score += 0.35
+                elif lane_name == "Shoulder":
+                    score += 0.10
             if best_score is None or score < best_score:
                 best_score = score
                 best = info
                 best_lane_key = lane_key
                 best_lane_name = lane_name
+            if (
+                initial_lane_key is not None
+                and lane_key == initial_lane_key
+                and (initial_lane_best_score is None or score < initial_lane_best_score)
+            ):
+                initial_lane_best_score = score
+                initial_lane_best = info
 
         if best is None:
             raw_dx.append(float(base_dx))
@@ -2029,6 +2919,32 @@ def _compute_piecewise_actor_offsets(
             lane_keys.append(None)
             yaws.append(float(wp.yaw))
             continue
+
+        if initial_lane_key is None and best_lane_key is not None:
+            initial_lane_key = best_lane_key
+
+        if (
+            role == "npc"
+            and early_lane_lock_seconds > 0.0
+            and initial_lane_key is not None
+            and best_lane_key is not None
+            and best_lane_key != initial_lane_key
+        ):
+            t_rel = float(times[idx]) - t0 if idx < len(times) else 0.0
+            if t_rel <= early_lane_lock_seconds + 1e-6 and initial_lane_best is not None:
+                best_score_val = float(best_score) if best_score is not None else 1e9
+                initial_score_val = (
+                    float(initial_lane_best_score)
+                    if initial_lane_best_score is not None
+                    else best_score_val
+                )
+                # Keep initial lane early unless alternative lane is significantly better.
+                if (initial_score_val - best_score_val) < early_lane_switch_override_margin:
+                    best = initial_lane_best
+                    best_lane_key = initial_lane_key
+                    best_lane_name = None
+                    best_score = initial_score_val
+                    early_lane_lock_forced += 1
 
         dx = float(best["x"]) - float(wp.x)
         dy = float(best["y"]) - float(wp.y)
@@ -2147,6 +3063,9 @@ def _compute_piecewise_actor_offsets(
         "no_wp_ratio": float(sum(1 for ok in valid_mask if not ok) / max(1, len(valid_mask))),
         "lane_switches": int(lane_switches_post),
         "lane_switches_raw": int(lane_switches_raw),
+        "early_lane_lock_seconds": float(early_lane_lock_seconds),
+        "early_lane_switch_override_margin": float(early_lane_switch_override_margin),
+        "early_lane_lock_forced": int(early_lane_lock_forced),
         "bridge": bridge_info,
         "lane_key_coverage": float(len(lane_keys_valid) / max(1, len(lane_keys))),
         "lane_dist_median": float(_median(lane_dists)) if lane_dists else 999.0,
@@ -2282,7 +3201,8 @@ def _infer_alignment_intent(
 ) -> Dict[str, object]:
     """Infer lane intent (vehicles vs walkers) from projection distances."""
     if role in ("npc", "static"):
-        lane_names = [n for n in ("Driving", "Shoulder", "Parking") if any(n in p for p in projections)]
+        lane_pref = ("Driving", "Shoulder", "Parking") if role == "npc" else ("Parking", "Shoulder", "Driving")
+        lane_names = [n for n in lane_pref if any(n in p for p in projections)]
         counts = {n: 0 for n in lane_names}
         dists: Dict[str, List[float]] = {n: [] for n in lane_names}
         for proj in projections:
@@ -2299,7 +3219,7 @@ def _infer_alignment_intent(
             if best_lane is not None:
                 counts[best_lane] += 1
         total = sum(counts.values()) or 1
-        intent_lane = max(counts.items(), key=lambda kv: kv[1])[0] if counts else "Driving"
+        intent_lane = max(counts.items(), key=lambda kv: kv[1])[0] if counts else lane_pref[0]
         intent_ratio = counts.get(intent_lane, 0) / float(total)
         med_dist = _median(dists.get(intent_lane, []))
         intent = intent_lane.lower()
@@ -2310,8 +3230,8 @@ def _infer_alignment_intent(
             "intent_ratio": intent_ratio,
             "lane_counts": counts,
             "lane_median_dist": {k: _median(v) for k, v in dists.items()},
-            "candidate_lanes": lane_names or ["Driving"],
-            "score_lanes": lane_names or ["Driving"],
+            "candidate_lanes": lane_names or [lane_pref[0]],
+            "score_lanes": lane_names or [lane_pref[0]],
         }
 
     # Walker intent
@@ -2493,7 +3413,13 @@ def _build_alignment_candidates(
     samples = _select_alignment_samples(traj, times, sample_count)
     if not samples:
         return [], {"status": "no_samples"}
-    lane_names_all = ["Driving", "Shoulder", "Parking"] if role in ("npc", "static") else ["Sidewalk", "Shoulder", "Driving"]
+    if role == "npc":
+        lane_names_all = ["Driving", "Shoulder", "Parking"]
+    elif role == "static":
+        # Parked/static actors should preserve parking-side intent, not be pulled into lane-following.
+        lane_names_all = ["Parking", "Shoulder", "Driving"]
+    else:
+        lane_names_all = ["Sidewalk", "Shoulder", "Driving"]
     projections: List[Dict[str, Dict[str, float]]] = []
     for s in samples:
         loc = carla.Location(x=float(s["x"]), y=float(s["y"]), z=float(s["z"]))
@@ -2904,7 +3830,7 @@ def _build_alignment_neighbor_map(
         if meta is None:
             continue
         kind = str(meta.get("kind") or "")
-        if kind not in ("npc", "static"):
+        if kind != "npc":
             continue
         wp = traj[0]
         items.append((vid, float(wp.x), float(wp.y), float(wp.yaw)))
@@ -2996,8 +3922,14 @@ def _generate_spawn_candidates(
     loc = carla.Location(x=base_wp.x, y=base_wp.y, z=base_wp.z)
 
     lane_candidates: List[Tuple[str, object]] = []
-    if role in ("npc", "static"):
+    if role == "npc":
         for lane_name in ("Driving", "Shoulder", "Parking"):
+            lane_val = _lane_type_value(lane_name)
+            if lane_val is not None:
+                lane_candidates.append((lane_name, lane_val))
+    elif role == "static":
+        # For parked/static actors, prioritize off-lane placements and avoid lane-follow attraction.
+        for lane_name in ("Parking", "Shoulder", "Driving"):
             lane_val = _lane_type_value(lane_name)
             if lane_val is not None:
                 lane_candidates.append((lane_name, lane_val))
@@ -3022,7 +3954,7 @@ def _generate_spawn_candidates(
             driving_wp = wp
 
     # Lateral offsets from driving lane (captures shoulder-like positions)
-    if driving_wp is not None:
+    if driving_wp is not None and role == "npc":
         try:
             yaw = math.radians(float(driving_wp.transform.rotation.yaw))
             right = (math.sin(yaw), -math.cos(yaw))
@@ -3247,7 +4179,10 @@ def _preprocess_spawn_positions(
     }
 
     if carla is None:
-        print("[WARN] spawn preprocess requested but CARLA Python module is unavailable; skipping.")
+        msg = "spawn preprocess requested but CARLA Python module is unavailable"
+        if bool(getattr(args, "spawn_preprocess_require_carla", False)):
+            raise RuntimeError(msg)
+        print(f"[WARN] {msg}; skipping.")
         report["summary"]["status"] = "skipped_no_carla"
         return report
 
@@ -3258,9 +4193,21 @@ def _preprocess_spawn_positions(
             expected_town=args.expected_town,
         )
     except Exception as exc:
-        print(f"[WARN] spawn preprocess failed to connect to CARLA: {exc}")
+        msg = f"spawn preprocess failed to connect to CARLA: {exc}"
+        if bool(getattr(args, "spawn_preprocess_require_carla", False)):
+            raise RuntimeError(msg) from exc
+        print(f"[WARN] {msg}")
         report["summary"]["status"] = "skipped_carla_connect"
         return report
+
+    try:
+        map_name = world_map.name if world_map is not None else "unknown"
+    except Exception:
+        map_name = "unknown"
+    print(
+        f"[SPAWN_PRE] Connected to CARLA {args.carla_host}:{int(args.carla_port)} "
+        f"(map={map_name})"
+    )
 
     blueprint_lib = world.get_blueprint_library() if world else None
 
@@ -3390,10 +4337,23 @@ def _preprocess_spawn_positions(
         "snap_ego_to_lane": bool(getattr(args, "snap_ego_to_lane", False)),
         "align_ego_smooth_window": int(getattr(args, "spawn_preprocess_align_ego_smooth_window", 9)),
         "align_ego_max_step_delta": float(getattr(args, "spawn_preprocess_align_ego_max_step_delta", 0.45)),
+        "static_path_threshold": float(getattr(args, "static_path_threshold", 1.2)),
+        "static_net_disp_threshold": float(getattr(args, "static_net_disp_threshold", 0.8)),
+        "static_bbox_extent_threshold": float(getattr(args, "static_bbox_extent_threshold", 0.9)),
+        "static_avg_speed_threshold": float(getattr(args, "static_avg_speed_threshold", 0.8)),
+        "static_heavy_path_threshold": float(getattr(args, "static_heavy_path_threshold", 8.0)),
+        "static_heavy_bbox_extent_threshold": float(getattr(args, "static_heavy_bbox_extent_threshold", 1.2)),
+        "static_heavy_avg_speed_threshold": float(getattr(args, "static_heavy_avg_speed_threshold", 0.8)),
         "refine_piecewise": refine_piecewise,
         "refine_max_local": refine_max_local,
         "refine_smooth_window": refine_smooth_window,
         "refine_max_step_delta": refine_max_step_delta,
+        "refine_early_lane_lock_seconds": float(
+            getattr(args, "spawn_preprocess_refine_early_lane_lock_seconds", 1.0)
+        ),
+        "refine_early_lane_switch_override_margin": float(
+            getattr(args, "spawn_preprocess_refine_early_lane_switch_override_margin", 0.9)
+        ),
         "refine_collision_slack": refine_collision_slack,
         "bridge_max_gap_steps": bridge_max_gap_steps,
         "bridge_straight_thresh_deg": bridge_straight_thresh_deg,
@@ -3470,7 +4430,12 @@ def _preprocess_spawn_positions(
         if meta is None or not traj:
             continue
         kind = str(meta.get("kind"))
-        role = "npc" if kind in ("npc", "static") else "walker"
+        if kind == "npc":
+            role = "npc"
+        elif kind == "static":
+            role = "static"
+        else:
+            role = "walker"
         model = str(meta.get("model") or "")
         actor_report = {
             "kind": kind,
@@ -3915,7 +4880,15 @@ def _preprocess_spawn_positions(
                 continue
             times = times_cache.get(vid) or _ensure_times(traj, vehicle_times.get(vid), args.dt)
             kind = str(meta.get("kind") or "")
-            role = "npc" if kind in ("npc", "static") else "walker"
+            if kind != "npc":
+                entry = report["actors"].get(str(vid), {})
+                entry["refinement"] = {
+                    "accepted": False,
+                    "reason": "skipped_non_moving_kind",
+                    "kind": kind,
+                }
+                continue
+            role = "npc"
             always_active = kind in ("static", "walker_static")
 
             refined_offsets, refine_report = _compute_piecewise_actor_offsets(
@@ -3932,6 +4905,12 @@ def _preprocess_spawn_positions(
                 max_step_delta=refine_max_step_delta,
                 bridge_max_gap_steps=bridge_max_gap_steps,
                 bridge_straight_thresh_deg=bridge_straight_thresh_deg,
+                early_lane_lock_seconds=float(
+                    getattr(args, "spawn_preprocess_refine_early_lane_lock_seconds", 1.0)
+                ),
+                early_lane_switch_override_margin=float(
+                    getattr(args, "spawn_preprocess_refine_early_lane_switch_override_margin", 0.9)
+                ),
             )
             entry = report["actors"].get(str(vid), {})
             entry["refinement"] = refine_report
@@ -5686,6 +6665,48 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ego-model", default="vehicle.lincoln.mkz2017", help="Blueprint for ego vehicle")
     p.add_argument("--dt", type=float, default=0.1, help="Timestep spacing in seconds (for speed estimation)")
     p.add_argument(
+        "--static-path-threshold",
+        type=float,
+        default=1.2,
+        help="Classify vehicle as static if total XY path length stays below this threshold and net displacement is small.",
+    )
+    p.add_argument(
+        "--static-net-disp-threshold",
+        type=float,
+        default=0.8,
+        help="Max XY start-to-end displacement (meters) for vehicle static classification.",
+    )
+    p.add_argument(
+        "--static-bbox-extent-threshold",
+        type=float,
+        default=0.9,
+        help="Max XY bounding-box extent (meters) for noisy-in-place static fallback classification.",
+    )
+    p.add_argument(
+        "--static-avg-speed-threshold",
+        type=float,
+        default=0.8,
+        help="Max average speed (m/s) for noisy-in-place static fallback classification.",
+    )
+    p.add_argument(
+        "--static-heavy-path-threshold",
+        type=float,
+        default=8.0,
+        help="For heavy vehicles (truck/bus/etc), max XY path length (meters) for parked/static fallback classification.",
+    )
+    p.add_argument(
+        "--static-heavy-bbox-extent-threshold",
+        type=float,
+        default=1.2,
+        help="For heavy vehicles (truck/bus/etc), max XY compact-extent (meters) for parked/static fallback classification.",
+    )
+    p.add_argument(
+        "--static-heavy-avg-speed-threshold",
+        type=float,
+        default=0.8,
+        help="For heavy vehicles (truck/bus/etc), max avg speed (m/s) for parked/static fallback classification.",
+    )
+    p.add_argument(
         "--encode-timing",
         action="store_true",
         help="Embed per-waypoint timing in XML using frame index * dt (enables log replay).",
@@ -5944,6 +6965,20 @@ def parse_args() -> argparse.Namespace:
         help="Run CARLA-in-the-loop spawn preprocessing to improve actor spawn success.",
     )
     p.add_argument(
+        "--spawn-preprocess-require-carla",
+        action="store_true",
+        help="Fail export if spawn preprocessing cannot import/connect CARLA (instead of skipping).",
+    )
+    p.add_argument(
+        "--spawn-preprocess-maximal",
+        action="store_true",
+        help=(
+            "Enable an aggressive CARLA-in-the-loop preprocessing preset: "
+            "strict CARLA connectivity, higher candidate/refinement budgets, "
+            "and timing optimizations."
+        ),
+    )
+    p.add_argument(
         "--spawn-preprocess-report",
         default=None,
         help="Optional JSON report path for spawn preprocessing results.",
@@ -6107,6 +7142,18 @@ def parse_args() -> argparse.Namespace:
         help="Max change (m) between adjacent actor offsets in piecewise refinement (default: 0.35).",
     )
     p.add_argument(
+        "--spawn-preprocess-refine-early-lane-lock-seconds",
+        type=float,
+        default=1.0,
+        help="For NPC/static piecewise refinement, keep initial lane for this many seconds unless alternative is clearly better (default: 1.0).",
+    )
+    p.add_argument(
+        "--spawn-preprocess-refine-early-lane-switch-override-margin",
+        type=float,
+        default=0.9,
+        help="Minimum score improvement required to allow early lane switch during initial-lane lock (default: 0.9).",
+    )
+    p.add_argument(
         "--spawn-preprocess-refine-collision-slack",
         type=float,
         default=0.0,
@@ -6162,12 +7209,59 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--snap-ego-to-lane",
+        dest="snap_ego_to_lane",
         action="store_true",
-        default=False,
         help=(
             "When aligning ego trajectories, lock snapping to a continuous forward lane-center path "
-            "(prevents lane changes while still allowing turns)."
+            "(prevents lane changes while still allowing turns; default: enabled)."
         ),
+    )
+    p.add_argument(
+        "--no-snap-ego-to-lane",
+        dest="snap_ego_to_lane",
+        action="store_false",
+        help="Disable continuous lane-lock snapping for ego trajectories.",
+    )
+    p.set_defaults(snap_ego_to_lane=True)
+    p.add_argument(
+        "--parked-clearance",
+        dest="parked_clearance",
+        action="store_true",
+        help=(
+            "For static parked/off-side vehicles, apply minimal XY nudges when alignment introduces "
+            "new bounding-box interference with moving vehicle paths (default: enabled)."
+        ),
+    )
+    p.add_argument(
+        "--no-parked-clearance",
+        dest="parked_clearance",
+        action="store_false",
+        help="Disable parked/off-side clearance nudging.",
+    )
+    p.set_defaults(parked_clearance=True)
+    p.add_argument(
+        "--parked-clearance-sample-dt",
+        type=float,
+        default=0.2,
+        help="Sampling timestep (seconds) for parked clearance overlap checks (default: 0.2).",
+    )
+    p.add_argument(
+        "--parked-clearance-max-shift",
+        type=float,
+        default=1.0,
+        help="Maximum XY nudge (meters) allowed for parked clearance adjustment (default: 1.0).",
+    )
+    p.add_argument(
+        "--parked-clearance-shift-step",
+        type=float,
+        default=0.15,
+        help="Search step (meters) for parked clearance shift candidates (default: 0.15).",
+    )
+    p.add_argument(
+        "--parked-clearance-angle-count",
+        type=int,
+        default=16,
+        help="Number of angular directions sampled per parked-clearance radius (default: 16).",
     )
     p.add_argument(
         "--spawn-preprocess-normalize-z",
@@ -6216,6 +7310,58 @@ def _parse_id_list(raw: str) -> List[int]:
         except Exception:
             continue
     return ids
+
+
+def _apply_spawn_preprocess_maximal_profile(args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "spawn_preprocess_maximal", False)):
+        return
+
+    args.spawn_preprocess = True
+    args.spawn_preprocess_require_carla = True
+    args.use_carla_map = True
+    args.encode_timing = True
+    args.maximize_safe_early_spawn = True
+    args.maximize_safe_late_despawn = True
+
+    args.spawn_preprocess_align = True
+    args.spawn_preprocess_align_ego = True
+    args.spawn_preprocess_align_ego_piecewise = True
+    args.spawn_preprocess_refine_piecewise = True
+    args.spawn_preprocess_normalize_z = True
+    args.snap_ego_to_lane = True
+    args.parked_clearance = True
+
+    args.spawn_preprocess_max_shift = max(float(args.spawn_preprocess_max_shift), 5.0)
+    args.spawn_preprocess_random_samples = max(int(args.spawn_preprocess_random_samples), 160)
+    args.spawn_preprocess_max_candidates = max(int(args.spawn_preprocess_max_candidates), 120)
+    args.spawn_preprocess_sample_dt = min(float(args.spawn_preprocess_sample_dt), 0.35)
+    args.spawn_preprocess_align_samples = max(int(args.spawn_preprocess_align_samples), 18)
+    args.spawn_preprocess_align_windows = max(int(args.spawn_preprocess_align_windows), 5)
+    args.spawn_preprocess_align_neighbor_radius = max(
+        float(args.spawn_preprocess_align_neighbor_radius), 8.0
+    )
+    args.spawn_preprocess_align_neighbor_weight = max(
+        float(args.spawn_preprocess_align_neighbor_weight), 0.22
+    )
+    args.spawn_preprocess_refine_max_local = max(float(args.spawn_preprocess_refine_max_local), 1.0)
+    args.spawn_preprocess_refine_smooth_window = max(int(args.spawn_preprocess_refine_smooth_window), 11)
+    args.spawn_preprocess_refine_max_step_delta = min(
+        float(args.spawn_preprocess_refine_max_step_delta), 0.25
+    )
+    args.spawn_preprocess_align_ego_smooth_window = max(
+        int(args.spawn_preprocess_align_ego_smooth_window), 13
+    )
+    args.spawn_preprocess_align_ego_max_step_delta = min(
+        float(args.spawn_preprocess_align_ego_max_step_delta), 0.30
+    )
+    args.spawn_preprocess_bridge_max_gap_steps = max(int(args.spawn_preprocess_bridge_max_gap_steps), 8)
+    args.spawn_preprocess_bridge_straight_thresh_deg = min(
+        float(args.spawn_preprocess_bridge_straight_thresh_deg), 15.0
+    )
+    args.early_spawn_safety_margin = max(float(args.early_spawn_safety_margin), 0.30)
+    args.late_despawn_safety_margin = max(float(args.late_despawn_safety_margin), 0.30)
+
+    print("[INFO] Enabled maximal spawn preprocess profile (strict CARLA connectivity).")
 
 
 def pick_yaml_dirs(scenario_dir: Path, chosen: str | None) -> List[Path]:
@@ -7096,6 +8242,7 @@ def fetch_carla_map_lines(
 
 def main() -> None:
     args = parse_args()
+    _apply_spawn_preprocess_maximal_profile(args)
     scenario_dir = Path(args.scenario_dir).expanduser().resolve()
     yaml_dirs = pick_yaml_dirs(scenario_dir, args.subdir)
     out_dir = Path(args.out_dir or (scenario_dir / "carla_log_export")).resolve()
@@ -7211,7 +8358,19 @@ def main() -> None:
         if not is_vehicle_type(obj_type_raw):
             skipped_non_vehicles += 1
             continue
-        kind, is_ped = _classify_actor_kind(traj, obj_type_raw)
+        kind, is_ped, motion_stats = _classify_actor_kind(
+            traj,
+            obj_type_raw,
+            times=vehicle_times.get(vid),
+            default_dt=float(args.dt),
+            static_path_threshold=float(getattr(args, "static_path_threshold", 1.2)),
+            static_net_disp_threshold=float(getattr(args, "static_net_disp_threshold", 0.8)),
+            static_bbox_extent_threshold=float(getattr(args, "static_bbox_extent_threshold", 0.9)),
+            static_avg_speed_threshold=float(getattr(args, "static_avg_speed_threshold", 0.8)),
+            static_heavy_path_threshold=float(getattr(args, "static_heavy_path_threshold", 8.0)),
+            static_heavy_bbox_extent_threshold=float(getattr(args, "static_heavy_bbox_extent_threshold", 1.2)),
+            static_heavy_avg_speed_threshold=float(getattr(args, "static_heavy_avg_speed_threshold", 0.8)),
+        )
         model = info.get("model") or map_obj_type(obj_type_raw)
         actor_meta_by_id[vid] = {
             "kind": kind,
@@ -7220,10 +8379,29 @@ def main() -> None:
             "model": model,
             "length": info.get("length"),
             "width": info.get("width"),
+            "motion_path_m": float(motion_stats.get("path_dist", 0.0)),
+            "motion_net_m": float(motion_stats.get("net_disp_xy", 0.0)),
+            "motion_bbox_m": float(motion_stats.get("bbox_extent_xy", 0.0)),
+            "motion_avg_speed_mps": float(motion_stats.get("avg_speed_mps", 0.0)),
         }
 
     if skipped_non_vehicles > 0:
         print(f"[INFO] Skipped {skipped_non_vehicles} non-actor objects (props, static objects, etc.)")
+
+    walker_diversity_stats = _diversify_nearby_walker_models(
+        actor_meta_by_id=actor_meta_by_id,
+        vehicles=vehicles,
+        near_distance_m=WALKER_MODEL_NEAR_DISTANCE_M,
+    )
+    if walker_diversity_stats.get("walkers", 0) > 0:
+        print(
+            "[INFO] Walker model diversity: "
+            f"walkers={walker_diversity_stats.get('walkers', 0)}, "
+            f"near_pairs={walker_diversity_stats.get('near_pairs', 0)}, "
+            f"same_model_pairs={walker_diversity_stats.get('same_pairs_before', 0)}"
+            f"->{walker_diversity_stats.get('same_pairs_after', 0)}, "
+            f"models_changed={walker_diversity_stats.get('models_changed', 0)}"
+        )
 
     # Keep a copy for diagnostics/visualization (pre-spawn-preprocess state).
     ego_trajs_pre_align = [
@@ -7427,6 +8605,16 @@ def main() -> None:
         except Exception as exc:
             print(f"[WARN] Failed to write late-despawn report: {exc}")
 
+    parked_clearance_report: Dict[str, object] = {}
+    vehicles_export, parked_clearance_report = _apply_parked_vehicle_path_clearance(
+        vehicles_aligned=vehicles_export,
+        vehicle_times_aligned=vehicle_times_export,
+        vehicles_original=vehicles_pre_align,
+        vehicle_times_original=vehicle_times,
+        actor_meta=actor_meta_by_id,
+        args=args,
+    )
+
     # Write ego route (optional)
     ego_entries: List[dict] = []
     if not args.no_ego and ego_trajs:
@@ -7467,6 +8655,7 @@ def main() -> None:
     actors_by_kind: Dict[str, List[dict]] = {}
     actor_kind_by_id: Dict[int, str] = {}
     actor_xml_by_id: Dict[int, Path] = {}
+    frozen_static_exports = 0
 
     if args.ego_only and actors_dir.exists():
         removed = 0
@@ -7505,35 +8694,44 @@ def main() -> None:
         kind_dir.mkdir(parents=True, exist_ok=True)
         actor_xml = kind_dir / f"{name}.xml"
 
+        traj_for_export = traj
+        times_for_export = vehicle_times_export.get(vid) if args.encode_timing else None
+        if kind in ("static", "walker_static") and len(traj) > 1:
+            # Keep parked/static actors fixed over time to avoid replaying lidar jitter.
+            anchor = _copy_waypoint(traj[0])
+            traj_for_export = [_copy_waypoint(anchor) for _ in range(len(traj))]
+            if times_for_export and len(times_for_export) != len(traj_for_export):
+                times_for_export = _ensure_times(traj_for_export, times_for_export, args.dt)
+            frozen_static_exports += 1
+
         write_route_xml(
             actor_xml,
             route_id=args.route_id,
             role=kind,
             town=args.town,
-            waypoints=traj,
-            times=vehicle_times_export.get(vid) if args.encode_timing else None,
+            waypoints=traj_for_export,
+            times=times_for_export,
             snap_to_road=args.snap_to_road is True,
             xml_tx=args.xml_tx,
             xml_ty=args.xml_ty,
         )
         actor_xml_by_id[vid] = actor_xml
         speed = 0.0
-        if len(traj) >= 2:
+        if len(traj_for_export) >= 2:
             dist = 0.0
-            for a, b in zip(traj, traj[1:]):
+            for a, b in zip(traj_for_export, traj_for_export[1:]):
                 dist += euclid3((a.x, a.y, a.z), (b.x, b.y, b.z))
             if args.encode_timing:
-                times = vehicle_times_export.get(vid)
-                if times and len(times) == len(traj):
-                    total_time = times[-1] - times[0]
+                if times_for_export and len(times_for_export) == len(traj_for_export):
+                    total_time = times_for_export[-1] - times_for_export[0]
                     if total_time > 1e-6:
                         speed = dist / total_time
                     else:
-                        speed = dist / max(args.dt * (len(traj) - 1), 1e-6)
+                        speed = dist / max(args.dt * (len(traj_for_export) - 1), 1e-6)
                 else:
-                    speed = dist / max(args.dt * (len(traj) - 1), 1e-6)
+                    speed = dist / max(args.dt * (len(traj_for_export) - 1), 1e-6)
             else:
-                speed = dist / max(args.dt * (len(traj) - 1), 1e-6)
+                speed = dist / max(args.dt * (len(traj_for_export) - 1), 1e-6)
         
         entry = {
             "file": str(actor_xml.relative_to(out_dir)),
@@ -7556,6 +8754,12 @@ def main() -> None:
             actors_by_kind[kind] = []
         actors_by_kind[kind].append(entry)
         actor_kind_by_id[vid] = kind
+
+    if frozen_static_exports > 0:
+        print(
+            f"[INFO] Froze waypoint jitter for {frozen_static_exports} static actor trajectories "
+            "(position held fixed across timestamps)."
+        )
 
     save_manifest(out_dir / "actors_manifest.json", actors_by_kind, ego_entries)
 

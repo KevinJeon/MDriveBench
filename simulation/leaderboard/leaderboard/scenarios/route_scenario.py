@@ -83,20 +83,123 @@ def _resolve_ground_z(world: Optional[carla.World], location: carla.Location) ->
             )
             hits = cast_ray(start, end)
             if hits:
-                best_z = None
-                best_dist = None
+                top_z = None
                 for hit in hits:
                     hit_loc = getattr(hit, "location", None) or getattr(hit, "point", None)
                     if hit_loc is None:
                         continue
-                    dz = abs(float(hit_loc.z) - float(location.z))
-                    if best_dist is None or dz < best_dist:
-                        best_dist = dz
-                        best_z = float(hit_loc.z)
-                if best_z is not None:
-                    return best_z
+                    z_val = float(hit_loc.z)
+                    if top_z is None or z_val > top_z:
+                        top_z = z_val
+                if top_z is not None:
+                    return float(top_z)
         except Exception:  # pylint: disable=broad-except
             pass
+    return None
+
+
+def _ground_obstacle_clip_height() -> float:
+    """
+    Height threshold (meters) used to ignore obstacle-top ray hits when gluing actors
+    to the ground. If the ray hit is this much above nearby lane/sidewalk projection,
+    we prefer the map projection instead.
+    """
+    try:
+        value = float(os.environ.get("CUSTOM_LOG_REPLAY_GROUND_OBSTACLE_CLIP_Z", "0.35"))
+    except Exception:  # pylint: disable=broad-except
+        value = 0.35
+    return max(0.0, float(value))
+
+
+def _ground_ray_vehicle_clip_height() -> float:
+    """
+    If ray-ground is this much above map-ground, treat it as an obstacle-top hit
+    for vehicles and keep map-ground instead.
+    """
+    try:
+        value = float(os.environ.get("CUSTOM_LOG_REPLAY_GROUND_RAY_VEHICLE_CLIP_Z", "0.60"))
+    except Exception:  # pylint: disable=broad-except
+        value = 0.60
+    return max(0.0, float(value))
+
+
+def _ground_junction_vehicle_lift() -> float:
+    """
+    Extra Z lift (meters) for vehicles inside junctions/intersections.
+    Helps avoid visible wheel/body clipping from local junction mesh artifacts.
+    """
+    try:
+        value = float(os.environ.get("CUSTOM_LOG_REPLAY_GROUND_JUNCTION_LIFT_Z", "0.04"))
+    except Exception:  # pylint: disable=broad-except
+        value = 0.04
+    return max(0.0, float(value))
+
+
+def _resolve_map_z(
+    world_map: Optional[carla.Map],
+    location: carla.Location,
+    lane_type: carla.LaneType,
+) -> Optional[float]:
+    if world_map is None:
+        return None
+
+    def _get_waypoint_z(query_lane_type: carla.LaneType) -> Optional[float]:
+        try:
+            snapped_wp = world_map.get_waypoint(
+                location,
+                project_to_road=True,
+                lane_type=query_lane_type,
+            )
+        except Exception:  # pylint: disable=broad-except
+            snapped_wp = None
+        if snapped_wp is None:
+            return None
+        try:
+            return float(snapped_wp.transform.location.z)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    map_z = _get_waypoint_z(lane_type)
+    if map_z is None and lane_type != carla.LaneType.Any:
+        map_z = _get_waypoint_z(carla.LaneType.Any)
+    return map_z
+
+
+def _select_ground_z(
+    *,
+    world: Optional[carla.World],
+    world_map: Optional[carla.Map],
+    location: carla.Location,
+    lane_type: carla.LaneType,
+    prefer_ray_ground: bool,
+) -> Optional[float]:
+    """
+    Pick a robust ground estimate at the requested location.
+    For walkers, we still prefer ray-ground, but we reject ray hits that are
+    significantly above nearby drivable/sidewalk projections (typically obstacle tops).
+    """
+    ground_z = _resolve_ground_z(world, location)
+    map_z = _resolve_map_z(world_map, location, lane_type)
+
+    if ground_z is None and map_z is None:
+        return None
+
+    if prefer_ray_ground and ground_z is not None:
+        if map_z is not None and float(ground_z) > float(map_z) + _ground_obstacle_clip_height():
+            return float(map_z)
+        return float(ground_z)
+
+    # Vehicles: use a conservative fusion that avoids clipping into road mesh.
+    # Keep map-z when ray appears to be obstacle-top, otherwise use the higher
+    # of map/ray so we do not sink below rendered asphalt at intersections.
+    if map_z is not None and ground_z is not None:
+        if float(ground_z) > float(map_z) + _ground_ray_vehicle_clip_height():
+            return float(map_z)
+        return float(max(float(map_z), float(ground_z)))
+    if map_z is not None:
+        return float(map_z)
+    if ground_z is not None:
+        return float(ground_z)
     return None
 
 
@@ -116,26 +219,49 @@ def _glue_plan_to_ground(
         base_offset = float(bbox.extent.z) - float(bbox.location.z)
     except Exception:  # pylint: disable=broad-except
         base_offset = 0.0
+    is_vehicle = _is_vehicle_actor(actor)
+    junction_lift = _ground_junction_vehicle_lift() if is_vehicle else 0.0
     for tf in plan:
-        candidates: list[float] = []
-        ground_z = _resolve_ground_z(world, tf.location)
-        if ground_z is not None:
-            candidates.append(ground_z)
-        if world_map is not None:
-            snapped_wp = world_map.get_waypoint(
-                tf.location,
-                project_to_road=True,
-                lane_type=lane_type,
-            )
-            if snapped_wp is not None:
-                candidates.append(float(snapped_wp.transform.location.z))
-        if not candidates:
+        target_z = _select_ground_z(
+            world=world,
+            world_map=world_map,
+            location=tf.location,
+            lane_type=lane_type,
+            prefer_ray_ground=bool(prefer_ray_ground),
+        )
+        if target_z is None:
             continue
-        if prefer_ray_ground and ground_z is not None:
-            target_z = float(ground_z)
-        else:
-            target_z = min(candidates, key=lambda z: abs(z - float(tf.location.z)))
-        tf.location.z = float(target_z) + base_offset + float(z_extra)
+        extra_z = float(z_extra)
+        if (
+            is_vehicle
+            and junction_lift > 1e-6
+            and world_map is not None
+        ):
+            wp_probe = None
+            try:
+                wp_probe = world_map.get_waypoint(
+                    tf.location,
+                    project_to_road=True,
+                    lane_type=lane_type,
+                )
+            except Exception:  # pylint: disable=broad-except
+                wp_probe = None
+            if wp_probe is None and lane_type != carla.LaneType.Any:
+                try:
+                    wp_probe = world_map.get_waypoint(
+                        tf.location,
+                        project_to_road=True,
+                        lane_type=carla.LaneType.Any,
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    wp_probe = None
+            if wp_probe is not None:
+                try:
+                    if bool(getattr(wp_probe, "is_junction", False)):
+                        extra_z += float(junction_lift)
+                except Exception:  # pylint: disable=broad-except
+                    pass
+        tf.location.z = float(target_z) + base_offset + float(extra_z)
 
 
 def _interp_angle(a: float, b: float, alpha: float) -> float:
@@ -182,6 +308,15 @@ def _is_walker_actor(actor: Optional[carla.Actor]) -> bool:
         pass
     try:
         return str(actor.type_id).startswith("walker.")
+    except Exception:  # pylint: disable=broad-except
+        return False
+
+
+def _is_vehicle_actor(actor: Optional[carla.Actor]) -> bool:
+    if actor is None:
+        return False
+    try:
+        return str(actor.type_id).startswith("vehicle.")
     except Exception:  # pylint: disable=broad-except
         return False
 
@@ -288,6 +423,211 @@ def _turn_angle_deg(prev_tf: carla.Transform, cur_tf: carla.Transform, next_tf: 
         )
     )
     return abs(_delta_angle_deg(h1, h0))
+
+
+def _point_to_segment_distance_xy(
+    point_x: float,
+    point_y: float,
+    start_x: float,
+    start_y: float,
+    end_x: float,
+    end_y: float,
+) -> float:
+    cx, cy = _closest_point_on_segment_xy(point_x, point_y, start_x, start_y, end_x, end_y)
+    return math.hypot(float(point_x) - float(cx), float(point_y) - float(cy))
+
+
+def _simplify_vehicle_path_temporal(
+    transforms: List[carla.Transform],
+    times: Optional[List[float]],
+    *,
+    epsilon_m: float,
+    max_gap_seconds: float,
+    keep_turn_angle_deg: float,
+) -> List[carla.Transform]:
+    """
+    Simplify noisy XY paths via turn-aware RDP and resample back onto original
+    timestamps. This smooths high-frequency jitter while preserving maneuver intent.
+    """
+    n = len(transforms)
+    if n < 3:
+        return [_copy_transform(tf) for tf in transforms]
+
+    eps = max(0.0, float(epsilon_m))
+    if eps <= 1e-4:
+        return [_copy_transform(tf) for tf in transforms]
+
+    has_times = bool(times) and len(times) == n
+    if has_times:
+        t_vals = [float(t) for t in times]  # type: ignore[arg-type]
+    else:
+        t_vals = [float(i) for i in range(n)]
+
+    keep_turn_angle_deg = max(0.0, float(keep_turn_angle_deg))
+    forced_keep: set[int] = {0, n - 1}
+    for idx in range(1, n - 1):
+        if _turn_angle_deg(transforms[idx - 1], transforms[idx], transforms[idx + 1]) >= keep_turn_angle_deg:
+            forced_keep.add(idx)
+
+    pts = [(float(tf.location.x), float(tf.location.y)) for tf in transforms]
+
+    keep_idx: set[int] = set()
+
+    def _rdp(start_idx: int, end_idx: int) -> None:
+        if end_idx <= start_idx + 1:
+            keep_idx.add(start_idx)
+            keep_idx.add(end_idx)
+            return
+        sx, sy = pts[start_idx]
+        ex, ey = pts[end_idx]
+        best_i = None
+        best_d = -1.0
+        for i in range(start_idx + 1, end_idx):
+            if i in forced_keep:
+                best_i = i
+                best_d = eps + 1.0
+                break
+            px, py = pts[i]
+            d = _point_to_segment_distance_xy(px, py, sx, sy, ex, ey)
+            if d > best_d:
+                best_d = d
+                best_i = i
+        if best_i is None or best_d <= eps:
+            keep_idx.add(start_idx)
+            keep_idx.add(end_idx)
+            return
+        _rdp(start_idx, int(best_i))
+        _rdp(int(best_i), end_idx)
+
+    _rdp(0, n - 1)
+    keep_idx.update(forced_keep)
+    key_indices = sorted(int(i) for i in keep_idx)
+
+    max_gap_seconds = max(0.0, float(max_gap_seconds))
+    if max_gap_seconds > 1e-5:
+        densified: List[int] = [key_indices[0]]
+        for idx in key_indices[1:]:
+            prev = densified[-1]
+            t0 = t_vals[prev]
+            t1 = t_vals[idx]
+            dt = float(t1) - float(t0)
+            if dt > max_gap_seconds and idx > prev + 1:
+                steps = int(math.floor(dt / max_gap_seconds))
+                for step in range(1, steps + 1):
+                    alpha = float(step) / float(steps + 1)
+                    target_t = float(t0) + alpha * dt
+                    best_mid = min(
+                        range(prev + 1, idx),
+                        key=lambda j: abs(float(t_vals[j]) - target_t),
+                    )
+                    if best_mid not in densified:
+                        densified.append(int(best_mid))
+            densified.append(int(idx))
+        key_indices = sorted(set(densified))
+
+    if len(key_indices) < 2:
+        return [_copy_transform(tf) for tf in transforms]
+
+    key_t = [float(t_vals[i]) for i in key_indices]
+    key_x = [float(transforms[i].location.x) for i in key_indices]
+    key_y = [float(transforms[i].location.y) for i in key_indices]
+    key_z = [float(transforms[i].location.z) for i in key_indices]
+
+    key_yaw_unwrapped: List[float] = []
+    for pos, idx in enumerate(key_indices):
+        yaw_rad = math.radians(float(transforms[idx].rotation.yaw))
+        if pos == 0:
+            key_yaw_unwrapped.append(float(yaw_rad))
+        else:
+            prev_idx = key_indices[pos - 1]
+            prev_raw = math.radians(float(transforms[prev_idx].rotation.yaw))
+            prev_unwrapped = key_yaw_unwrapped[-1]
+            key_yaw_unwrapped.append(_unwrap_angle_rad(yaw_rad, prev_raw, prev_unwrapped))
+
+    out = [_copy_transform(tf) for tf in transforms]
+    seg = 0
+    for i in range(n):
+        ti = float(t_vals[i])
+        while seg + 1 < len(key_t) and key_t[seg + 1] < ti:
+            seg += 1
+        if seg + 1 >= len(key_t):
+            seg = len(key_t) - 2
+        t0 = key_t[seg]
+        t1 = key_t[seg + 1]
+        if t1 <= t0 + 1e-9:
+            alpha = 0.0
+        else:
+            alpha = (ti - t0) / (t1 - t0)
+        alpha = max(0.0, min(1.0, float(alpha)))
+
+        out[i].location.x = key_x[seg] + (key_x[seg + 1] - key_x[seg]) * alpha
+        out[i].location.y = key_y[seg] + (key_y[seg + 1] - key_y[seg]) * alpha
+        out[i].location.z = key_z[seg] + (key_z[seg + 1] - key_z[seg]) * alpha
+
+        yaw_u = key_yaw_unwrapped[seg] + (key_yaw_unwrapped[seg + 1] - key_yaw_unwrapped[seg]) * alpha
+        out[i].rotation.yaw = _wrap_angle_deg(float(yaw_u))
+
+    out[0] = _copy_transform(transforms[0])
+    out[-1] = _copy_transform(transforms[-1])
+    return out
+
+
+def _suppress_vehicle_detour_noise(
+    transforms: List[carla.Transform],
+    *,
+    detour_excess_m: float,
+    short_segment_m: float,
+    passes: int,
+) -> List[carla.Transform]:
+    """
+    Remove short zig-zag/backtracking detours from vehicle XY paths while preserving
+    overall maneuver shape. This is applied before final yaw stabilization.
+    """
+    if len(transforms) < 3:
+        return [_copy_transform(tf) for tf in transforms]
+
+    out = [_copy_transform(tf) for tf in transforms]
+    detour_excess_m = max(0.0, float(detour_excess_m))
+    short_segment_m = max(0.05, float(short_segment_m))
+    passes = max(1, int(passes))
+
+    if detour_excess_m <= 1e-6:
+        return out
+
+    for _ in range(passes):
+        src = [_copy_transform(tf) for tf in out]
+        changed = False
+        for idx in range(1, len(src) - 1):
+            prev_tf = src[idx - 1]
+            cur_tf = src[idx]
+            next_tf = src[idx + 1]
+
+            d_prev = _distance_xy(prev_tf, cur_tf)
+            d_next = _distance_xy(cur_tf, next_tf)
+            d_direct = _distance_xy(prev_tf, next_tf)
+            detour_excess = max(0.0, (d_prev + d_next) - d_direct)
+            if detour_excess < detour_excess_m:
+                continue
+            if min(d_prev, d_next) > short_segment_m:
+                continue
+
+            cx, cy = _closest_point_on_segment_xy(
+                float(cur_tf.location.x),
+                float(cur_tf.location.y),
+                float(prev_tf.location.x),
+                float(prev_tf.location.y),
+                float(next_tf.location.x),
+                float(next_tf.location.y),
+            )
+            out[idx].location.x = float(cx)
+            out[idx].location.y = float(cy)
+            changed = True
+        if not changed:
+            break
+
+    out[0] = _copy_transform(transforms[0])
+    out[-1] = _copy_transform(transforms[-1])
+    return out
 
 
 def _suppress_vehicle_lateral_jitter(
@@ -584,6 +924,95 @@ def _stabilize_near_static_vehicle_segments(
     return out
 
 
+def _stabilize_vehicle_yaw_from_motion(
+    transforms: List[carla.Transform],
+    times: Optional[List[float]],
+    *,
+    motion_min_speed: float,
+    motion_blend: float,
+    max_yaw_rate_deg_per_s: float,
+    heading_window: int = 3,
+) -> List[carla.Transform]:
+    """
+    Align yaw with smoothed XY motion to suppress noisy 180-degree yaw flips.
+    The heading from displacement is treated as front/back ambiguous and resolved
+    to remain close to the previous stabilized yaw.
+    """
+    if len(transforms) < 2:
+        return [_copy_transform(tf) for tf in transforms]
+
+    out = [_copy_transform(tf) for tf in transforms]
+    has_times = bool(times) and len(times) == len(out)
+    default_dt = 0.05
+    motion_min_speed = max(0.0, float(motion_min_speed))
+    motion_blend = max(0.0, min(1.0, float(motion_blend)))
+    max_yaw_rate = max(10.0, float(max_yaw_rate_deg_per_s))
+    heading_window = max(1, int(heading_window))
+
+    prev_yaw = float(out[0].rotation.yaw)
+    prev_time = float(times[0]) if has_times else 0.0
+    for idx in range(1, len(out)):
+        cur = out[idx]
+        prev = out[idx - 1]
+
+        if has_times:
+            cur_t = float(times[idx])
+            dt = max(1e-3, min(0.25, cur_t - prev_time))
+            prev_time = cur_t
+        else:
+            dt = default_dt
+
+        back_idx = max(0, idx - heading_window)
+        fwd_idx = min(len(out) - 1, idx + heading_window)
+        ref_a = out[back_idx]
+        ref_b = out[fwd_idx]
+        dx = float(ref_b.location.x) - float(ref_a.location.x)
+        dy = float(ref_b.location.y) - float(ref_a.location.y)
+        dist_xy = math.hypot(dx, dy)
+        if has_times and fwd_idx > back_idx:
+            dt_heading = max(1e-3, float(times[fwd_idx]) - float(times[back_idx]))  # type: ignore[index]
+        else:
+            dt_heading = max(default_dt, float(fwd_idx - back_idx) * default_dt)
+        speed_xy = dist_xy / max(1e-3, dt_heading)
+
+        yaw = float(cur.rotation.yaw)
+        if dist_xy > 1e-5 and speed_xy >= motion_min_speed:
+            motion_yaw = math.degrees(math.atan2(dy, dx))
+            alt_motion_yaw = _wrap_angle_deg(math.radians(motion_yaw + 180.0))
+            if abs(_delta_angle_deg(alt_motion_yaw, prev_yaw)) < abs(
+                _delta_angle_deg(motion_yaw, prev_yaw)
+            ):
+                motion_yaw = alt_motion_yaw
+            yaw_delta_to_motion = _delta_angle_deg(motion_yaw, yaw)
+            yaw = _wrap_angle_deg(math.radians(yaw + motion_blend * yaw_delta_to_motion))
+
+        max_step = max(5.0, max_yaw_rate * dt)
+        step_delta = _delta_angle_deg(yaw, prev_yaw)
+        if abs(step_delta) > max_step:
+            yaw = _wrap_angle_deg(
+                math.radians(prev_yaw + math.copysign(max_step, step_delta))
+            )
+        out[idx].rotation.yaw = float(yaw)
+        prev_yaw = float(yaw)
+
+    if len(out) >= 2:
+        dx0 = float(out[1].location.x) - float(out[0].location.x)
+        dy0 = float(out[1].location.y) - float(out[0].location.y)
+        if math.hypot(dx0, dy0) > 1e-5:
+            start_yaw = math.degrees(math.atan2(dy0, dx0))
+            alt_start = _wrap_angle_deg(math.radians(start_yaw + 180.0))
+            if abs(_delta_angle_deg(alt_start, float(out[1].rotation.yaw))) < abs(
+                _delta_angle_deg(start_yaw, float(out[1].rotation.yaw))
+            ):
+                start_yaw = alt_start
+            out[0].rotation.yaw = float(start_yaw)
+        else:
+            out[0].rotation.yaw = float(out[1].rotation.yaw)
+    else:
+        out[0].rotation.yaw = float(transforms[0].rotation.yaw)
+    return out
+
+
 def _smooth_vehicle_replay_plan(
     transforms: List[carla.Transform],
     times: Optional[List[float]],
@@ -607,6 +1036,17 @@ def _smooth_vehicle_replay_plan(
     lateral_max_correction: float = 0.40,
     lateral_turn_keep: float = 0.62,
     lateral_turn_angle_deg: float = 10.0,
+    motion_yaw_min_speed: float = 0.6,
+    motion_yaw_blend: float = 0.85,
+    motion_yaw_max_rate_deg_per_s: float = 120.0,
+    simplify_enabled: bool = True,
+    simplify_epsilon_m: float = 0.28,
+    simplify_max_gap_seconds: float = 1.2,
+    simplify_keep_turn_angle_deg: float = 22.0,
+    simplify_detour_excess_m: float = 0.22,
+    simplify_short_segment_m: float = 1.25,
+    simplify_detour_passes: int = 2,
+    yaw_follow_heading_window: int = 3,
 ) -> List[carla.Transform]:
     """
     Smooth replay transforms with adaptive filtering while preserving endpoints.
@@ -616,6 +1056,20 @@ def _smooth_vehicle_replay_plan(
         return [_copy_transform(tf) for tf in transforms]
 
     src = [_copy_transform(tf) for tf in transforms]
+    if simplify_enabled:
+        src = _simplify_vehicle_path_temporal(
+            src,
+            times,
+            epsilon_m=simplify_epsilon_m,
+            max_gap_seconds=simplify_max_gap_seconds,
+            keep_turn_angle_deg=simplify_keep_turn_angle_deg,
+        )
+        src = _suppress_vehicle_detour_noise(
+            src,
+            detour_excess_m=simplify_detour_excess_m,
+            short_segment_m=simplify_short_segment_m,
+            passes=simplify_detour_passes,
+        )
     out: List[carla.Transform] = []
 
     fx = _OneEuroScalar(min_cutoff=min_cutoff_xy, beta=beta_xy, d_cutoff=d_cutoff)
@@ -688,7 +1142,234 @@ def _smooth_vehicle_replay_plan(
             window_max_speed=static_window_max_speed,
             window_max_yaw_delta=static_window_max_yaw_delta,
         )
+    out = _stabilize_vehicle_yaw_from_motion(
+        out,
+        times,
+        motion_min_speed=motion_yaw_min_speed,
+        motion_blend=motion_yaw_blend,
+        max_yaw_rate_deg_per_s=motion_yaw_max_rate_deg_per_s,
+        heading_window=yaw_follow_heading_window,
+    )
     return out
+
+
+class StagedWaypointFollower(py_trees.behaviour.Behaviour):
+    """Wrapper that delays an actor's movement until its real-world start time.
+
+    This solves the fundamental timing mismatch: in the real data, some actors
+    only appear several seconds into the scenario.  Without staging, they all
+    spawn at t=0 and start driving immediately, creating impossible scenarios
+    (e.g., a car that should have already passed an intersection is instead
+    driving through it while pedestrians are crossing).
+
+    When *hide_underground* is ``True`` the actor is parked 500 m below ground
+    until its start time (used when the stationary actor would collide with
+    other actors' trajectories).  When ``False`` the actor stays visible at its
+    spawn position but with physics disabled — it simply waits there until its
+    time to start driving.
+
+    When *initial_speed* is provided, the actor is given that velocity at
+    activation time (in the direction it's facing), avoiding the PID warmup
+    delay that would otherwise cause timing drift.
+
+    The wrapper exposes the same py_trees lifecycle as a plain behaviour:
+    ``initialise()`` → ``update()`` → ``terminate()``.
+    """
+
+    def __init__(
+        self,
+        actor: carla.Actor,
+        start_time: float,
+        inner_behavior: py_trees.behaviour.Behaviour,
+        plan_transforms: "Optional[List[carla.Transform]]" = None,
+        name: str = "StagedWaypointFollower",
+        hide_underground: bool = True,
+        initial_speed: "Optional[float]" = None,
+    ):
+        super().__init__(name=name)
+        self._actor = actor
+        self._start_time = float(start_time)
+        self._inner = inner_behavior
+        self._plan_transforms = plan_transforms
+        self._hide_underground = hide_underground
+        self._initial_speed = float(initial_speed) if initial_speed is not None else None
+        self._staged = False
+        self._activated = False
+        self._stage_tf: Optional[carla.Transform] = None
+
+    def initialise(self):
+        try:
+            if self._hide_underground:
+                # Park the actor 500 m below ground
+                loc = self._actor.get_location()
+                self._stage_tf = carla.Transform(
+                    carla.Location(x=float(loc.x), y=float(loc.y), z=float(loc.z) - 500.0),
+                    carla.Rotation(),
+                )
+                self._actor.set_transform(self._stage_tf)
+            else:
+                # Keep visible at spawn position, just freeze in place
+                self._stage_tf = self._actor.get_transform()
+            self._actor.set_simulate_physics(False)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        self._staged = True
+        self._activated = False
+
+    def update(self):
+        if not self._staged:
+            self.initialise()
+
+        # Get simulation time from CarlaDataProvider
+        try:
+            sim_time = float(CarlaDataProvider.get_world().get_snapshot().elapsed_seconds)
+        except Exception:  # pylint: disable=broad-except
+            sim_time = 0.0
+
+        if sim_time < self._start_time:
+            # Keep the actor frozen (underground or at spawn position)
+            if self._stage_tf is not None:
+                try:
+                    self._actor.set_transform(self._stage_tf)
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            return py_trees.common.Status.RUNNING
+
+        # Time to activate!
+        if not self._activated:
+            # Teleport to the first plan waypoint
+            if self._plan_transforms and len(self._plan_transforms) > 0:
+                try:
+                    self._actor.set_transform(self._plan_transforms[0])
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            try:
+                self._actor.set_simulate_physics(True)
+            except Exception:  # pylint: disable=broad-except
+                pass
+            
+            # Apply initial velocity to avoid PID warmup delay
+            if self._initial_speed is not None and self._initial_speed > 0.1:
+                try:
+                    import math
+                    transform = self._actor.get_transform()
+                    yaw = transform.rotation.yaw * (math.pi / 180.0)
+                    vx = math.cos(yaw) * self._initial_speed
+                    vy = math.sin(yaw) * self._initial_speed
+                    self._actor.set_target_velocity(carla.Vector3D(vx, vy, 0))
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            
+            self._inner.initialise()
+            self._activated = True
+
+        return self._inner.update()
+
+    def terminate(self, new_status):
+        if self._activated:
+            try:
+                self._inner.terminate(new_status)
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+
+def _delayed_actor_interferes(actor_plan, all_actor_plans, collision_dist=3.5):
+    """Check whether a delayed-start actor, sitting stationary at its spawn
+    position, would collide with any other actor's trajectory during the
+    time window ``[0, start_time]``.
+
+    Returns ``True`` if the spawn position is within *collision_dist* metres
+    of any waypoint of any other actor during that window.
+    """
+    plan_times = actor_plan.get("plan_times") or []
+    start_time = float(plan_times[0]) if plan_times else 0.0
+    if start_time <= 0.5:
+        return False
+
+    spawn_tfs = actor_plan.get("plan_transforms")
+    if not spawn_tfs:
+        return False
+    sx = float(spawn_tfs[0].location.x)
+    sy = float(spawn_tfs[0].location.y)
+
+    for other in all_actor_plans:
+        if other is actor_plan:
+            continue
+        o_tfs = other.get("plan_transforms") or []
+        o_times = other.get("plan_times") or []
+        if not o_tfs or not o_times:
+            continue
+        for tf, t in zip(o_tfs, o_times):
+            t_f = float(t)
+            if t_f > start_time:
+                break  # no need to check beyond our start time
+            dx = float(tf.location.x) - sx
+            dy = float(tf.location.y) - sy
+            if dx * dx + dy * dy < collision_dist * collision_dist:
+                return True
+    return False
+
+
+def _make_plan_speed_callback(
+    plan_transforms: "Optional[List[carla.Transform]]",
+    plan_speeds: "Optional[List[float]]",
+    fallback_speed: float = 8.0,
+):
+    """Return a *speed_callback* for ``WaypointFollower`` that yields
+    per-segment speeds derived from the original log-replay trajectory.
+
+    The callback finds the plan waypoint closest to the actor's current
+    location and returns the pre-computed speed for that waypoint.  This
+    lets the physics-based PID controller drive at the correct speed for
+    each portion of the route.
+
+    If *plan_speeds* or *plan_transforms* are ``None`` (or empty), a
+    trivial ``lambda`` that returns the constant *fallback_speed* is
+    returned so that existing behaviour is preserved.
+    """
+    if (
+        not plan_speeds
+        or not plan_transforms
+        or len(plan_speeds) != len(plan_transforms)
+    ):
+        return lambda _actor: fallback_speed
+
+    # Pre-extract (x, y) pairs for fast nearest-neighbour lookup.
+    _pts = [
+        (float(tf.location.x), float(tf.location.y))
+        for tf in plan_transforms
+    ]
+    _spds = list(plan_speeds)
+    _n = len(_pts)
+
+    # ---- Cursor-based nearest-waypoint search ---------------------------------
+    # Vehicles only move *forward* along their plan, so we keep a cursor
+    # and only search a small window around it.  This is O(1) amortised
+    # per tick instead of O(n) brute-force.
+    _state = {"cursor": 0}
+    _SEARCH_RADIUS = 20  # waypoints to check around the cursor
+
+    def _callback(actor):
+        loc = actor.get_location()
+        ax, ay = float(loc.x), float(loc.y)
+
+        cur = _state["cursor"]
+        lo = max(0, cur - _SEARCH_RADIUS)
+        hi = min(_n, cur + _SEARCH_RADIUS)
+        best_d2 = float("inf")
+        best_idx = cur
+        for idx in range(lo, hi):
+            dx = _pts[idx][0] - ax
+            dy = _pts[idx][1] - ay
+            d2 = dx * dx + dy * dy
+            if d2 < best_d2:
+                best_d2 = d2
+                best_idx = idx
+
+        _state["cursor"] = best_idx
+        return max(0.0, _spds[best_idx])
+
+    return _callback
 
 
 def _make_stage_transform(index: int, base_transform: Optional[carla.Transform] = None) -> carla.Transform:
@@ -1125,23 +1806,14 @@ def _spawn_with_offsets(
             ),
         )
         if normalize_actor_z:
-            candidates: List[float] = []
-            ground_z = _resolve_ground_z(world, candidate.location)
-            if ground_z is not None:
-                candidates.append(float(ground_z))
-            if world_map is not None:
-                try:
-                    snapped_wp = world_map.get_waypoint(
-                        candidate.location,
-                        project_to_road=True,
-                        lane_type=lane_type,
-                    )
-                    if snapped_wp is not None:
-                        candidates.append(float(snapped_wp.transform.location.z))
-                except Exception:  # pylint: disable=broad-except
-                    pass
-            if candidates:
-                target_z = min(candidates, key=lambda z: abs(z - float(candidate.location.z)))
+            target_z = _select_ground_z(
+                world=world,
+                world_map=world_map,
+                location=candidate.location,
+                lane_type=lane_type,
+                prefer_ray_ground=False,
+            )
+            if target_z is not None:
                 candidate.location.z = float(target_z)
         try:
             actor = CarlaDataProvider.request_new_actor(
@@ -1196,6 +1868,7 @@ def _ground_actor_transform(
     world_map: Optional[carla.Map],
     world: Optional[carla.World],
     lane_type: carla.LaneType,
+    z_extra: float = 0.0,
 ) -> Optional[carla.Transform]:
     if actor is None:
         return None
@@ -1213,8 +1886,172 @@ def _ground_actor_transform(
             ),
         )
     ]
-    _glue_plan_to_ground(temp, actor, world_map, lane_type, world)
+    _glue_plan_to_ground(temp, actor, world_map, lane_type, world, z_extra=float(z_extra))
+    if temp and _is_vehicle_actor(actor):
+        temp[0] = _align_vehicle_transform_to_ground(
+            temp[0],
+            actor,
+            world=world,
+            world_map=world_map,
+            lane_type=lane_type,
+        )
     return temp[0] if temp else None
+
+
+def _align_vehicle_transform_to_ground(
+    target: carla.Transform,
+    actor: Optional[carla.Actor],
+    *,
+    world: Optional[carla.World],
+    world_map: Optional[carla.Map],
+    lane_type: carla.LaneType,
+) -> carla.Transform:
+    """
+    Estimate vehicle pitch/roll from local ground heights under four wheel-like points.
+    This keeps replay vehicles aligned to road inclines/camber while preserving replay yaw.
+    """
+    aligned = _copy_transform(target)
+    if actor is None or not _is_vehicle_actor(actor):
+        return aligned
+
+    try:
+        bbox = actor.bounding_box
+        bbox_center_x = float(bbox.location.x)
+        bbox_center_y = float(bbox.location.y)
+        bbox_bottom_z = float(bbox.location.z) - float(bbox.extent.z)
+        half_len = max(0.8, float(bbox.extent.x) * 0.92)
+        half_wid = max(0.5, float(bbox.extent.y) * 0.92)
+    except Exception:  # pylint: disable=broad-except
+        bbox_center_x = 0.0
+        bbox_center_y = 0.0
+        bbox_bottom_z = -1.0
+        half_len = 1.6
+        half_wid = 0.9
+
+    yaw_rad = math.radians(float(aligned.rotation.yaw))
+    fwd_x = math.cos(yaw_rad)
+    fwd_y = math.sin(yaw_rad)
+    right_x = -math.sin(yaw_rad)
+    right_y = math.cos(yaw_rad)
+
+    def _probe_height(forward_offset: float, right_offset: float) -> Optional[float]:
+        probe = carla.Location(
+            x=float(aligned.location.x) + fwd_x * float(forward_offset) + right_x * float(right_offset),
+            y=float(aligned.location.y) + fwd_y * float(forward_offset) + right_y * float(right_offset),
+            z=float(aligned.location.z),
+        )
+        z_val = _select_ground_z(
+            world=world,
+            world_map=world_map,
+            location=probe,
+            lane_type=lane_type,
+            prefer_ray_ground=False,
+        )
+        if z_val is None and lane_type != carla.LaneType.Any:
+            z_val = _select_ground_z(
+                world=world,
+                world_map=world_map,
+                location=probe,
+                lane_type=carla.LaneType.Any,
+                prefer_ray_ground=False,
+            )
+        return z_val
+
+    fl = _probe_height(half_len, -half_wid)
+    fr = _probe_height(half_len, half_wid)
+    rl = _probe_height(-half_len, -half_wid)
+    rr = _probe_height(-half_len, half_wid)
+
+    front_vals = [z for z in (fl, fr) if z is not None]
+    rear_vals = [z for z in (rl, rr) if z is not None]
+    left_vals = [z for z in (fl, rl) if z is not None]
+    right_vals = [z for z in (fr, rr) if z is not None]
+    if not front_vals or not rear_vals or not left_vals or not right_vals:
+        return aligned
+
+    front_z = float(sum(front_vals) / len(front_vals))
+    rear_z = float(sum(rear_vals) / len(rear_vals))
+    left_z = float(sum(left_vals) / len(left_vals))
+    right_z = float(sum(right_vals) / len(right_vals))
+
+    wheel_base = max(0.8, 2.0 * float(half_len))
+    track_width = max(0.6, 2.0 * float(half_wid))
+    pitch_est = math.degrees(math.atan2(front_z - rear_z, wheel_base))
+    roll_est = math.degrees(math.atan2(right_z - left_z, track_width))
+
+    try:
+        current_tf = actor.get_transform()
+        current_pitch = float(current_tf.rotation.pitch)
+        current_roll = float(current_tf.rotation.roll)
+    except Exception:  # pylint: disable=broad-except
+        current_pitch = float(aligned.rotation.pitch)
+        current_roll = float(aligned.rotation.roll)
+
+    try:
+        gain = float(os.environ.get("CUSTOM_LOG_REPLAY_GROUND_TILT_GAIN", "0.70"))
+    except Exception:  # pylint: disable=broad-except
+        gain = 0.70
+    gain = max(0.0, min(1.0, float(gain)))
+    try:
+        max_pitch = float(os.environ.get("CUSTOM_LOG_REPLAY_MAX_GROUND_PITCH_DEG", "18.0"))
+    except Exception:  # pylint: disable=broad-except
+        max_pitch = 18.0
+    try:
+        max_roll = float(os.environ.get("CUSTOM_LOG_REPLAY_MAX_GROUND_ROLL_DEG", "18.0"))
+    except Exception:  # pylint: disable=broad-except
+        max_roll = 18.0
+
+    pitch = current_pitch + gain * (float(pitch_est) - current_pitch)
+    roll = current_roll + gain * (float(roll_est) - current_roll)
+    pitch = max(-abs(float(max_pitch)), min(abs(float(max_pitch)), float(pitch)))
+    roll = max(-abs(float(max_roll)), min(abs(float(max_roll)), float(roll)))
+    if not (math.isfinite(pitch) and math.isfinite(roll)):
+        return aligned
+
+    aligned.rotation.pitch = float(pitch)
+    aligned.rotation.roll = float(roll)
+    try:
+        wheel_clearance = float(os.environ.get("CUSTOM_LOG_REPLAY_VEHICLE_GROUND_CLEARANCE", "0.04"))
+    except Exception:  # pylint: disable=broad-except
+        wheel_clearance = 0.04
+    wheel_clearance = max(0.0, float(wheel_clearance))
+
+    # After pitch/roll alignment, lift center-z if needed so wheel-contact points
+    # do not clip below local ground.
+    try:
+        wheel_specs = (
+            (half_len, -half_wid, fl),
+            (half_len, half_wid, fr),
+            (-half_len, -half_wid, rl),
+            (-half_len, half_wid, rr),
+        )
+        rot_tf = carla.Transform(
+            carla.Location(x=0.0, y=0.0, z=0.0),
+            carla.Rotation(
+                pitch=float(aligned.rotation.pitch),
+                yaw=float(aligned.rotation.yaw),
+                roll=float(aligned.rotation.roll),
+            ),
+        )
+        required_center_z = float(aligned.location.z)
+        for fwd_off, right_off, ground_val in wheel_specs:
+            if ground_val is None:
+                continue
+            local_pt = carla.Location(
+                x=float(bbox_center_x) + float(fwd_off),
+                y=float(bbox_center_y) + float(right_off),
+                z=float(bbox_bottom_z),
+            )
+            world_local = rot_tf.transform(local_pt)
+            z_offset = float(world_local.z)
+            need_z = float(ground_val) + float(wheel_clearance) - z_offset
+            if need_z > required_center_z:
+                required_center_z = float(need_z)
+        if required_center_z > float(aligned.location.z):
+            aligned.location.z = float(required_center_z)
+    except Exception:  # pylint: disable=broad-except
+        pass
+    return aligned
 
 
 class LogReplayFollower(py_trees.behaviour.Behaviour):
@@ -1248,6 +2085,8 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
         ground_world: Optional[carla.World] = None,
         ground_prefer_ray: bool = False,
         ground_z_extra: float = 0.0,
+        ground_align_vehicle_tilt: bool = True,
+        ground_smooth_vehicle_pose: bool = True,
         animate_walkers: Optional[bool] = None,
         walker_max_speed: Optional[float] = None,
         walker_teleport_distance: Optional[float] = None,
@@ -1275,6 +2114,54 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
         self._ground_world = ground_world
         self._ground_prefer_ray = bool(ground_prefer_ray)
         self._ground_z_extra = float(ground_z_extra)
+        self._ground_align_vehicle_tilt = bool(ground_align_vehicle_tilt)
+        self._ground_smooth_vehicle_pose = bool(ground_smooth_vehicle_pose)
+        try:
+            self._ground_z_up_rate = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_GROUND_Z_UP_RATE_MPS", "1.20")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._ground_z_up_rate = 1.20
+        try:
+            self._ground_z_down_rate = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_GROUND_Z_DOWN_RATE_MPS", "0.60")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._ground_z_down_rate = 0.60
+        try:
+            self._ground_pitch_rate = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_GROUND_PITCH_RATE_DPS", "16.0")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._ground_pitch_rate = 16.0
+        try:
+            self._ground_roll_rate = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_GROUND_ROLL_RATE_DPS", "18.0")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._ground_roll_rate = 18.0
+        try:
+            self._ground_tilt_blend = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_GROUND_TILT_BLEND", "0.32")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._ground_tilt_blend = 0.32
+        self._ground_z_up_rate = max(0.05, float(self._ground_z_up_rate))
+        self._ground_z_down_rate = max(0.02, float(self._ground_z_down_rate))
+        self._ground_pitch_rate = max(2.0, float(self._ground_pitch_rate))
+        self._ground_roll_rate = max(2.0, float(self._ground_roll_rate))
+        self._ground_tilt_blend = max(0.0, min(1.0, float(self._ground_tilt_blend)))
+        try:
+            self._ground_max_below_plan_z = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_GROUND_MAX_BELOW_PLAN_Z", "0.28")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._ground_max_below_plan_z = 0.28
+        self._ground_max_below_plan_z = max(0.0, float(self._ground_max_below_plan_z))
+        self._last_ground_vehicle_time: Optional[float] = None
+        self._last_ground_vehicle_z: Optional[float] = None
+        self._last_ground_vehicle_pitch: Optional[float] = None
+        self._last_ground_vehicle_roll: Optional[float] = None
         if animate_walkers is None:
             animate_walkers = os.environ.get("CUSTOM_LOG_REPLAY_ANIMATE_WALKERS", "1").lower() in (
                 "1",
@@ -1300,7 +2187,40 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
         except Exception:  # pylint: disable=broad-except
             self._walker_teleport_distance = 1.2
         self._walker_teleport_distance = max(0.1, self._walker_teleport_distance)
+        try:
+            self._walker_reverse_dot_threshold = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_WALKER_REVERSE_DOT_THRESHOLD", "-0.35")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._walker_reverse_dot_threshold = -0.35
+        try:
+            self._walker_reverse_noise_distance = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_WALKER_REVERSE_NOISE_DIST", "0.75")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._walker_reverse_noise_distance = 0.75
+        try:
+            self._walker_reverse_noise_duration = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_WALKER_REVERSE_NOISE_TIME", "0.90")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._walker_reverse_noise_duration = 0.90
+        try:
+            self._walker_direction_blend = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_WALKER_DIR_BLEND", "0.22")
+            )
+        except Exception:  # pylint: disable=broad-except
+            self._walker_direction_blend = 0.22
+        self._walker_reverse_dot_threshold = max(
+            -0.99, min(0.0, float(self._walker_reverse_dot_threshold))
+        )
+        self._walker_reverse_noise_distance = max(0.05, float(self._walker_reverse_noise_distance))
+        self._walker_reverse_noise_duration = max(0.10, float(self._walker_reverse_noise_duration))
+        self._walker_direction_blend = max(0.0, min(1.0, float(self._walker_direction_blend)))
         self._last_walker_time: Optional[float] = None
+        self._walker_forward_dir: Optional[Tuple[float, float]] = None
+        self._walker_reverse_start_time: Optional[float] = None
+        self._walker_reverse_peak_distance: float = 0.0
         self._spawned_once = bool(self._actor)
         self._valid = len(self._plan) == len(self._times) and len(self._plan) >= 1 and (
             self._actor is not None or self._spawn_cb is not None
@@ -1373,6 +2293,109 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
     def _should_animate_walker(self) -> bool:
         return self._animate_walkers and _is_walker_actor(self._actor)
 
+    @staticmethod
+    def _normalize_xy_vector(vx: float, vy: float) -> Optional[Tuple[float, float]]:
+        norm = math.hypot(float(vx), float(vy))
+        if norm <= 1e-6:
+            return None
+        return (float(vx) / norm, float(vy) / norm)
+
+    def _walker_plan_direction(self) -> Optional[Tuple[float, float]]:
+        if not self._plan or len(self._plan) <= 1:
+            return None
+        idx = max(0, min(len(self._plan) - 2, int(self._last_index)))
+        a = self._plan[idx].location
+        b = self._plan[idx + 1].location
+        return self._normalize_xy_vector(float(b.x) - float(a.x), float(b.y) - float(a.y))
+
+    def _blend_walker_direction(
+        self,
+        base_dir: Optional[Tuple[float, float]],
+        update_dir: Optional[Tuple[float, float]],
+        blend: float,
+    ) -> Optional[Tuple[float, float]]:
+        if update_dir is None:
+            return base_dir
+        if base_dir is None:
+            return update_dir
+        alpha = max(0.0, min(1.0, float(blend)))
+        mixed = self._normalize_xy_vector(
+            (1.0 - alpha) * float(base_dir[0]) + alpha * float(update_dir[0]),
+            (1.0 - alpha) * float(base_dir[1]) + alpha * float(update_dir[1]),
+        )
+        return mixed if mixed is not None else update_dir
+
+    def _smooth_vehicle_ground_pose(
+        self,
+        target: carla.Transform,
+        sim_time: float,
+    ) -> carla.Transform:
+        if self._actor is None or not _is_vehicle_actor(self._actor):
+            return target
+
+        smoothed = _copy_transform(target)
+        current_tf = None
+        try:
+            current_tf = self._actor.get_transform()
+        except Exception:  # pylint: disable=broad-except
+            current_tf = None
+
+        if self._last_ground_vehicle_time is None:
+            self._last_ground_vehicle_time = float(sim_time)
+        dt = max(1e-3, min(0.25, float(sim_time) - float(self._last_ground_vehicle_time)))
+        self._last_ground_vehicle_time = float(sim_time)
+
+        prev_z = self._last_ground_vehicle_z
+        prev_pitch = self._last_ground_vehicle_pitch
+        prev_roll = self._last_ground_vehicle_roll
+        if current_tf is not None:
+            if prev_z is None:
+                prev_z = float(current_tf.location.z)
+            if prev_pitch is None:
+                prev_pitch = float(current_tf.rotation.pitch)
+            if prev_roll is None:
+                prev_roll = float(current_tf.rotation.roll)
+        if prev_z is None:
+            prev_z = float(smoothed.location.z)
+        if prev_pitch is None:
+            prev_pitch = float(smoothed.rotation.pitch)
+        if prev_roll is None:
+            prev_roll = float(smoothed.rotation.roll)
+
+        target_z = float(smoothed.location.z)
+        dz = target_z - float(prev_z)
+        max_up_step = float(self._ground_z_up_rate) * dt
+        max_down_step = float(self._ground_z_down_rate) * dt
+        if dz > max_up_step:
+            target_z = float(prev_z) + max_up_step
+        elif dz < -max_down_step:
+            target_z = float(prev_z) - max_down_step
+        smoothed.location.z = float(target_z)
+
+        target_pitch = float(smoothed.rotation.pitch)
+        target_roll = float(smoothed.rotation.roll)
+        if not self._ground_align_vehicle_tilt and current_tf is not None:
+            target_pitch = float(current_tf.rotation.pitch)
+            target_roll = float(current_tf.rotation.roll)
+
+        pitch_delta = float(target_pitch) - float(prev_pitch)
+        roll_delta = float(target_roll) - float(prev_roll)
+        max_pitch_step = float(self._ground_pitch_rate) * dt
+        max_roll_step = float(self._ground_roll_rate) * dt
+        if abs(pitch_delta) > max_pitch_step:
+            target_pitch = float(prev_pitch) + math.copysign(max_pitch_step, pitch_delta)
+        if abs(roll_delta) > max_roll_step:
+            target_roll = float(prev_roll) + math.copysign(max_roll_step, roll_delta)
+
+        blend = float(self._ground_tilt_blend)
+        smoothed.rotation.pitch = float(prev_pitch) + blend * (float(target_pitch) - float(prev_pitch))
+        smoothed.rotation.roll = float(prev_roll) + blend * (float(target_roll) - float(prev_roll))
+
+        self._last_ground_vehicle_z = float(smoothed.location.z)
+        self._last_ground_vehicle_pitch = float(smoothed.rotation.pitch)
+        self._last_ground_vehicle_roll = float(smoothed.rotation.roll)
+        return smoothed
+
     def _estimate_segment_speed(self) -> float:
         if self._last_index >= len(self._plan) - 1 or self._last_index >= len(self._times) - 1:
             return 0.0
@@ -1398,15 +2421,49 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
 
         dx = float(target.location.x) - float(loc.x)
         dy = float(target.location.y) - float(loc.y)
-        dz = float(target.location.z) - float(loc.z)
-        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        dist_xy = math.hypot(dx, dy)
+        raw_dir = self._normalize_xy_vector(dx, dy)
+        plan_dir = self._walker_plan_direction()
+        ref_dir = self._walker_forward_dir or plan_dir or raw_dir
 
-        if dist > self._walker_teleport_distance:
+        reverse_noise_suppressed = False
+        if raw_dir is not None and ref_dir is not None:
+            dot = float(raw_dir[0]) * float(ref_dir[0]) + float(raw_dir[1]) * float(ref_dir[1])
+            if dot < float(self._walker_reverse_dot_threshold):
+                if self._walker_reverse_start_time is None:
+                    self._walker_reverse_start_time = float(sim_time)
+                    self._walker_reverse_peak_distance = float(dist_xy)
+                else:
+                    self._walker_reverse_peak_distance = max(
+                        float(self._walker_reverse_peak_distance),
+                        float(dist_xy),
+                    )
+                reverse_elapsed = max(0.0, float(sim_time) - float(self._walker_reverse_start_time))
+                if (
+                    float(self._walker_reverse_peak_distance)
+                    <= float(self._walker_reverse_noise_distance)
+                    and reverse_elapsed <= float(self._walker_reverse_noise_duration)
+                ):
+                    reverse_noise_suppressed = True
+            else:
+                self._walker_reverse_start_time = None
+                self._walker_reverse_peak_distance = 0.0
+        else:
+            self._walker_reverse_start_time = None
+            self._walker_reverse_peak_distance = 0.0
+
+        if dist_xy > self._walker_teleport_distance and not reverse_noise_suppressed:
             try:
                 self._actor.set_transform(target)
             except Exception:  # pylint: disable=broad-except
                 return False
             self._last_walker_time = sim_time
+            if raw_dir is not None:
+                self._walker_forward_dir = self._blend_walker_direction(
+                    self._walker_forward_dir,
+                    raw_dir,
+                    self._walker_direction_blend,
+                )
             return True
 
         dt = 0.05
@@ -1416,18 +2473,48 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
 
         desired_speed = self._estimate_segment_speed()
         if desired_speed <= 1e-3:
-            desired_speed = dist / dt
+            desired_speed = dist_xy / dt
         desired_speed = min(self._walker_max_speed, max(0.0, float(desired_speed)))
-        if dist < 0.02:
+        if reverse_noise_suppressed or dist_xy < 0.02:
             desired_speed = 0.0
 
-        if dist > 1e-4:
-            direction = carla.Vector3D(dx / dist, dy / dist, dz / dist)
+        if reverse_noise_suppressed and ref_dir is not None:
+            direction = carla.Vector3D(float(ref_dir[0]), float(ref_dir[1]), 0.0)
+        elif raw_dir is not None:
+            if self._walker_forward_dir is not None:
+                blended_dir = self._blend_walker_direction(
+                    raw_dir,
+                    self._walker_forward_dir,
+                    0.35,
+                )
+            else:
+                blended_dir = raw_dir
+            if blended_dir is None:
+                direction = carla.Vector3D(float(raw_dir[0]), float(raw_dir[1]), 0.0)
+            else:
+                direction = carla.Vector3D(float(blended_dir[0]), float(blended_dir[1]), 0.0)
         else:
             try:
                 direction = self._actor.get_transform().get_forward_vector()
+                direction = carla.Vector3D(direction.x, direction.y, 0.0)
             except Exception:  # pylint: disable=broad-except
                 direction = carla.Vector3D(1.0, 0.0, 0.0)
+        if reverse_noise_suppressed and ref_dir is not None:
+            self._walker_forward_dir = (float(ref_dir[0]), float(ref_dir[1]))
+        elif raw_dir is not None and desired_speed > 0.05:
+            if (
+                ref_dir is not None
+                and (float(raw_dir[0]) * float(ref_dir[0]) + float(raw_dir[1]) * float(ref_dir[1]))
+                < float(self._walker_reverse_dot_threshold)
+            ):
+                # Significant sustained reversal: allow intentional turn-around quickly.
+                self._walker_forward_dir = (float(raw_dir[0]), float(raw_dir[1]))
+            else:
+                self._walker_forward_dir = self._blend_walker_direction(
+                    self._walker_forward_dir,
+                    plan_dir or raw_dir,
+                    self._walker_direction_blend,
+                )
 
         try:
             control = self._actor.get_control()
@@ -1524,6 +2611,13 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
         self._last_sim_time = None
         self._last_index_dbg = None
         self._last_walker_time = None
+        self._walker_forward_dir = None
+        self._walker_reverse_start_time = None
+        self._walker_reverse_peak_distance = 0.0
+        self._last_ground_vehicle_time = None
+        self._last_ground_vehicle_z = None
+        self._last_ground_vehicle_pitch = None
+        self._last_ground_vehicle_roll = None
 
     def _compute_target(self, sim_time: float) -> carla.Transform:
         if sim_time <= self._times[0]:
@@ -1615,7 +2709,8 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
             self._debug_log(sim_time, note="staged_before")
             return py_trees.common.Status.RUNNING
 
-        target = self._compute_target(replay_time)
+        raw_target = self._compute_target(replay_time)
+        target = _copy_transform(raw_target)
         if self._ground_each_tick and self._actor is not None:
             if self._ground_world is None:
                 try:
@@ -1638,6 +2733,21 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
                 z_extra=self._ground_z_extra,
             )
             target = grounded_target
+            if _is_vehicle_actor(self._actor):
+                if self._ground_align_vehicle_tilt:
+                    target = _align_vehicle_transform_to_ground(
+                        target,
+                        self._actor,
+                        world=self._ground_world,
+                        world_map=self._ground_world_map,
+                        lane_type=self._ground_lane_type,
+                    )
+                if self._ground_smooth_vehicle_pose:
+                    target = self._smooth_vehicle_ground_pose(target, sim_time)
+        if _is_vehicle_actor(self._actor):
+            min_allowed_z = float(raw_target.location.z) - float(self._ground_max_below_plan_z)
+            if float(target.location.z) < float(min_allowed_z):
+                target.location.z = float(min_allowed_z)
         if self._debug and self._last_index_dbg is not None and self._last_index < self._last_index_dbg:
             print(
                 f"[LOG_REPLAY_DEBUG] {self.name}: index regressed ({self._last_index_dbg} -> {self._last_index})"
@@ -2491,6 +3601,10 @@ class RouteScenario(BasicScenario):
             "true",
             "yes",
         )
+        try:
+            vehicle_ground_lift = float(os.environ.get("CUSTOM_VEHICLE_GROUND_LIFT", "0.04"))
+        except Exception:  # pylint: disable=broad-except
+            vehicle_ground_lift = 0.04
         world = CarlaDataProvider.get_world()
         world_map = CarlaDataProvider.get_map()
 
@@ -2548,13 +3662,15 @@ class RouteScenario(BasicScenario):
                     ego_vehicle.set_simulate_physics(False)
                 except Exception:  # pylint: disable=broad-except
                     pass
-                if (normalize_ego_z or normalize_actor_z) and self._ego_replay_transforms[j]:
+                # Always glue ego to ground in log-replay mode (not just when normalize flags are set)
+                if self._ego_replay_transforms[j]:
                     _glue_plan_to_ground(
                         self._ego_replay_transforms[j],
                         ego_vehicle,
                         world_map,
                         carla.LaneType.Driving,
                         world,
+                        z_extra=float(vehicle_ground_lift),
                     )
                     try:
                         ego_vehicle.set_transform(self._ego_replay_transforms[j][0])
@@ -2979,27 +4095,22 @@ class RouteScenario(BasicScenario):
             "true",
             "yes",
         )
-        log_replay = os.environ.get("CUSTOM_ACTOR_LOG_REPLAY", "").lower() in (
+        actor_log_replay_requested = os.environ.get("CUSTOM_ACTOR_LOG_REPLAY", "").lower() in (
             "1",
             "true",
             "yes",
         )
-        use_staging = os.environ.get("CUSTOM_LOG_REPLAY_STAGE", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        defer_log_replay_spawn = os.environ.get("CUSTOM_LOG_REPLAY_DEFER_SPAWN", "1").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        if actor_log_replay_requested:
+            print(
+                "[RouteScenario] CUSTOM_ACTOR_LOG_REPLAY is ignored. "
+                "Custom actors always use policy control."
+            )
         debug_spawn = os.environ.get("CUSTOM_ACTOR_SPAWN_DEBUG", "").lower() in (
             "1",
             "true",
             "yes",
         )
-        dynamic_spawn_lift = log_replay and os.environ.get("CUSTOM_ACTOR_DYNAMIC_Z", "1").lower() in (
+        dynamic_spawn_lift = os.environ.get("CUSTOM_ACTOR_DYNAMIC_Z", "1").lower() in (
             "1",
             "true",
             "yes",
@@ -3008,126 +4119,13 @@ class RouteScenario(BasicScenario):
             walker_ground_lift = float(os.environ.get("CUSTOM_WALKER_GROUND_LIFT", "0.06"))
         except Exception:  # pylint: disable=broad-except
             walker_ground_lift = 0.06
-        animate_walkers = os.environ.get("CUSTOM_LOG_REPLAY_ANIMATE_WALKERS", "1").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        smooth_vehicle_replay = os.environ.get("CUSTOM_LOG_REPLAY_SMOOTH_VEHICLES", "1").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
         try:
-            smooth_min_cutoff_xy = float(os.environ.get("CUSTOM_LOG_REPLAY_SMOOTH_MIN_CUTOFF", "0.65"))
+            vehicle_ground_lift = float(os.environ.get("CUSTOM_VEHICLE_GROUND_LIFT", "0.04"))
         except Exception:  # pylint: disable=broad-except
-            smooth_min_cutoff_xy = 0.65
-        try:
-            smooth_beta_xy = float(os.environ.get("CUSTOM_LOG_REPLAY_SMOOTH_BETA", "0.18"))
-        except Exception:  # pylint: disable=broad-except
-            smooth_beta_xy = 0.18
-        try:
-            smooth_min_cutoff_yaw = float(os.environ.get("CUSTOM_LOG_REPLAY_SMOOTH_YAW_MIN_CUTOFF", "0.5"))
-        except Exception:  # pylint: disable=broad-except
-            smooth_min_cutoff_yaw = 0.5
-        try:
-            smooth_beta_yaw = float(os.environ.get("CUSTOM_LOG_REPLAY_SMOOTH_YAW_BETA", "0.12"))
-        except Exception:  # pylint: disable=broad-except
-            smooth_beta_yaw = 0.12
-        try:
-            smooth_min_cutoff_z = float(os.environ.get("CUSTOM_LOG_REPLAY_SMOOTH_Z_MIN_CUTOFF", "0.8"))
-        except Exception:  # pylint: disable=broad-except
-            smooth_min_cutoff_z = 0.8
-        try:
-            smooth_beta_z = float(os.environ.get("CUSTOM_LOG_REPLAY_SMOOTH_Z_BETA", "0.12"))
-        except Exception:  # pylint: disable=broad-except
-            smooth_beta_z = 0.12
-        try:
-            smooth_d_cutoff = float(os.environ.get("CUSTOM_LOG_REPLAY_SMOOTH_D_CUTOFF", "1.0"))
-        except Exception:  # pylint: disable=broad-except
-            smooth_d_cutoff = 1.0
-        try:
-            smooth_lateral_damping = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_LATERAL_DAMPING", "0.72")
-            )
-        except Exception:  # pylint: disable=broad-except
-            smooth_lateral_damping = 0.72
-        try:
-            smooth_lateral_passes = int(
-                os.environ.get("CUSTOM_LOG_REPLAY_LATERAL_PASSES", "2")
-            )
-        except Exception:  # pylint: disable=broad-except
-            smooth_lateral_passes = 2
-        try:
-            smooth_lateral_max_correction = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_LATERAL_MAX_CORRECTION", "0.40")
-            )
-        except Exception:  # pylint: disable=broad-except
-            smooth_lateral_max_correction = 0.40
-        try:
-            smooth_lateral_turn_keep = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_LATERAL_TURN_KEEP", "0.62")
-            )
-        except Exception:  # pylint: disable=broad-except
-            smooth_lateral_turn_keep = 0.62
-        try:
-            smooth_lateral_turn_angle = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_LATERAL_TURN_ANGLE_DEG", "10.0")
-            )
-        except Exception:  # pylint: disable=broad-except
-            smooth_lateral_turn_angle = 10.0
-        stabilize_static_segments = os.environ.get(
-            "CUSTOM_LOG_REPLAY_STABILIZE_STATIC_VEHICLES", "1"
-        ).lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        try:
-            static_total_disp = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_STATIC_TOTAL_DISP", "0.35")
-            )
-        except Exception:  # pylint: disable=broad-except
-            static_total_disp = 0.35
-        try:
-            static_total_path = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_STATIC_TOTAL_PATH", "1.6")
-            )
-        except Exception:  # pylint: disable=broad-except
-            static_total_path = 1.6
-        try:
-            static_window_min_duration = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_STATIC_WINDOW_MIN_DURATION", "0.8")
-            )
-        except Exception:  # pylint: disable=broad-except
-            static_window_min_duration = 0.8
-        try:
-            static_window_max_disp = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_STATIC_WINDOW_MAX_DISP", "0.22")
-            )
-        except Exception:  # pylint: disable=broad-except
-            static_window_max_disp = 0.22
-        try:
-            static_window_max_speed = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_STATIC_WINDOW_MAX_SPEED", "0.08")
-            )
-        except Exception:  # pylint: disable=broad-except
-            static_window_max_speed = 0.08
-        try:
-            static_window_max_yaw_delta = float(
-                os.environ.get("CUSTOM_LOG_REPLAY_STATIC_WINDOW_MAX_YAW_DELTA", "2.5")
-            )
-        except Exception:  # pylint: disable=broad-except
-            static_window_max_yaw_delta = 2.5
+            vehicle_ground_lift = 0.04
         lift_steps = _parse_lift_steps(
             os.environ.get("CUSTOM_ACTOR_SPAWN_LIFT_STEPS", "0.2,0.5,1.0")
         )
-        if log_replay:
-            follow_exact = True
-            print(
-                "[RouteScenario] Custom actors will replay logged transforms with timing "
-                "(no road snapping or route planning)."
-            )
         if follow_exact:
             print(
                 "[RouteScenario] Custom actors will follow exact authored trajectories "
@@ -3178,10 +4176,9 @@ class RouteScenario(BasicScenario):
         total = len(self._custom_actor_configs)
         spawned = 0
         failed = 0
-        deferred = 0
         self._custom_actor_spawn_summary_printed = False
         self._custom_actor_spawn_states = {}
-        for actor_idx, actor_cfg in enumerate(self._custom_actor_configs):
+        for actor_cfg in self._custom_actor_configs:
             role = actor_cfg.get("role", "npc")
             name = actor_cfg.get("rolename") or actor_cfg.get("name") or "unknown"
             model = actor_cfg.get("model", "unknown")
@@ -3189,17 +4186,15 @@ class RouteScenario(BasicScenario):
                 "name": name,
                 "role": role,
                 "model": model,
-                "deferred": False,
                 "spawned": False,
                 "attempts": 0,
                 "last_failure": None,
-                "spawn_time": None,
                 "spawn_offset": (0.0, 0.0, 0.0),
             }
             plan_transforms = actor_cfg.get("plan_transforms") or []
             plan_times = actor_cfg.get("plan_times")
             spawn_tf_src: carla.Transform = actor_cfg["spawn_transform"]
-            spawn_tf_plan = carla.Transform(
+            spawn_tf = carla.Transform(
                 carla.Location(
                     x=spawn_tf_src.location.x,
                     y=spawn_tf_src.location.y,
@@ -3209,18 +4204,6 @@ class RouteScenario(BasicScenario):
                     pitch=spawn_tf_src.rotation.pitch,
                     yaw=spawn_tf_src.rotation.yaw,
                     roll=spawn_tf_src.rotation.roll,
-                ),
-            )
-            spawn_tf = carla.Transform(
-                carla.Location(
-                    x=spawn_tf_plan.location.x,
-                    y=spawn_tf_plan.location.y,
-                    z=spawn_tf_plan.location.z,
-                ),
-                carla.Rotation(
-                    pitch=spawn_tf_plan.rotation.pitch,
-                    yaw=spawn_tf_plan.rotation.yaw,
-                    roll=spawn_tf_plan.rotation.roll,
                 ),
             )
             adjusted_plan_transforms = [
@@ -3234,50 +4217,15 @@ class RouteScenario(BasicScenario):
                 )
                 for tf in plan_transforms
             ]
-            is_non_vehicle_role = role in ("pedestrian", "walker", "bicycle", "cyclist")
-            is_vehicle_model = str(model).lower().startswith("vehicle.")
-            if (
-                log_replay
-                and smooth_vehicle_replay
-                and adjusted_plan_transforms
-                and not is_non_vehicle_role
-                and is_vehicle_model
-            ):
-                adjusted_plan_transforms = _smooth_vehicle_replay_plan(
-                    adjusted_plan_transforms,
-                    plan_times,
-                    min_cutoff_xy=smooth_min_cutoff_xy,
-                    beta_xy=smooth_beta_xy,
-                    min_cutoff_z=smooth_min_cutoff_z,
-                    beta_z=smooth_beta_z,
-                    min_cutoff_yaw=smooth_min_cutoff_yaw,
-                    beta_yaw=smooth_beta_yaw,
-                    d_cutoff=smooth_d_cutoff,
-                    static_hold_enabled=stabilize_static_segments,
-                    static_total_displacement=static_total_disp,
-                    static_total_path_length=static_total_path,
-                    static_window_min_duration=static_window_min_duration,
-                    static_window_max_displacement=static_window_max_disp,
-                    static_window_max_speed=static_window_max_speed,
-                    static_window_max_yaw_delta=static_window_max_yaw_delta,
-                    lateral_damping=smooth_lateral_damping,
-                    lateral_passes=smooth_lateral_passes,
-                    lateral_max_correction=smooth_lateral_max_correction,
-                    lateral_turn_keep=smooth_lateral_turn_keep,
-                    lateral_turn_angle_deg=smooth_lateral_turn_angle,
-                )
-            stage_replay = bool(
-                log_replay
-                and use_staging
-                and plan_times
-                and adjusted_plan_transforms
-                and len(plan_times) == len(adjusted_plan_transforms)
-            )
-            stage_tf = _make_stage_transform(actor_idx, spawn_tf_plan) if stage_replay else None
+            is_walker_like = role in ("pedestrian", "walker", "bicycle", "cyclist")
 
             snapped_to_road = False
             ground_z_for_actor: Optional[float] = None
-            if normalize_actor_z:
+            # Always ground-normalize walker-like actors: they are excluded from road
+            # snapping so their original dataset z can be completely wrong for the
+            # CARLA map (e.g. -1.0 while ground is at +10.0).
+            should_normalize_z = normalize_actor_z or is_walker_like
+            if should_normalize_z:
                 # Adjust only Z to the nearest ground height; preserve authored x/y and rotation.
                 candidates: list[float] = []
                 ground_z = _resolve_ground_z(world, spawn_tf.location)
@@ -3325,90 +4273,7 @@ class RouteScenario(BasicScenario):
                     # Smaller offset for static/parked vehicles to avoid visible floating
                     spawn_tf.location.z += 0.1
 
-            if log_replay and adjusted_plan_transforms and not normalize_actor_z:
-                try:
-                    z_offset = float(spawn_tf_plan.location.z) - float(adjusted_plan_transforms[0].location.z)
-                    if abs(z_offset) > 1e-4:
-                        for tf in adjusted_plan_transforms:
-                            tf.location.z = float(tf.location.z) + z_offset
-                except Exception:  # pylint: disable=broad-except
-                    pass
-
-            defer_spawn = False
-            spawn_time = None
-            if (
-                log_replay
-                and defer_log_replay_spawn
-                and not use_staging
-                and plan_times
-                and adjusted_plan_transforms
-                and len(plan_times) == len(adjusted_plan_transforms)
-            ):
-                try:
-                    spawn_time = float(plan_times[0])
-                except Exception:  # pylint: disable=broad-except
-                    spawn_time = None
-                if spawn_time is not None and spawn_time > 0.0:
-                    defer_spawn = True
-
             rolename = name
-            is_walker_like = role in ("pedestrian", "walker", "bicycle", "cyclist")
-            if defer_spawn:
-                deferred += 1
-                state = self._custom_actor_spawn_states.get(rolename)
-                if state is not None:
-                    state["deferred"] = True
-                    state["spawn_time"] = float(spawn_time) if spawn_time is not None else None
-                if spawn_time is not None:
-                    print(
-                        f"[RouteScenario] Log replay actor {rolename} deferred spawn until t={spawn_time:.3f}s"
-                    )
-                self._custom_actor_plans.append(
-                    {
-                        "actor": None,
-                        "name": actor_cfg["name"],
-                        "model": actor_cfg.get("model"),
-                        "plan": [],
-                        "plan_transforms": adjusted_plan_transforms,
-                        "plan_times": plan_times,
-                        "target_speed": actor_cfg["target_speed"],
-                        "avoid_collision": actor_cfg.get("avoid_collision", False),
-                        "behavior": self._custom_actor_behavior_by_name.get(actor_cfg["name"]),
-                        "role": actor_cfg.get("role", "npc"),
-                        "stage_transform": None,
-                        "stage_before": False,
-                        "stage_after": False,
-                        "realized_path": [],
-                        "spawn_model": actor_cfg.get("model"),
-                        "spawn_transform": carla.Transform(
-                            carla.Location(
-                                x=spawn_tf.location.x,
-                                y=spawn_tf.location.y,
-                                z=spawn_tf.location.z,
-                            ),
-                            carla.Rotation(
-                                pitch=spawn_tf.rotation.pitch,
-                                yaw=spawn_tf.rotation.yaw,
-                                roll=spawn_tf.rotation.roll,
-                            ),
-                        ),
-                        "spawn_time": spawn_time,
-                        "defer_spawn": True,
-                        "normalize_actor_z": normalize_actor_z,
-                        "ground_prefer_ray": is_walker_like,
-                        "ground_z_extra": float(walker_ground_lift) if is_walker_like else 0.0,
-                        "animate_walkers": animate_walkers,
-                        "snap_to_road": should_snap_to_road,
-                        "follow_exact": follow_exact,
-                        "spawn_retry_offsets": spawn_retry_offsets,
-                        "spawn_debug": {
-                            "snapped_to_road": snapped_to_road,
-                            "ground_z": ground_z_for_actor,
-                            "stage_replay": stage_replay,
-                        },
-                    }
-                )
-                continue
             spawn_candidates = [spawn_tf]
             new_actor = None
             last_exc = None
@@ -3495,12 +4360,12 @@ class RouteScenario(BasicScenario):
                     spawn_tf,
                     snapped_to_road,
                     ground_z_for_actor,
-                    stage_replay,
+                    False,
                     world,
                     world_map,
                     normalize_actor_z,
                     follow_exact,
-                    log_replay,
+                    False,
                     debug_spawn,
                 )
                 continue
@@ -3520,6 +4385,7 @@ class RouteScenario(BasicScenario):
                         world_map,
                         world,
                         lane_type,
+                        z_extra=float(walker_ground_lift) if is_walker_like else float(vehicle_ground_lift),
                     )
                     if grounded_tf is not None:
                         try:
@@ -3552,50 +4418,13 @@ class RouteScenario(BasicScenario):
                 except Exception:  # pylint: disable=broad-except
                     pass
 
-            if log_replay and normalize_actor_z and adjusted_plan_transforms:
-                lane_type = carla.LaneType.Driving
-                if role in ("pedestrian", "walker", "bicycle", "cyclist"):
-                    lane_type = carla.LaneType.Any
-                _glue_plan_to_ground(
-                    adjusted_plan_transforms,
-                    new_actor,
-                    world_map,
-                    lane_type,
-                    world,
-                    prefer_ray_ground=is_walker_like,
-                    z_extra=float(walker_ground_lift) if is_walker_like else 0.0,
-                )
-                if not (stage_replay and plan_times and plan_times[0] > 0.0):
-                    try:
-                        new_actor.set_transform(adjusted_plan_transforms[0])
-                    except Exception:  # pylint: disable=broad-except
-                        pass
-
             spawned += 1
             print(
                 f"[RouteScenario] Spawned custom actor name={rolename} role={role} model={model} at {spawn_tf}"
             )
-            if stage_replay and stage_tf is not None and plan_times:
-                try:
-                    t0 = float(plan_times[0])
-                except Exception:  # pylint: disable=broad-except
-                    t0 = None
-                if t0 is not None and t0 > 0.0:
-                    if not (is_walker_like and animate_walkers):
-                        try:
-                            new_actor.set_simulate_physics(False)
-                        except Exception:  # pylint: disable=broad-except
-                            pass
-                    try:
-                        new_actor.set_transform(stage_tf)
-                    except Exception:  # pylint: disable=broad-except
-                        pass
-                    print(
-                        f"[RouteScenario] Log replay actor {rolename} staged until t={t0:.3f}s"
-                    )
             self.other_actors.append(new_actor)
 
-            if actor_image_dir and not log_replay:
+            if actor_image_dir:
                 self._capture_custom_actor_image(new_actor, rolename, role, actor_image_dir)
 
             if role in ("static", "static_prop"):
@@ -3612,8 +4441,35 @@ class RouteScenario(BasicScenario):
             plan_locations = []
             for loc in actor_cfg["plan"]:
                 if not snap_plan:
-                    # Keep original waypoint for pedestrians/cyclists
-                    plan_locations.append(carla.Location(x=loc.x, y=loc.y, z=loc.z))
+                    # Keep original x/y for pedestrians/cyclists but ground z
+                    grounded_loc = carla.Location(x=loc.x, y=loc.y, z=loc.z)
+                    if is_walker_like and world_map is not None:
+                        # Try Sidewalk first for correct sidewalk surface height,
+                        # then fall back to Any (covers areas without sidewalk geometry).
+                        sw_wp = None
+                        try:
+                            sw_wp = world_map.get_waypoint(
+                                loc,
+                                project_to_road=True,
+                                lane_type=carla.LaneType.Sidewalk,
+                            )
+                        except Exception:  # pylint: disable=broad-except
+                            sw_wp = None
+                        if sw_wp is not None:
+                            grounded_loc.z = float(sw_wp.transform.location.z)
+                        else:
+                            any_wp = None
+                            try:
+                                any_wp = world_map.get_waypoint(
+                                    loc,
+                                    project_to_road=True,
+                                    lane_type=carla.LaneType.Any,
+                                )
+                            except Exception:  # pylint: disable=broad-except
+                                any_wp = None
+                            if any_wp is not None:
+                                grounded_loc.z = float(any_wp.transform.location.z)
+                    plan_locations.append(grounded_loc)
                 else:
                     snapped_loc = carla.Location(x=loc.x, y=loc.y, z=loc.z)
                     if world_map is not None:
@@ -3662,55 +4518,63 @@ class RouteScenario(BasicScenario):
                     "plan": dense_plan,
                     "plan_transforms": adjusted_plan_transforms,
                     "plan_times": plan_times,
+                    "plan_speeds": actor_cfg.get("plan_speeds"),
                     "target_speed": actor_cfg["target_speed"],
                     "avoid_collision": actor_cfg.get("avoid_collision", False),
                     "behavior": self._custom_actor_behavior_by_name.get(actor_cfg["name"]),
                     "role": actor_cfg.get("role", "npc"),
-                    "stage_transform": stage_tf,
-                    "stage_before": stage_replay,
-                    "stage_after": stage_replay,
                     "ground_prefer_ray": is_walker_like,
-                    "ground_z_extra": float(walker_ground_lift) if is_walker_like else 0.0,
-                    "animate_walkers": animate_walkers,
+                    "ground_z_extra": float(walker_ground_lift) if is_walker_like else float(vehicle_ground_lift),
                     "realized_path": [],
                 }
             )
 
-        if deferred:
-            print(
-                f"[RouteScenario] Custom actor initial spawn summary: total={total} spawned={spawned} "
-                f"deferred={deferred} failed={failed}"
-            )
-        else:
-            print(
-                f"[RouteScenario] Custom actor initial spawn summary: total={total} spawned={spawned} failed={failed}"
-            )
+        print(
+            f"[RouteScenario] Custom actor initial spawn summary: total={total} spawned={spawned} failed={failed}"
+        )
+
+        # ── Pre-stage delayed-start actors that would interfere ──
+        # Done as a post-pass so we can check every actor's trajectory.
+        _STAGING_THRESHOLD = 0.5
+        for ap in self._custom_actor_plans:
+            _pt = ap.get("plan_times") or []
+            _st = float(_pt[0]) if _pt else 0.0
+            if _st <= _STAGING_THRESHOLD:
+                continue
+            if _delayed_actor_interferes(ap, self._custom_actor_plans):
+                try:
+                    _a = ap["actor"]
+                    _loc = _a.get_location()
+                    _a.set_transform(carla.Transform(
+                        carla.Location(x=float(_loc.x), y=float(_loc.y),
+                                       z=float(_loc.z) - 500.0),
+                        carla.Rotation(),
+                    ))
+                    _a.set_simulate_physics(False)
+                    if os.environ.get('DEBUG_FINISH', '').lower() in ('1', 'true', 'yes'):
+                        print(f"[RouteScenario] Pre-staged {ap['name']} underground "
+                              f"(start_time={_st:.2f}s, interferes=True)")
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            else:
+                # Non-interfering: just freeze physics so they don't drift
+                try:
+                    ap["actor"].set_simulate_physics(False)
+                    if os.environ.get('DEBUG_FINISH', '').lower() in ('1', 'true', 'yes'):
+                        print(f"[RouteScenario] Frozen {ap['name']} at spawn "
+                              f"(start_time={_st:.2f}s, interferes=False)")
+                except Exception:  # pylint: disable=broad-except
+                    pass
         if actor_image_dir:
             self._capture_overhead_scene_image(actor_image_dir)
 
     def _build_custom_actor_spawn_summary(self) -> dict:
         states = self._custom_actor_spawn_states or {}
         total = len(states)
-        immediate_states = [s for s in states.values() if not bool(s.get("deferred"))]
-        deferred_states = [s for s in states.values() if bool(s.get("deferred"))]
-
-        immediate_spawned = sum(1 for s in immediate_states if bool(s.get("spawned")))
-        immediate_failed = sum(1 for s in immediate_states if not bool(s.get("spawned")))
-        deferred_spawned = sum(1 for s in deferred_states if bool(s.get("spawned")))
-        deferred_attempted = sum(1 for s in deferred_states if int(s.get("attempts", 0)) > 0)
-        deferred_failed = sum(
-            1
-            for s in deferred_states
-            if int(s.get("attempts", 0)) > 0 and not bool(s.get("spawned"))
-        )
-        deferred_pending = sum(
-            1
-            for s in deferred_states
-            if int(s.get("attempts", 0)) == 0 and not bool(s.get("spawned"))
-        )
+        spawned = sum(1 for s in states.values() if bool(s.get("spawned")))
+        failed = sum(1 for s in states.values() if not bool(s.get("spawned")))
 
         failed_details = []
-        pending_details = []
         for state in states.values():
             if bool(state.get("spawned")):
                 continue
@@ -3718,30 +4582,17 @@ class RouteScenario(BasicScenario):
                 "name": state.get("name"),
                 "role": state.get("role"),
                 "model": state.get("model"),
-                "deferred": bool(state.get("deferred")),
                 "attempts": int(state.get("attempts", 0)),
-                "spawn_time": state.get("spawn_time"),
                 "last_failure": state.get("last_failure"),
             }
-            if bool(state.get("deferred")) and int(state.get("attempts", 0)) == 0:
-                pending_details.append(record)
-            else:
-                failed_details.append(record)
+            failed_details.append(record)
 
         return {
             "total": total,
             "attempts_total": sum(int(s.get("attempts", 0)) for s in states.values()),
-            "immediate_total": len(immediate_states),
-            "immediate_spawned": immediate_spawned,
-            "immediate_failed": immediate_failed,
-            "deferred_total": len(deferred_states),
-            "deferred_spawned": deferred_spawned,
-            "deferred_attempted": deferred_attempted,
-            "deferred_failed": deferred_failed,
-            "deferred_pending": deferred_pending,
-            "failed_total": immediate_failed + deferred_failed,
+            "spawned": spawned,
+            "failed": failed,
             "failed_details": failed_details,
-            "pending_details": pending_details,
         }
 
     def _print_custom_actor_spawn_summary(self) -> None:
@@ -3754,12 +4605,8 @@ class RouteScenario(BasicScenario):
         print(
             "[RouteScenario] Custom actor final spawn summary: "
             f"total={summary['total']} attempts={summary['attempts_total']} "
-            f"immediate_ok={summary['immediate_spawned']}/{summary['immediate_total']} "
-            f"immediate_fail={summary['immediate_failed']} "
-            f"deferred_ok={summary['deferred_spawned']}/{summary['deferred_total']} "
-            f"deferred_fail={summary['deferred_failed']} "
-            f"deferred_pending={summary['deferred_pending']} "
-            f"failed_total={summary['failed_total']}"
+            f"spawned={summary['spawned']} "
+            f"failed={summary['failed']}"
         )
         if summary["failed_details"]:
             preview = []
@@ -3774,18 +4621,6 @@ class RouteScenario(BasicScenario):
                     )
                 )
             print("[RouteScenario] Failed spawn actors: " + "; ".join(preview))
-        if summary["pending_details"]:
-            preview = []
-            for item in summary["pending_details"][:15]:
-                preview.append(
-                    "{}(role={}, model={}, spawn_time={})".format(
-                        item.get("name"),
-                        item.get("role"),
-                        item.get("model"),
-                        item.get("spawn_time"),
-                    )
-                )
-            print("[RouteScenario] Deferred actors not yet attempted: " + "; ".join(preview))
         self._custom_actor_spawn_summary_printed = True
 
     def _capture_custom_actor_image(self, actor, name: str, role: str, output_dir: str) -> None:
@@ -4389,12 +5224,26 @@ class RouteScenario(BasicScenario):
         """
         scenario_trigger_distance = 1.5  # Max trigger distance between route and scenario
         behavior = []
-        log_replay = os.environ.get("CUSTOM_ACTOR_LOG_REPLAY", "").lower() in (
+        log_replay_ego = os.environ.get("CUSTOM_EGO_LOG_REPLAY", "").lower() in (
             "1",
             "true",
             "yes",
         )
-        log_replay_ego = os.environ.get("CUSTOM_EGO_LOG_REPLAY", "").lower() in (
+        normalize_ego_z = os.environ.get("CUSTOM_EGO_NORMALIZE_Z", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        try:
+            vehicle_ground_lift = float(os.environ.get("CUSTOM_VEHICLE_GROUND_LIFT", "0.04"))
+        except Exception:  # pylint: disable=broad-except
+            vehicle_ground_lift = 0.04
+        ego_ground_align_tilt = os.environ.get("CUSTOM_EGO_GROUND_ALIGN_TILT", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        ego_ground_smooth_pose = os.environ.get("CUSTOM_EGO_GROUND_SMOOTH_POSE", "1").lower() in (
             "1",
             "true",
             "yes",
@@ -4404,7 +5253,6 @@ class RouteScenario(BasicScenario):
             "true",
             "yes",
         )
-        actor_image_dir = os.environ.get("CUSTOM_ACTOR_IMAGE_DIR")
         world = CarlaDataProvider.get_world()
         world_map = CarlaDataProvider.get_map()
 
@@ -4442,6 +5290,14 @@ class RouteScenario(BasicScenario):
                             stage_before=use_staging,
                             stage_after=use_staging,
                             done_blackboard_key=f"log_replay_done_ego_{ego_vehicle_id}",
+                            ground_each_tick=bool(normalize_ego_z),
+                            ground_lane_type=carla.LaneType.Driving,
+                            ground_world_map=world_map,
+                            ground_world=world,
+                            ground_prefer_ray=False,
+                            ground_z_extra=float(vehicle_ground_lift),
+                            ground_align_vehicle_tilt=bool(ego_ground_align_tilt),
+                            ground_smooth_vehicle_pose=bool(ego_ground_smooth_pose),
                         )
                     )
                 else:
@@ -4456,274 +5312,57 @@ class RouteScenario(BasicScenario):
                         print(f"[DEBUG FINISH]   behavior spec: {actor_plan.get('behavior')}")
                         print(f"[DEBUG FINISH]   target_speed: {actor_plan.get('target_speed')}")
                         print(f"[DEBUG FINISH]   plan length: {len(actor_plan.get('plan') or [])}")
-                    if log_replay and actor_plan.get("plan_times") and actor_plan.get("plan_transforms"):
-                        capture_cb = None
-                        finalize_cb = None
-                        record_list = actor_plan.get("realized_path")
-                        if actor_image_dir:
-                            def _make_cb(plan=actor_plan):
-                                return lambda stage: self._capture_custom_actor_image_stage(
-                                    plan.get("actor"),
-                                    plan.get("name", "unknown"),
-                                    plan.get("role", "npc"),
-                                    actor_image_dir,
-                                    stage,
-                                )
-                            capture_cb = _make_cb()
-                            def _make_finalize_cb(plan=actor_plan):
-                                return lambda: self._save_custom_actor_path_visualization(plan, actor_image_dir)
-                            finalize_cb = _make_finalize_cb()
-                        spawn_cb = None
-                        despawn_cb = None
-                        spawn_time = actor_plan.get("spawn_time")
-                        def _make_despawn_cb(plan=actor_plan):
-                            def _despawn(actor):
-                                try:
-                                    CarlaDataProvider.remove_actor_by_id(actor.id)
-                                except Exception:  # pylint: disable=broad-except
-                                    try:
-                                        actor.destroy()
-                                    except Exception:  # pylint: disable=broad-except
-                                        pass
-                                try:
-                                    self.other_actors.remove(actor)
-                                except Exception:  # pylint: disable=broad-except
-                                    pass
-                                plan["actor"] = None
-                            return _despawn
-                        if actor_plan.get("actor") is None and actor_plan.get("spawn_model") is not None:
-                            def _make_spawn_cb(plan=actor_plan):
-                                def _spawn():
-                                    world = CarlaDataProvider.get_world()
-                                    world_map = CarlaDataProvider.get_map()
-                                    model = plan.get("spawn_model")
-                                    rolename = plan.get("name") or "unknown"
-                                    spawn_tf = plan.get("spawn_transform")
-                                    state = self._custom_actor_spawn_states.get(rolename)
-                                    attempts = 0
-                                    try:
-                                        actor = None
-                                        lift_used = None
-                                        offset_used = None
-                                        last_exc = None
-                                        attempts += 1
-                                        try:
-                                            actor = CarlaDataProvider.request_new_actor(
-                                                model,
-                                                spawn_tf,
-                                                rolename=rolename,
-                                                autopilot=False,
-                                            )
-                                        except Exception as exc:  # pylint: disable=broad-except
-                                            actor = None
-                                            last_exc = exc
-
-                                        if actor is None:
-                                            retry_offsets = plan.get("spawn_retry_offsets") or []
-                                            if retry_offsets:
-                                                lane_type = carla.LaneType.Driving
-                                                if plan.get("role") in ("pedestrian", "walker", "bicycle", "cyclist"):
-                                                    lane_type = carla.LaneType.Any
-                                                (
-                                                    actor,
-                                                    retry_tf,
-                                                    retry_offset,
-                                                    retry_exc,
-                                                    retry_attempts,
-                                                ) = _spawn_with_offsets(
-                                                    model,
-                                                    rolename,
-                                                    spawn_tf,
-                                                    retry_offsets,
-                                                    world,
-                                                    world_map,
-                                                    lane_type,
-                                                    normalize_actor_z=bool(plan.get("normalize_actor_z")),
-                                                    autopilot=False,
-                                                )
-                                                attempts += retry_attempts
-                                                if actor is not None and retry_tf is not None:
-                                                    spawn_tf = retry_tf
-                                                    plan["spawn_transform"] = retry_tf
-                                                    offset_used = retry_offset
-                                                elif retry_exc is not None:
-                                                    last_exc = retry_exc
-
-                                        if actor is None and os.environ.get("CUSTOM_ACTOR_DYNAMIC_Z", "1").lower() in (
-                                            "1",
-                                            "true",
-                                            "yes",
-                                        ):
-                                            lift_steps = _parse_lift_steps(
-                                                os.environ.get(
-                                                    "CUSTOM_ACTOR_SPAWN_LIFT_STEPS", "0.2,0.5,1.0"
-                                                )
-                                            )
-                                            actor, lift_used, lift_exc = _spawn_with_lifts(
-                                                model,
-                                                rolename,
-                                                spawn_tf,
-                                                lift_steps,
-                                                autopilot=False,
-                                            )
-                                            attempts += len(lift_steps)
-                                            if actor is None and lift_exc is not None:
-                                                last_exc = lift_exc
-
-                                        if actor is None:
-                                            if last_exc is None:
-                                                raise RuntimeError("request_new_actor returned None")
-                                            raise last_exc
-                                    except Exception as exc:  # pylint: disable=broad-except
-                                        if state is not None:
-                                            state["attempts"] = int(state.get("attempts", 0)) + int(attempts)
-                                            state["last_failure"] = str(exc)
-                                        print(
-                                            f"[RouteScenario] Log replay spawn failed name={rolename} model={model}: {exc}"
-                                        )
-                                        _emit_spawn_debug(
-                                            "log_replay_spawn_exception",
-                                            plan,
-                                            spawn_tf,
-                                            plan.get("snap_to_road", False),
-                                            plan.get("spawn_debug", {}).get("ground_z"),
-                                            plan.get("spawn_debug", {}).get("stage_replay", False),
-                                            world,
-                                            world_map,
-                                            bool(plan.get("normalize_actor_z")),
-                                            bool(plan.get("follow_exact")),
-                                            True,
-                                            os.environ.get("CUSTOM_ACTOR_SPAWN_DEBUG", "").lower() in ("1", "true", "yes"),
-                                        )
-                                        return None
-                                    if state is not None:
-                                        state["attempts"] = int(state.get("attempts", 0)) + int(attempts)
-                                    if actor is not None and lift_used is not None:
-                                        if plan.get("normalize_actor_z"):
-                                            lane_type = carla.LaneType.Driving
-                                            if plan.get("role") in ("pedestrian", "walker", "bicycle", "cyclist"):
-                                                lane_type = carla.LaneType.Any
-                                            grounded_tf = _ground_actor_transform(
-                                                actor,
-                                                spawn_tf,
-                                                world_map,
-                                                world,
-                                                lane_type,
-                                            )
-                                            if grounded_tf is not None:
-                                                try:
-                                                    actor.set_transform(grounded_tf)
-                                                except Exception:  # pylint: disable=broad-except
-                                                    pass
-                                        else:
-                                            try:
-                                                actor.set_transform(spawn_tf)
-                                            except Exception:  # pylint: disable=broad-except
-                                                pass
-                                    elif actor is not None and offset_used is not None:
-                                        print(
-                                            "[RouteScenario] Log replay spawn retry succeeded name={} offset=({:+.2f},{:+.2f},{:+.2f})".format(
-                                                rolename,
-                                                float(offset_used[0]),
-                                                float(offset_used[1]),
-                                                float(offset_used[2]),
-                                            )
-                                        )
-                                    if actor is None:
-                                        if state is not None:
-                                            state["last_failure"] = "request_new_actor returned None"
-                                        print(
-                                            f"[RouteScenario] Log replay spawn returned None name={rolename} model={model}"
-                                        )
-                                        _emit_spawn_debug(
-                                            "log_replay_spawn_none",
-                                            plan,
-                                            spawn_tf,
-                                            plan.get("snap_to_road", False),
-                                            plan.get("spawn_debug", {}).get("ground_z"),
-                                            plan.get("spawn_debug", {}).get("stage_replay", False),
-                                            world,
-                                            world_map,
-                                            bool(plan.get("normalize_actor_z")),
-                                            bool(plan.get("follow_exact")),
-                                            True,
-                                            os.environ.get("CUSTOM_ACTOR_SPAWN_DEBUG", "").lower() in ("1", "true", "yes"),
-                                        )
-                                        return None
-                                    if state is not None:
-                                        state["spawned"] = True
-                                        state["last_failure"] = None
-                                        if offset_used is not None:
-                                            state["spawn_offset"] = offset_used
-                                    plan["actor"] = actor
-                                    self.other_actors.append(actor)
-                                    if plan.get("normalize_actor_z") and plan.get("plan_transforms"):
-                                        lane_type = carla.LaneType.Driving
-                                        if plan.get("role") in ("pedestrian", "walker", "bicycle", "cyclist"):
-                                            lane_type = carla.LaneType.Any
-                                        _glue_plan_to_ground(
-                                            plan.get("plan_transforms"),
-                                            actor,
-                                            world_map,
-                                            lane_type,
-                                            world,
-                                            prefer_ray_ground=bool(plan.get("ground_prefer_ray")),
-                                            z_extra=float(plan.get("ground_z_extra", 0.0)),
-                                        )
-                                        try:
-                                            actor.set_transform(plan["plan_transforms"][0])
-                                        except Exception:  # pylint: disable=broad-except
-                                            pass
-                                    return actor
-                                return _spawn
-                            spawn_cb = _make_spawn_cb()
-                            despawn_cb = _make_despawn_cb()
-                        if despawn_cb is None and not actor_plan.get("stage_after", False):
-                            despawn_cb = _make_despawn_cb()
-                        custom_behavior = LogReplayFollower(
-                            actor_plan["actor"],
-                            actor_plan.get("plan_transforms"),
-                            actor_plan.get("plan_times"),
-                            name=f"LogReplay-{actor_plan['name']}",
-                            stage_transform=actor_plan.get("stage_transform"),
-                            stage_before=actor_plan.get("stage_before", False),
-                            stage_after=actor_plan.get("stage_after", False),
-                            fail_on_exception=False,
-                            capture_callback=capture_cb,
-                            record_list=record_list,
-                            finalize_callback=finalize_cb,
-                            spawn_cb=spawn_cb,
-                            spawn_time=spawn_time,
-                            despawn_cb=despawn_cb,
-                            ground_each_tick=bool(actor_plan.get("normalize_actor_z")),
-                            ground_lane_type=(
-                                carla.LaneType.Any
-                                if actor_plan.get("role") in ("pedestrian", "walker", "bicycle", "cyclist")
-                                else carla.LaneType.Driving
-                            ),
-                            ground_world_map=world_map,
-                            ground_world=world,
-                            ground_prefer_ray=bool(actor_plan.get("ground_prefer_ray")),
-                            ground_z_extra=float(actor_plan.get("ground_z_extra", 0.0)),
-                            animate_walkers=bool(actor_plan.get("animate_walkers", True)),
-                        )
+                    custom_behavior = self._build_custom_actor_behavior(actor_plan)
+                    if custom_behavior is None:
                         if os.environ.get('DEBUG_FINISH', '').lower() in ('1', 'true', 'yes'):
-                            print("[DEBUG FINISH]   -> Using LogReplayFollower")
+                            print(f"[DEBUG FINISH]   -> Behavior is None, using default WaypointFollower")
+                        _ap_speed_cb = _make_plan_speed_callback(
+                            actor_plan.get("plan_transforms"),
+                            actor_plan.get("plan_speeds"),
+                            fallback_speed=actor_plan["target_speed"],
+                        )
+                        # Compute initial speed from plan_speeds or fall back to target_speed
+                        _plan_speeds = actor_plan.get("plan_speeds") or []
+                        _initial_speed = float(_plan_speeds[0]) if _plan_speeds else actor_plan.get("target_speed")
+                        custom_behavior = WaypointFollower(
+                            actor_plan["actor"],
+                            target_speed=actor_plan["target_speed"],
+                            plan=actor_plan["plan"],
+                            avoid_collision=actor_plan["avoid_collision"],
+                            speed_callback=_ap_speed_cb,
+                            name=f"FollowWaypoints-{actor_plan['name']}",
+                            initial_speed=_initial_speed,
+                        )
                     else:
-                        custom_behavior = self._build_custom_actor_behavior(actor_plan)
-                        if custom_behavior is None:
-                            if os.environ.get('DEBUG_FINISH', '').lower() in ('1', 'true', 'yes'):
-                                print(f"[DEBUG FINISH]   -> Behavior is None, using default WaypointFollower")
-                            custom_behavior = WaypointFollower(
-                                actor_plan["actor"],
-                                target_speed=actor_plan["target_speed"],
-                                plan=actor_plan["plan"],
-                                avoid_collision=actor_plan["avoid_collision"],
-                                name=f"FollowWaypoints-{actor_plan['name']}",
-                            )
-                        else:
-                            if os.environ.get('DEBUG_FINISH', '').lower() in ('1', 'true', 'yes'):
-                                print(f"[DEBUG FINISH]   -> Built custom behavior: {type(custom_behavior).__name__}")
+                        if os.environ.get('DEBUG_FINISH', '').lower() in ('1', 'true', 'yes'):
+                            print(f"[DEBUG FINISH]   -> Built custom behavior: {type(custom_behavior).__name__}")
+
+                    # ── Wrap with StagedWaypointFollower for delayed-start actors ──
+                    _plan_times = actor_plan.get("plan_times") or []
+                    _start_time = float(_plan_times[0]) if _plan_times else 0.0
+                    _STAGING_THRESHOLD = 0.5  # seconds – only stage if start > 0.5 s
+                    if _start_time > _STAGING_THRESHOLD:
+                        _interferes = _delayed_actor_interferes(
+                            actor_plan, self._custom_actor_plans,
+                        )
+                        # Compute initial speed from plan_speeds or fall back to target_speed
+                        _plan_speeds = actor_plan.get("plan_speeds") or []
+                        _initial_speed = float(_plan_speeds[0]) if _plan_speeds else actor_plan.get("target_speed")
+                        if os.environ.get('DEBUG_FINISH', '').lower() in ('1', 'true', 'yes'):
+                            print(f"[DEBUG FINISH]   -> Wrapping with StagedWaypointFollower "
+                                  f"(start_time={_start_time:.2f}s, "
+                                  f"hide_underground={_interferes}, "
+                                  f"initial_speed={_initial_speed:.2f})")
+                        custom_behavior = StagedWaypointFollower(
+                            actor=actor_plan["actor"],
+                            start_time=_start_time,
+                            inner_behavior=custom_behavior,
+                            plan_transforms=actor_plan.get("plan_transforms"),
+                            name=f"Staged-{actor_plan['name']}",
+                            hide_underground=_interferes,
+                            initial_speed=_initial_speed,
+                        )
+
                     subbehavior.add_child(custom_behavior)
 
             scenario_behaviors = []

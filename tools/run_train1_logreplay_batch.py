@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set
@@ -393,6 +394,186 @@ def _is_completed_scenario(
     return all(path.is_file() and path.stat().st_size > 0 for path in expected_outputs)
 
 
+def _overwrite_scenario_outputs(
+    scenario_name: str,
+    results_root: Path,
+    fullvideos_dir: Path,
+    *,
+    dry_run: bool,
+) -> None:
+    scenario_results_dir = results_root / scenario_name
+    video_paths = sorted(fullvideos_dir.glob(f"{scenario_name}_*.mp4"))
+
+    if not scenario_results_dir.exists() and not video_paths:
+        print(f"[INFO] No existing outputs to overwrite for scenario: {scenario_name}")
+        return
+
+    if scenario_results_dir.exists():
+        if dry_run:
+            print(f"[INFO] [dry-run] would remove results dir: {scenario_results_dir}")
+        else:
+            shutil.rmtree(scenario_results_dir)
+            print(f"[INFO] Removed results dir: {scenario_results_dir}")
+
+    for video_path in video_paths:
+        if dry_run:
+            print(f"[INFO] [dry-run] would remove video: {video_path}")
+        else:
+            video_path.unlink(missing_ok=True)
+            print(f"[INFO] Removed video: {video_path}")
+
+
+def _delete_stale_scenario_xml_exports(
+    scenario_dir: Path,
+    *,
+    dry_run: bool,
+) -> None:
+    export_dir = scenario_dir / "carla_log_export"
+    if not export_dir.exists():
+        return
+    if not export_dir.is_dir():
+        raise NotADirectoryError(f"Expected directory for route export cleanup: {export_dir}")
+    if dry_run:
+        print(f"[INFO] [dry-run] would remove stale route export dir: {export_dir}")
+        return
+    shutil.rmtree(export_dir)
+    print(f"[INFO] Removed stale route export dir: {export_dir}")
+
+
+def _collect_scenario_videos(scenario_name: str, fullvideos_dir: Path) -> List[Path]:
+    videos: List[Path] = []
+    for path in sorted(fullvideos_dir.glob(f"{scenario_name}_*.mp4")):
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                videos.append(path)
+        except OSError:
+            continue
+    return videos
+
+
+def _build_alignment_bundle(
+    scenarios: Sequence[Path],
+    bundle_zip: Path,
+    *,
+    dry_run: bool,
+) -> Optional[Path]:
+    valid_scenarios: List[Path] = [s for s in scenarios if s.exists() and s.is_dir()]
+    if not valid_scenarios:
+        print("[INFO] Alignment bundle skipped: no valid scenario directories.")
+        return None
+
+    if dry_run:
+        print(f"[INFO] [dry-run] would create alignment bundle: {bundle_zip}")
+        return bundle_zip
+
+    _ensure_dir(bundle_zip.parent)
+
+    added_files = 0
+    with zipfile.ZipFile(bundle_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for scenario_dir in valid_scenarios:
+            scenario_name = scenario_dir.name
+            export_dir = scenario_dir / "carla_log_export"
+            if not export_dir.exists() or not export_dir.is_dir():
+                print(f"[WARN] Missing carla_log_export for bundle: {export_dir}")
+                continue
+            for file_path in sorted(p for p in export_dir.rglob("*") if p.is_file()):
+                rel = file_path.relative_to(export_dir).as_posix()
+                arcname = f"{scenario_name}/carla_log_export/{rel}"
+                archive.write(file_path, arcname)
+                added_files += 1
+
+    if added_files <= 0:
+        try:
+            bundle_zip.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print("[INFO] Alignment bundle skipped: no files found under selected scenarios.")
+        return None
+
+    print(f"[INFO] Alignment bundle created: {bundle_zip} (files={added_files})")
+    return bundle_zip
+
+
+def _compile_route_alignment_studio(
+    *,
+    repo_root: Path,
+    python_bin: str,
+    dry_run: bool,
+    failure_tail_lines: int,
+) -> None:
+    studio_backend = repo_root / "tools" / "route_alignment_studio.py"
+    studio_frontend = repo_root / "tools" / "route_alignment_studio"
+    studio_js = studio_frontend / "app.js"
+    studio_html = studio_frontend / "index.html"
+    studio_css = studio_frontend / "style.css"
+
+    required_paths = [studio_backend, studio_js, studio_html, studio_css]
+    missing = [path for path in required_paths if not path.exists()]
+    if missing:
+        missing_text = ", ".join(str(path) for path in missing)
+        raise FileNotFoundError(f"Route Alignment Studio assets missing: {missing_text}")
+
+    print("[INFO] Compiling Route Alignment Studio backend/frontend checks...")
+    _run(
+        [python_bin, "-m", "py_compile", str(studio_backend)],
+        dry_run=dry_run,
+        failure_tail_lines=failure_tail_lines,
+    )
+
+    node_bin = shutil.which("node")
+    if node_bin:
+        _run(
+            [node_bin, "--check", str(studio_js)],
+            dry_run=dry_run,
+            failure_tail_lines=failure_tail_lines,
+        )
+    else:
+        print("[WARN] node not found; skipping app.js syntax check.")
+
+    print("[INFO] Route Alignment Studio compile checks completed.")
+
+
+def _print_alignment_bundle_summary(bundle_path: Path, repo_root: Path) -> None:
+    print(f"[SUMMARY] Alignment bundle: {bundle_path}")
+    map_cache = repo_root / "v2xpnp" / "map" / "carla_map_cache.pkl"
+    if map_cache.exists():
+        print(
+            "[SUMMARY] Studio launch: "
+            f"python tools/route_alignment_studio.py --bundle {bundle_path} "
+            f"--map-pkl {map_cache} --open-browser"
+        )
+    else:
+        print(
+            "[SUMMARY] Studio launch: "
+            f"python tools/route_alignment_studio.py --bundle {bundle_path} --open-browser"
+        )
+
+
+def _print_output_summary(
+    scenario_names: Sequence[str],
+    results_root: Path,
+    fullvideos_dir: Path,
+    *,
+    dry_run: bool,
+) -> None:
+    if not scenario_names:
+        return
+    print("\n=== Output Summary ===")
+    for scenario_name in scenario_names:
+        print(f"[SUMMARY] Scenario: {scenario_name}")
+        print(f"[SUMMARY] Results dir: {results_root / scenario_name}")
+        if dry_run:
+            print("[SUMMARY] Videos: [dry-run] not generated.")
+            continue
+        video_paths = _collect_scenario_videos(scenario_name, fullvideos_dir)
+        if not video_paths:
+            print("[SUMMARY] Videos: none found.")
+            continue
+        print("[SUMMARY] Videos:")
+        for video_path in video_paths:
+            print(f"  - {video_path}")
+
+
 def _dir_names(path: Path) -> Set[str]:
     if not path.exists():
         return set()
@@ -437,6 +618,24 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _parse_scenario_paths(raw_value: Optional[str]) -> List[Path]:
+    scenario_paths: List[Path] = []
+    seen: Set[Path] = set()
+    if raw_value is None:
+        return scenario_paths
+
+    for token in str(raw_value).split(","):
+        cleaned = token.strip()
+        if not cleaned:
+            continue
+        path = Path(cleaned).expanduser().resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        scenario_paths.append(path)
+    return scenario_paths
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run yaml_to_carla_log + run_custom_eval + gen_video for all scenarios in train1."
@@ -444,7 +643,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train1-root",
         type=Path,
-        default=Path("/data2/marco/CoLMDriver/v2xpnp/dataset/train4"),
+        default=Path("/data2/marco/CoLMDriver/v2xpnp/dataset/train1"),
         help="Root folder containing scenario subfolders.",
     )
     parser.add_argument(
@@ -542,10 +741,72 @@ def parse_args() -> argparse.Namespace:
         help="Resize factor for gen_video.",
     )
     parser.add_argument(
-        "--scenario",
-        action="append",
+        "--logreplay-rgb-fov",
+        type=float,
+        default=62.0,
+        help=(
+            "FOV for logreplay RGB capture forwarded to run_custom_eval "
+            "(wider than legacy default 58.0 to better match real cam1)."
+        ),
+    )
+    parser.add_argument(
+        "--custom-actor-control-mode",
+        choices=("policy", "replay"),
+        default="policy",
+        help=(
+            "Actor control mode forwarded to run_custom_eval. "
+            "'policy' keeps regular NPC controller behavior; "
+            "'replay' re-enables transform/timing log replay."
+        ),
+    )
+    parser.add_argument(
+        "--scenario-paths",
+        type=str,
         default=None,
-        help="Scenario folder name to run (repeatable). If omitted, run all subfolders.",
+        help=(
+            "Comma-separated absolute scenario directory paths to run. "
+            "If omitted, run all scenario subfolders under --train1-root."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Delete existing outputs for selected scenarios before running "
+            "(results_root/<scenario_name> and fullvideos/<scenario_name>_*.mp4). "
+            "Requires --scenario-paths."
+        ),
+    )
+    parser.add_argument(
+        "--alignment-bundle-zip",
+        type=Path,
+        default=None,
+        help=(
+            "Optional output ZIP path for route-alignment input bundle. "
+            "When omitted and --alignment-bundle is enabled, an auto-named ZIP is created "
+            "under results_root/alignment_bundles/."
+        ),
+    )
+    parser.add_argument(
+        "--alignment-bundle",
+        dest="alignment_bundle",
+        action="store_true",
+        default=True,
+        help="Create route-alignment ZIP bundle from selected scenarios (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-alignment-bundle",
+        dest="alignment_bundle",
+        action="store_false",
+        help="Disable route-alignment ZIP bundle generation.",
+    )
+    parser.add_argument(
+        "--alignment-studio-only",
+        action="store_true",
+        help=(
+            "One-shot mode: skip yaml/eval/video stages, compile Route Alignment Studio checks, "
+            "and build an alignment bundle from existing carla_log_export files only."
+        ),
     )
     parser.add_argument(
         "--python",
@@ -608,16 +869,17 @@ def main() -> int:
     eval_script = repo_root / "tools" / "run_custom_eval.py"
     gen_video_script = repo_root / "visualization" / "gen_video.py"
 
-    if not train1_root.exists():
+    if args.scenario_paths is None and not train1_root.exists():
         raise FileNotFoundError(f"train1 root not found: {train1_root}")
-    if not coord_json.exists():
-        raise FileNotFoundError(f"coord json not found: {coord_json}")
-    if not yaml_to_log_script.exists():
-        raise FileNotFoundError(f"yaml_to_carla_log script not found: {yaml_to_log_script}")
-    if not eval_script.exists():
-        raise FileNotFoundError(f"run_custom_eval script not found: {eval_script}")
-    if not gen_video_script.exists():
-        raise FileNotFoundError(f"gen_video script not found: {gen_video_script}")
+    if not args.alignment_studio_only:
+        if not coord_json.exists():
+            raise FileNotFoundError(f"coord json not found: {coord_json}")
+        if not yaml_to_log_script.exists():
+            raise FileNotFoundError(f"yaml_to_carla_log script not found: {yaml_to_log_script}")
+        if not eval_script.exists():
+            raise FileNotFoundError(f"run_custom_eval script not found: {eval_script}")
+        if not gen_video_script.exists():
+            raise FileNotFoundError(f"gen_video script not found: {gen_video_script}")
 
     carla_server: Optional[CarlaServer] = None
     prev_sigterm = signal.getsignal(signal.SIGTERM)
@@ -629,21 +891,113 @@ def main() -> int:
 
     _ensure_dir(fullvideos_dir)
 
-    scenarios = _scenario_dirs(train1_root)
-    if args.scenario:
-        wanted = set(args.scenario)
-        scenarios = [s for s in scenarios if s.name in wanted]
+    scenarios = _parse_scenario_paths(args.scenario_paths)
+    if scenarios:
+        for scenario_dir in scenarios:
+            if not scenario_dir.exists():
+                raise FileNotFoundError(f"scenario path not found: {scenario_dir}")
+            if not scenario_dir.is_dir():
+                raise NotADirectoryError(f"scenario path is not a directory: {scenario_dir}")
+    else:
+        scenarios = _scenario_dirs(train1_root)
 
     if not scenarios:
         print("No scenarios found to process.")
         return 0
 
-    print(f"Found {len(scenarios)} scenario(s) under {train1_root}")
+    if args.overwrite and not args.scenario_paths and not args.alignment_studio_only:
+        raise ValueError("--overwrite requires --scenario-paths to limit deletion scope.")
+
+    if args.overwrite and args.alignment_studio_only:
+        print("[WARN] --overwrite is ignored in --alignment-studio-only mode.")
+    elif args.overwrite:
+        for scenario_dir in scenarios:
+            _overwrite_scenario_outputs(
+                scenario_name=scenario_dir.name,
+                results_root=results_root,
+                fullvideos_dir=fullvideos_dir,
+                dry_run=args.dry_run,
+            )
+
+    if args.scenario_paths:
+        print(f"Found {len(scenarios)} scenario(s) from --scenario-paths")
+    else:
+        print(f"Found {len(scenarios)} scenario(s) under {train1_root}")
+    scenario_names = [s.name for s in scenarios]
+    want_alignment_bundle = bool(args.alignment_bundle or args.alignment_studio_only)
+
+    if args.alignment_studio_only:
+        try:
+            _compile_route_alignment_studio(
+                repo_root=repo_root,
+                python_bin=python_bin,
+                dry_run=args.dry_run,
+                failure_tail_lines=args.failure_tail_lines,
+            )
+            if args.alignment_bundle_zip is not None:
+                candidate_bundle = args.alignment_bundle_zip.expanduser().resolve()
+            else:
+                candidate_bundle = (
+                    results_root
+                    / "alignment_bundles"
+                    / f"alignment_bundle_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                )
+
+            bundle_path = _build_alignment_bundle(
+                scenarios=scenarios,
+                bundle_zip=candidate_bundle,
+                dry_run=args.dry_run,
+            )
+            if bundle_path is None:
+                print("[ERROR] Alignment Studio prep failed: no bundle was created.")
+                return 1
+
+            print("\n=== Alignment Studio Prep Summary ===")
+            print(f"[SUMMARY] Scenarios included: {len(scenarios)}")
+            _print_alignment_bundle_summary(bundle_path, repo_root)
+            print("\nDone.")
+            return 0
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[ERROR] Alignment Studio prep failed: {exc}")
+            return 1
+
+    finalized = False
+
+    def _finalize_outputs() -> None:
+        nonlocal finalized
+        if finalized:
+            return
+        finalized = True
+
+        bundle_path: Optional[Path] = None
+        if want_alignment_bundle:
+            if args.alignment_bundle_zip is not None:
+                candidate_bundle = args.alignment_bundle_zip.expanduser().resolve()
+            else:
+                candidate_bundle = (
+                    results_root
+                    / "alignment_bundles"
+                    / f"alignment_bundle_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                )
+            bundle_path = _build_alignment_bundle(
+                scenarios=scenarios,
+                bundle_zip=candidate_bundle,
+                dry_run=args.dry_run,
+            )
+
+        _print_output_summary(
+            scenario_names=scenario_names,
+            results_root=results_root,
+            fullvideos_dir=fullvideos_dir,
+            dry_run=args.dry_run,
+        )
+        if bundle_path is not None:
+            _print_alignment_bundle_summary(bundle_path, repo_root)
 
     try:
         for scenario_dir in scenarios:
             scenario_name = scenario_dir.name
-            if _is_completed_scenario(scenario_name, scenario_dir, fullvideos_dir):
+            if (not args.overwrite) and _is_completed_scenario(scenario_name, scenario_dir, fullvideos_dir):
                 print(f"\n=== Scenario: {scenario_name} ===")
                 print("[SKIP] Scenario already completed (all expected videos exist).")
                 continue
@@ -654,6 +1008,9 @@ def main() -> int:
             print(f"[INFO] scenario log: {scenario_log_path}")
 
             try:
+                # Always regenerate routes from a clean export dir so old XMLs never leak across runs.
+                _delete_stale_scenario_xml_exports(scenario_dir, dry_run=args.dry_run)
+
                 selected_port = _find_available_carla_port(
                     host=str(args.carla_host),
                     preferred_port=int(args.port),
@@ -686,7 +1043,25 @@ def main() -> int:
                     "--coord-json",
                     str(coord_json),
                     "--use-carla-map",
-                    "--encode-timing",
+                    "--spawn-preprocess-maximal",
+                    "--spawn-preprocess-report",
+                    "spawn_preprocess_report.json",
+                    "--early-spawn-report",
+                    "early_spawn_report.json",
+                    "--late-despawn-report",
+                    "late_despawn_report.json",
+                    "--static-path-threshold",
+                    "1.2",
+                    "--static-net-disp-threshold",
+                    "0.8",
+                    "--static-bbox-extent-threshold",
+                    "0.9",
+                    "--static-avg-speed-threshold",
+                    "0.8",
+                    "--spawn-preprocess-refine-early-lane-lock-seconds",
+                    "1.0",
+                    "--spawn-preprocess-refine-early-lane-switch-override-margin",
+                    "0.9",
                     "--carla-host",
                     str(args.carla_host),
                     "--carla-port",
@@ -717,6 +1092,8 @@ def main() -> int:
                 eval_args = [
                     "--planner",
                     "log-replay",
+                    "--custom-actor-control-mode",
+                    str(args.custom_actor_control_mode),
                     "--port",
                     str(selected_port),
                     "--traffic-manager-port",
@@ -726,10 +1103,40 @@ def main() -> int:
                     "--image-save-interval",
                     "1",
                     "--capture-logreplay-images",
+                    "--logreplay-rgb-fov",
+                    str(args.logreplay_rgb_fov),
                     "--results-tag",
                     scenario_name,
-                    "--normalize-actor-z",
                 ]
+                if args.custom_actor_control_mode == "replay":
+                    eval_args.extend(
+                        [
+                            "--smooth-log-replay-vehicles",
+                            "--log-replay-smooth-min-cutoff",
+                            "0.24",
+                            "--log-replay-smooth-beta",
+                            "0.05",
+                            "--log-replay-smooth-yaw-min-cutoff",
+                            "0.16",
+                            "--log-replay-smooth-yaw-beta",
+                            "0.02",
+                            "--log-replay-smooth-z-min-cutoff",
+                            "0.32",
+                            "--log-replay-smooth-z-beta",
+                            "0.03",
+                            "--log-replay-lateral-damping",
+                            "0.90",
+                            "--log-replay-lateral-passes",
+                            "5",
+                            "--log-replay-lateral-max-correction",
+                            "0.55",
+                            "--log-replay-lateral-turn-keep",
+                            "0.60",
+                            "--log-replay-lateral-turn-angle-deg",
+                            "18.0",
+                            "--normalize-actor-z",
+                        ]
+                    )
                 cmd_eval = _python_cmd(
                     script_path=eval_script,
                     script_args=eval_args,
@@ -887,18 +1294,21 @@ def main() -> int:
                 print(f"[ERROR] Scenario failed: {scenario_name} -> {exc}")
                 print(f"[ERROR] See scenario log: {scenario_log_path}")
                 if not args.continue_on_error:
+                    _finalize_outputs()
                     return 1
             finally:
                 if carla_server is not None:
                     carla_server.stop()
     except KeyboardInterrupt:
         print("\n[WARN] Interrupted by user. Shutting down CARLA and exiting.")
+        _finalize_outputs()
         return 130
     finally:
         signal.signal(signal.SIGTERM, prev_sigterm)
         if carla_server is not None:
             carla_server.stop()
 
+    _finalize_outputs()
     print("\nDone.")
     return 0
 
