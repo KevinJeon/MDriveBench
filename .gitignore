@@ -9,6 +9,9 @@ benchmark_runs
 scenario_generator/log
 scenario_generator/routes
 all_videos/
+all_videos.zip
+models/
+ucla_v2_0.9.12-dirty.tar.gz
 debug_runs_passed/
 
 # Byte-compiled / optimized / DLL files
