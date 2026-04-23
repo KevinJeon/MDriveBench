@@ -1,0 +1,17 @@
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_16.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_17.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_18.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_19.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_20.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_21.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_22.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_23.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_24.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_25.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_26.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_27.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_28.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_29.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_30.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_31.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town01_32.sh 

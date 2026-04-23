@@ -1,0 +1,10 @@
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_0.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_1.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_2.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_3.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_4.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_5.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_6.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_7.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_8.sh 
+bash ./simulation/data_collection/scripts/weather-0/routes_town02_9.sh 

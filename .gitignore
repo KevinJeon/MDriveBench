@@ -289,6 +289,14 @@ CustomRoutes/
 
 ckpt/
 ckpt
+CoLMDriver/ckpt/
+CoLMDriver/ckpt
+CoLMDriver/dataset/
+CoLMDriver/dataset
+CoLMDriver/weather0/
+CoLMDriver/weather0
+CoLMDriver/weather-0/
+CoLMDriver/weather-0
 simulation/assets/LMDrive
 testscenarios/
 carla912/

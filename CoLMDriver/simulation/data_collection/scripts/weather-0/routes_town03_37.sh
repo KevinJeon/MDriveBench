@@ -1,0 +1,50 @@
+#!/bin/bash
+export CARLA_ROOT=external_paths/carla_root
+export LEADERBOARD_ROOT=simulation/leaderboard
+export SCENARIO_RUNNER_ROOT=simulation/scenario_runner
+export DATA_ROOT=external_paths/data_root
+
+export YAML_ROOT=simulation/data_collection/yamls
+export CARLA_SERVER=${CARLA_ROOT}/CarlaUE4.sh
+export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI
+export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla
+export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla/dist/carla-0.9.10-py3.7-linux-x86_64.egg
+export PYTHONPATH=$PYTHONPATH:${LEADERBOARD_ROOT}
+export PYTHONPATH=$PYTHONPATH:${LEADERBOARD_ROOT}/team_code
+export PYTHONPATH=$PYTHONPATH:${SCENARIO_RUNNER_ROOT}
+
+export CHECKPOINT_ENDPOINT=${DATA_ROOT}/weather-0/results/routes_town03_37.json
+export SAVE_PATH=${DATA_ROOT}/weather-0/data
+export TEAM_CONFIG=${YAML_ROOT}/weather-0.yaml
+export TRAFFIC_SEED=2000
+export CARLA_SEED=2000
+export SCENARIOS=${LEADERBOARD_ROOT}/data/scenarios/town03_all_scenarios.json
+export SCENARIOS_PARAMETER=${LEADERBOARD_ROOT}/leaderboard/scenarios/scenario_parameter_datagen.yaml
+export ROUTES=${LEADERBOARD_ROOT}/data/training_routes/splitted_routes/routes_town03_37.xml
+export TM_PORT=40510
+export PORT=40010
+export CHALLENGE_TRACK_CODENAME=SENSORS
+export DEBUG_CHALLENGE=0
+export REPETITIONS=1 # multiple evaluation runs
+export TEAM_AGENT=${LEADERBOARD_ROOT}/team_code/auto_pilot.py # agent
+export RESUME=0
+export EGO_NUM=2
+
+python ${LEADERBOARD_ROOT}/leaderboard/leaderboard_evaluator_parameter.py \
+--scenarios=${SCENARIOS}  \
+--scenario_parameter=${SCENARIOS_PARAMETER}  \
+--routes=${ROUTES} \
+--repetitions=${REPETITIONS} \
+--track=${CHALLENGE_TRACK_CODENAME} \
+--checkpoint=${CHECKPOINT_ENDPOINT} \
+--agent=${TEAM_AGENT} \
+--agent-config=${TEAM_CONFIG} \
+--debug=${DEBUG_CHALLENGE} \
+--record=${RECORD_PATH} \
+--resume=${RESUME} \
+--port=${PORT} \
+--trafficManagerPort=${TM_PORT} \
+--carlaProviderSeed=${CARLA_SEED} \
+--trafficManagerSeed=${TRAFFIC_SEED} \
+--ego-num=${EGO_NUM} \
+--timeout 600
