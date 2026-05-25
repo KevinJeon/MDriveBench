@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="utf-8"?>
+<routes><route id="07_placement" town="Town02" role="ego" model="vehicle.lincoln.mkz2017" speed="8.00"><weather cloudiness="80.00" precipitation="0.00" precipitation_deposits="0.00" wind_intensity="0.35" sun_azimuth_angle="45.00" sun_altitude_angle="75.00" wetness="0.00" fog_distance="0.00" fog_density="0.00" /><waypoint x="170.981000" y="236.918000" z="0.000000" yaw="-179.965231" /><waypoint x="96.981000" y="236.902000" z="0.000000" yaw="-179.965231" /></route></routes>

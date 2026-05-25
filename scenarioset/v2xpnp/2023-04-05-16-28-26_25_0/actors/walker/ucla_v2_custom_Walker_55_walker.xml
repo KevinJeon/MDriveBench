@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='utf-8'?>
 <routes>
-  <route control_mode="replay" id="2023-04-05-16-28-26_25_0" model="walker.pedestrian.0008" role="walker" snap_to_road="false" town="ucla_v2">
+  <route control_mode="replay" id="2023-04-05-16-28-26_25_0" model="walker.pedestrian.0003" role="walker" snap_to_road="false" town="ucla_v2">
     <waypoint pitch="0.000000" roll="0.000000" time="0.000000" x="-440.874041" y="-36.761678" yaw="-88.472065" z="10.777446" />
     <waypoint pitch="0.000000" roll="0.000000" time="0.100000" x="-440.859213" y="-36.903877" yaw="-88.472065" z="10.778232" />
     <waypoint pitch="0.000000" roll="0.000000" time="0.200000" x="-440.838799" y="-37.003707" yaw="-88.472065" z="10.778881" />

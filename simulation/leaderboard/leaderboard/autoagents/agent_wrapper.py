@@ -22,8 +22,13 @@ from leaderboard.autoagents.autonomous_agent import Track
 import json
 import numpy as np
 
-MAX_ALLOWED_RADIUS_SENSOR = 3.0
-MAX_ALLOWED_RADIUS_SENSOR = 1000.0 # increased for topdown map generation
+try:
+    from common.carla_connection_events import log_sensor_event as _log_sensor_event
+except Exception:  # pragma: no cover - keep runnable without repo root on PYTHONPATH
+    def _log_sensor_event(event, **kwargs):  # type: ignore[misc]
+        pass
+
+MAX_ALLOWED_RADIUS_SENSOR = 1000.0  # increased for topdown map generation
 
 SENSORS_LIMITS = {
     'sensor.camera.rgb': 10,
@@ -32,6 +37,7 @@ SENSORS_LIMITS = {
     'sensor.lidar.ray_cast': 1,
     'sensor.lidar.ray_cast_semantic': 1,
     'sensor.other.radar': 2,
+    'sensor.other.collision': 1,
     'sensor.other.gnss': 1,
     'sensor.other.imu': 1,
     'sensor.opendrive_map': 1,
@@ -97,12 +103,12 @@ class AgentWrapper(object):
         'sensor.lidar.ray_cast',
         'sensor.lidar.ray_cast_semantic',
         'sensor.other.radar',
+        'sensor.other.collision',
         'sensor.other.gnss',
         'sensor.other.imu'
     ]
 
     _agent = None
-    _sensors_list = []
 
     def __init__(self, agent):
         """
@@ -110,7 +116,7 @@ class AgentWrapper(object):
         """
         self._agent = agent
         self.ego_vehicles_num = agent.ego_vehicles_num
-        self._sensors_list.extend([[] for _ in range(0,self.ego_vehicles_num)])
+        self._sensors_list = [[] for _ in range(self.ego_vehicles_num)]
 
     def __call__(self):
         """
@@ -165,9 +171,15 @@ class AgentWrapper(object):
                     bp.set_attribute('image_size_x', str(sensor_spec['width']))
                     bp.set_attribute('image_size_y', str(sensor_spec['height']))
                     bp.set_attribute('fov', str(sensor_spec['fov']))
-                    is_logreplay_rgb = sensor_spec.get('id') == 'logreplay_rgb'
-                    if is_logreplay_rgb:
-                        # Keep log-replay image captures visually clean while preserving
+                    sensor_id = str(sensor_spec.get('id', ''))
+                    # Cinematic / log-replay capture sensors must be free of
+                    # lens distortion + chromatic aberration: the planner-facing
+                    # branch below explicitly cranks lens_circle_* up to 3.0
+                    # (for TCP and friends) and chromatic_aberration_intensity
+                    # to 0.5, both of which are visible at the frame edges.
+                    is_clean_camera = sensor_id == 'logreplay_rgb' or sensor_id.startswith('cine_')
+                    if is_clean_camera:
+                        # Keep image captures visually clean while preserving
                         # existing post-processing for planner-facing cameras.
                         _safe_set_bp_attribute(bp, 'chromatic_aberration_intensity', 0.0)
                         _safe_set_bp_attribute(bp, 'chromatic_aberration_offset', 0.0)
@@ -175,6 +187,14 @@ class AgentWrapper(object):
                         _safe_set_bp_attribute(bp, 'lens_circle_falloff', 0.0)
                         _safe_set_bp_attribute(bp, 'lens_k', 0.0)
                         _safe_set_bp_attribute(bp, 'lens_kcube', 0.0)
+                        # Also disable motion blur / bloom / lens flare for
+                        # crisp video frames (these are PostProcess effects
+                        # CARLA applies on top of the lens model).
+                        _safe_set_bp_attribute(bp, 'motion_blur_intensity', 0.0)
+                        _safe_set_bp_attribute(bp, 'motion_blur_max_distortion', 0.0)
+                        _safe_set_bp_attribute(bp, 'motion_blur_min_object_screen_size', 0.0)
+                        _safe_set_bp_attribute(bp, 'bloom_intensity', 0.0)
+                        _safe_set_bp_attribute(bp, 'lens_flare_intensity', 0.0)
                     else:
                         bp.set_attribute('chromatic_aberration_intensity', str(0.5))
                         bp.set_attribute('chromatic_aberration_offset', str(0))
@@ -192,13 +212,16 @@ class AgentWrapper(object):
                                                      roll=sensor_spec['roll'],
                                                      yaw=sensor_spec['yaw'])
                 elif sensor_spec['type'].startswith('sensor.lidar.ray_cast_semantic'):
-                    bp.set_attribute('range', str(85))
-                    bp.set_attribute('rotation_frequency', str(20)) # default: 10, change to 20 for old lidar models
-                    bp.set_attribute('channels', str(32))
-                    bp.set_attribute('upper_fov', str(10))
-                    bp.set_attribute('lower_fov', str(-30))
-                    bp.set_attribute('points_per_second', str(250000))
-                    # bp.set_attribute('horizontal_fov', str(100))
+                    # Honor sensor_spec values if the agent provided them so the
+                    # visibility-filter ray pattern can be matched to the main
+                    # perception LiDAR (openloop AP protocol). Falls back to the
+                    # legacy hardcoded defaults when the spec is silent.
+                    bp.set_attribute('range', str(sensor_spec.get('range', 85)))
+                    bp.set_attribute('rotation_frequency', str(sensor_spec.get('rotation_frequency', 20)))
+                    bp.set_attribute('channels', str(sensor_spec.get('channels', 32)))
+                    bp.set_attribute('upper_fov', str(sensor_spec.get('upper_fov', 10)))
+                    bp.set_attribute('lower_fov', str(sensor_spec.get('lower_fov', -30)))
+                    bp.set_attribute('points_per_second', str(sensor_spec.get('points_per_second', 250000)))
                     sensor_location = carla.Location(x=sensor_spec['x'], y=sensor_spec['y'],
                                                      z=sensor_spec['z'])
                     sensor_rotation = carla.Rotation(pitch=sensor_spec['pitch'],
@@ -251,6 +274,14 @@ class AgentWrapper(object):
                                                      roll=sensor_spec['roll'],
                                                      yaw=sensor_spec['yaw'])
 
+                elif sensor_spec['type'].startswith('sensor.other.collision'):
+                    sensor_location = carla.Location(x=sensor_spec['x'],
+                                                     y=sensor_spec['y'],
+                                                     z=sensor_spec['z'])
+                    sensor_rotation = carla.Rotation(pitch=sensor_spec['pitch'],
+                                                     roll=sensor_spec['roll'],
+                                                     yaw=sensor_spec['yaw'])
+
                 elif sensor_spec['type'].startswith('sensor.other.gnss'):
                     # bp.set_attribute('noise_alt_stddev', str(0.000005))
                     # bp.set_attribute('noise_lat_stddev', str(0.000005))
@@ -281,6 +312,16 @@ class AgentWrapper(object):
                 # create sensor
                 sensor_transform = carla.Transform(sensor_location, sensor_rotation)
                 sensor = CarlaDataProvider.get_world().spawn_actor(bp, sensor_transform, vehicle)
+            # log sensor spawn for forensic lifecycle tracking
+            try:
+                _log_sensor_event(
+                    "SENSOR_SPAWN",
+                    sensor=sensor,
+                    sensor_type=sensor_spec.get('type', ''),
+                    sensor_tag=sensor_spec.get('id', '') + "_{}".format(vehicle_num),
+                )
+            except Exception:
+                pass
             # setup callback
             sensor_tag = sensor_spec['id']+"_{}".format(vehicle_num)
             sensor.listen(CallBack(sensor_tag, sensor_spec['type'], sensor, self._agent.sensor_interface))
@@ -299,6 +340,18 @@ class AgentWrapper(object):
                 out_dir = os.path.join(str(capture_root), f"{sensor_spec['id']}_{vehicle_num}")
                 self._agent.sensor_interface.configure_image_capture(sensor_tag, out_dir)
             self._sensors_list[vehicle_num].append(sensor)
+
+        # Hook for stationary roadside / infrastructure sensors that aren't
+        # attached to a vehicle. Called BEFORE the priming world.tick() below
+        # so the new sensors' first-frame data is published at the same tick
+        # as the ego sensors. Idempotent — agents implement
+        # setup_infra_sensors() to be a no-op on repeat calls (one per ego).
+        try:
+            _hook = getattr(self._agent, "setup_infra_sensors", None)
+            if callable(_hook):
+                _hook()
+        except Exception as _exc:
+            print(f"[agent_wrapper] setup_infra_sensors hook failed: {_exc}")
 
         # Tick once to spawn the sensors
         CarlaDataProvider.get_world().tick()
@@ -364,36 +417,189 @@ class AgentWrapper(object):
         """
         Remove sensor tags of one ego vehicle
         """
+        sensor_interface = getattr(self._agent, "sensor_interface", None)
+        if sensor_interface is None:
+            return
         for sensor_spec in self._agent.sensors():
             sensor_tag = sensor_spec['id']+"_{}".format(vehicle_num)
-            if hasattr(self._agent.sensor_interface, "unregister_image_capture"):
-                self._agent.sensor_interface.unregister_image_capture(sensor_tag)
-            del self._agent.sensor_interface._sensors_objects[sensor_tag]
+            try:
+                _log_sensor_event(
+                    "SENSOR_LISTENER_DETACH",
+                    sensor_tag=sensor_tag,
+                    status="begin",
+                )
+            except Exception:
+                pass
+            if hasattr(sensor_interface, "unregister_image_capture"):
+                sensor_interface.unregister_image_capture(sensor_tag)
+            if hasattr(sensor_interface, "unregister_sensor"):
+                sensor_interface.unregister_sensor(sensor_tag)
+            else:
+                sensor_interface._sensors_objects.pop(sensor_tag, None)
+                if hasattr(sensor_interface, "_last_returned_timestamps"):
+                    sensor_interface._last_returned_timestamps.pop(sensor_tag, None)
+                if hasattr(sensor_interface, "_latest_data"):
+                    sensor_interface._latest_data.pop(sensor_tag, None)
+            try:
+                _log_sensor_event(
+                    "SENSOR_LISTENER_DETACH",
+                    sensor_tag=sensor_tag,
+                    status="end",
+                )
+            except Exception:
+                pass
 
-    def cleanup(self):
+    @staticmethod
+    def _sensor_actor_id(sensor):
+        if sensor is None:
+            return None
+        try:
+            sensor_id = getattr(sensor, "id", None)
+            if sensor_id is None:
+                return None
+            return int(sensor_id)
+        except Exception:
+            return None
+
+    def _cleanup_vehicle_sensors(self, vehicle_num, *, fast=False):
+        if vehicle_num < 0 or vehicle_num >= len(self._sensors_list):
+            return
+
+        sensors_ego = list(self._sensors_list[vehicle_num] or [])
+        if not sensors_ego:
+            self.del_ego_sensor(vehicle_num)
+            self._sensors_list[vehicle_num] = []
+            return
+
+        # Phase 1: unregister callbacks/listeners so late packets are dropped.
+        self.del_ego_sensor(vehicle_num)
+
+        # Phase 2: stop sensor streams before any actor destruction RPC.
+        for idx, sensor in enumerate(sensors_ego):
+            if sensor is None:
+                continue
+            try:
+                _log_sensor_event(
+                    "SENSOR_STOP_BEGIN",
+                    sensor=sensor,
+                    sensor_tag=f"ego{vehicle_num}:{idx}",
+                )
+            except Exception:
+                pass
+            stop_status = "ok"
+            try:
+                sensor.stop()
+            except Exception:
+                stop_status = "fail"
+            try:
+                _log_sensor_event(
+                    "SENSOR_STOP_END",
+                    sensor=sensor,
+                    sensor_tag=f"ego{vehicle_num}:{idx}",
+                    status=stop_status,
+                )
+            except Exception:
+                pass
+
+        # Phase 3: destroy CARLA-backed sensors with verified synchronous batch RPC.
+        sensor_actor_ids = []
+        sensor_actor_id_set = set()
+        for sensor in sensors_ego:
+            sensor_id = self._sensor_actor_id(sensor)
+            if sensor_id is None:
+                continue
+            if sensor_id in sensor_actor_id_set:
+                continue
+            sensor_actor_id_set.add(sensor_id)
+            sensor_actor_ids.append(sensor_id)
+
+        if sensor_actor_ids:
+            try:
+                _log_sensor_event(
+                    "SENSOR_DESTROY_BATCH_BEGIN",
+                    sensor_tag=f"ego_{vehicle_num}",
+                    actor_count=len(sensor_actor_ids),
+                    actor_ids=",".join(str(i) for i in sensor_actor_ids[:20]),
+                )
+            except Exception:
+                pass
+        destroy_summary = CarlaDataProvider.destroy_actor_ids(
+            sensor_actor_ids,
+            reason=f"agent_wrapper_sensor_cleanup_vehicle_{vehicle_num}",
+            timeout_s=0.5 if fast else 4.0,
+            poll_s=0.02 if fast else 0.05,
+            max_retries=0 if fast else 2,
+            direct_fallback=not fast,
+        )
+        if sensor_actor_ids:
+            try:
+                _log_sensor_event(
+                    "SENSOR_DESTROY_BATCH_RESULT",
+                    sensor_tag=f"ego_{vehicle_num}",
+                    actor_count=len(sensor_actor_ids),
+                    destroyed_count=len(destroy_summary.get("destroyed_ids", [])),
+                    already_gone_count=len(destroy_summary.get("already_gone_ids", [])),
+                    failed_count=len(destroy_summary.get("failed_ids", [])),
+                    remaining_count=len(destroy_summary.get("remaining_alive_ids", [])),
+                    failed_ids=",".join(
+                        str(i) for i in destroy_summary.get("failed_ids", [])[:20]
+                    ),
+                )
+            except Exception:
+                pass
+        failed_actor_ids = set(destroy_summary.get("failed_ids", []))
+        failed_actor_ids.update(destroy_summary.get("remaining_alive_ids", []))
+
+        # Phase 4: direct destroy fallback for pseudo sensors; CARLA-backed failures
+        # are deferred in fast mode to avoid aggressive mid-route RPC churn.
+        for idx, sensor in enumerate(sensors_ego):
+            if sensor is None:
+                continue
+            sensor_id = self._sensor_actor_id(sensor)
+            destroyed_via_batch = sensor_id is not None and sensor_id not in failed_actor_ids
+            is_carla_sensor = sensor_id is not None
+            use_direct_destroy = not destroyed_via_batch and (
+                (not is_carla_sensor) or (not fast)
+            )
+            try:
+                _log_sensor_event(
+                    "SENSOR_DESTROY",
+                    sensor=sensor,
+                    sensor_tag=f"ego{vehicle_num}:{idx}",
+                    teardown_path=(
+                        "batch_rpc"
+                        if destroyed_via_batch
+                        else ("direct" if use_direct_destroy else "deferred")
+                    ),
+                )
+            except Exception:
+                pass
+
+            if use_direct_destroy:
+                try:
+                    sensor.destroy()
+                except Exception:
+                    pass
+            self._sensors_list[vehicle_num][idx] = None
+
+        self._sensors_list[vehicle_num] = []
+
+    def cleanup(self, *, finalize_capture=True):
         """
         Remove and destroy all sensors
         """
-        for i, _sensors_ego in enumerate(self._sensors_list):
-            for i, _ in enumerate(_sensors_ego):
-                if _sensors_ego[i] is not None:
-                    _sensors_ego[i].stop()
-                    _sensors_ego[i].destroy()
-                    _sensors_ego[i] = None
-            _sensors_ego = []
-        if hasattr(self._agent.sensor_interface, "finalize_image_capture"):
-            self._agent.sensor_interface.finalize_image_capture()
+        for vehicle_num, _ in enumerate(self._sensors_list):
+            self._cleanup_vehicle_sensors(vehicle_num, fast=False)
+        sensor_interface = getattr(self._agent, "sensor_interface", None)
+        if finalize_capture and sensor_interface is not None and hasattr(sensor_interface, "finalize_image_capture"):
+            sensor_interface.finalize_image_capture()
+        self._sensors_list = [[] for _ in range(self.ego_vehicles_num)]
 
     def cleanup_single(self, vehicle_num = 0):
         """
         Remove and destroy all sensors
         """
-        for i, _ in enumerate(self._sensors_list[vehicle_num]):
-            if self._sensors_list[vehicle_num][i] is not None:
-                self._sensors_list[vehicle_num][i].stop()
-                self._sensors_list[vehicle_num][i].destroy()
-                self._sensors_list[vehicle_num][i] = None
-        self._sensors_list[vehicle_num] = []
+        self._cleanup_vehicle_sensors(vehicle_num, fast=True)
 
     def cleanup_rsu(self, vehicle_num):
         if hasattr(self._agent,"clean_rsu_single"):

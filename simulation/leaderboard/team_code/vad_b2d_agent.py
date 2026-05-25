@@ -1,4 +1,5 @@
 import os
+import copy
 import json
 import datetime
 import pathlib
@@ -10,6 +11,7 @@ import math
 from collections import OrderedDict
 from scipy.optimize import fsolve
 import torch
+torch.backends.cudnn.benchmark = True
 import carla
 import yaml
 import numpy as np
@@ -33,11 +35,8 @@ from pathlib import Path
 
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
-# Always enable route debugging; set VAD_ROUTE_DEBUG=0 to disable.
-ROUTE_DEBUG_FLAG = str(os.environ.get("VAD_ROUTE_DEBUG", "1")).lower() in ("1", "true", "yes")
-ROUTE_DEBUG_DIR = os.environ.get("VAD_ROUTE_DEBUG_DIR", "results/vad_route_debug")
-# Force route debugging on by default; override with VAD_ROUTE_DEBUG=0 if needed.
-ROUTE_DEBUG_FLAG = str(os.environ.get("VAD_ROUTE_DEBUG", "1")).lower() in ("1", "true", "yes")
+# Route debugging is opt-in in normal evaluation runs.
+ROUTE_DEBUG_FLAG = str(os.environ.get("VAD_ROUTE_DEBUG", "0")).lower() in ("1", "true", "yes")
 ROUTE_DEBUG_DIR = os.environ.get("VAD_ROUTE_DEBUG_DIR", "results/vad_route_debug")
 
 
@@ -78,13 +77,27 @@ class VadAgent(autonomous_agent.AutonomousAgent):
                     _module_path = _module_dir[0]
                     for m in _module_dir[1:]:
                         _module_path = _module_path + '.' + m
-                    print(_module_path)
                     plg_lib = importlib.import_module(_module_path)  
   
         self.model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg'))
         checkpoint = load_checkpoint(self.model, self.ckpt_path, map_location='cpu', strict=True)
         self.model.cuda()
         self.model.eval()
+        self._model_temporal_state_enabled = (
+            hasattr(self.model, "prev_frame_info") or hasattr(self.model, "prev_frame_infos")
+        )
+        self._model_temporal_state_by_ego = []
+        self._model_frame_idx_by_ego = [0 for _ in range(ego_vehicles_num)]
+        if self._model_temporal_state_enabled:
+            base_prev_frame_info = getattr(self.model, "prev_frame_info", None)
+            base_prev_frame_infos = getattr(self.model, "prev_frame_infos", None)
+            for _ in range(ego_vehicles_num):
+                state = {}
+                if hasattr(self.model, "prev_frame_info"):
+                    state["prev_frame_info"] = copy.deepcopy(base_prev_frame_info)
+                if hasattr(self.model, "prev_frame_infos"):
+                    state["prev_frame_infos"] = copy.deepcopy(base_prev_frame_infos)
+                self._model_temporal_state_by_ego.append(state)
         self.inference_only_pipeline = []
         for inference_only_pipeline in cfg.inference_only_pipeline:
             if inference_only_pipeline["type"] not in ['LoadMultiViewImageFromFilesInCeph','LoadMultiViewImageFromFiles']:
@@ -96,8 +109,8 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         self.takeover_time = 0
         self.save_path = None
         self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
-        # Debug logging controls; set DRIVE_DEBUG=0 to disable or DRIVE_DEBUG_EVERY to change frequency
-        self.debug_log = os.environ.get("DRIVE_DEBUG", "1") != "0"
+        # Debug logging controls; set DRIVE_DEBUG=1 to enable and DRIVE_DEBUG_EVERY to tune cadence.
+        self.debug_log = os.environ.get("DRIVE_DEBUG", "0") != "0"
         self.log_every = int(os.environ.get("DRIVE_DEBUG_EVERY", "1"))
         self.lat_ref, self.lon_ref = 42.0, 2.0
 
@@ -279,7 +292,10 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         refined_worlds = list(self._global_plan_world_coord)
 
         self._route_planners = []
-        for ego_id in range(self.ego_vehicles_num):
+        actual_plans = len(refined_plans)
+        if actual_plans < self.ego_vehicles_num:
+            self._log(f"[WARN] ego_vehicles_num={self.ego_vehicles_num} but only {actual_plans} routes in global_plan; capping loop")
+        for ego_id in range(min(self.ego_vehicles_num, actual_plans)):
             route_planner = RoutePlanner(4.0, 50.0, lat_ref=self.lat_ref, lon_ref=self.lon_ref)
             route_planner.set_route(refined_plans[ego_id], True, refined_worlds[ego_id])
             self._route_planners.append(route_planner)
@@ -395,10 +411,13 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         angular_velocity = input_data[f'IMU_{ego_id}'][1][3:6]
   
         pos = self.gps_to_location(gps)
-        route_out = self._route_planners[ego_id].run_step(pos)
+        route_planner = self._route_planners[ego_id]
+        route_out = route_planner.run_step(pos)
         # Allow for (pos, cmd, pos_world) tuples
         near_node, near_command = route_out[0], route_out[1]
         near_world = route_out[2] if len(route_out) > 2 else None
+        tail_mode = bool(getattr(route_planner, "tail_mode", False))
+        tail_passed_terminal = bool(getattr(route_planner, "tail_passed_terminal", False))
         if self.route_debugger:
             self.route_debugger.log_tick(
                 ego_id=ego_id,
@@ -430,7 +449,8 @@ class VadAgent(autonomous_agent.AutonomousAgent):
             )
         if self.debug_log and (self.step % self.log_every == 0):
             self._log(f"[TICK][ego={ego_id}] gps={gps.tolist()} pos={pos.tolist()} lat_ref={self.lat_ref:.6f} lon_ref={self.lon_ref:.6f} "
-                      f"speed={speed:.3f} compass={compass:.3f} near_node={(float(near_node[0]), float(near_node[1]))} near_cmd={near_command}")
+                      f"speed={speed:.3f} compass={compass:.3f} near_node={(float(near_node[0]), float(near_node[1]))} near_cmd={near_command} "
+                      f"tail_mode={tail_mode} tail_passed_terminal={tail_passed_terminal}")
   
         if (math.isnan(compass) == True): #It can happen that the compass sends nan for a few frames
             compass = 0.0
@@ -447,7 +467,9 @@ class VadAgent(autonomous_agent.AutonomousAgent):
                 'acceleration':acceleration,
                 'angular_velocity':angular_velocity,
                 'command_near':near_command,
-                'command_near_xy':near_node
+                'command_near_xy':near_node,
+                'tail_mode': tail_mode,
+                'tail_passed_terminal': tail_passed_terminal,
                 }
         
         return result
@@ -457,12 +479,38 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         control_all = []
         self.step += 1
         for ego_id in range(self.ego_vehicles_num):
-            if CarlaDataProvider.get_hero_actor(hero_id=ego_id) is not None:
-                control = self.run_step_single_vehicle(ego_id, input_data, timestamp)
-                control_all.append(control)
-            else:
+            hero = CarlaDataProvider.get_hero_actor(hero_id=ego_id)
+            if hero is None or not getattr(hero, "is_alive", True):
                 control_all.append(None)
+                continue
+            if f'CAM_FRONT_{ego_id}' not in input_data:
+                control_all.append(None)
+                continue
+            control = self.run_step_single_vehicle(ego_id, input_data, timestamp)
+            control_all.append(control)
         return control_all
+
+    def _restore_model_temporal_state(self, ego_id):
+        if not self._model_temporal_state_enabled:
+            return
+        if ego_id < 0 or ego_id >= len(self._model_temporal_state_by_ego):
+            return
+        state = self._model_temporal_state_by_ego[ego_id]
+        if hasattr(self.model, "prev_frame_info"):
+            self.model.prev_frame_info = state.get("prev_frame_info", None)
+        if hasattr(self.model, "prev_frame_infos"):
+            self.model.prev_frame_infos = state.get("prev_frame_infos", [])
+
+    def _capture_model_temporal_state(self, ego_id):
+        if not self._model_temporal_state_enabled:
+            return
+        if ego_id < 0 or ego_id >= len(self._model_temporal_state_by_ego):
+            return
+        state = self._model_temporal_state_by_ego[ego_id]
+        if hasattr(self.model, "prev_frame_info"):
+            state["prev_frame_info"] = self.model.prev_frame_info
+        if hasattr(self.model, "prev_frame_infos"):
+            state["prev_frame_infos"] = self.model.prev_frame_infos
 
     @torch.no_grad()
     def run_step_single_vehicle(self, ego_id, input_data, timestamp):
@@ -472,10 +520,14 @@ class VadAgent(autonomous_agent.AutonomousAgent):
 
         
         realtime_mode = os.environ.get('REALTIME_MODE', '0')
+        force_fresh_every_frame = (
+            os.environ.get('VAD_FORCE_FRESH_INFERENCE', '0') == '1'
+            or os.environ.get('OPENLOOP_FORCE_FRESH_INFERENCE', '0') == '1'
+        )
         if realtime_mode == '1':
             if self.step <= self.next_action_step[ego_id]:
                 return self.prev_control[ego_id]
-        if realtime_mode != '1':
+        if realtime_mode != '1' and not force_fresh_every_frame:
             if self.step % 4 != 1 and self.step:
                 return self.prev_control[ego_id]
 
@@ -485,8 +537,8 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         results['lidar2cam'] = []
         results['img'] = []
         results['folder'] = ' '
-        results['scene_token'] = ' '  
-        results['frame_idx'] = 0
+        results['scene_token'] = f'ego_{ego_id}'
+        results['frame_idx'] = self._model_frame_idx_by_ego[ego_id]
         results['timestamp'] = self.step / 20
         results['box_type_3d'], _ = get_box_type('LiDAR')
         start_time = time.time()
@@ -524,7 +576,9 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         else:
             ego_lcf_feat[8] = self.prev_control_cache[ego_id][0].steer
 
-        command = tick_data['command_near'].value
+        command_raw = int(tick_data['command_near'].value)
+        command_fallback_to_lanefollow = bool(command_raw < 0)
+        command = command_raw
         if command < 0:
             command = 4
         command -= 1
@@ -560,7 +614,12 @@ class VadAgent(autonomous_agent.AutonomousAgent):
                     data[0] = data[0].to(self.device)
 
         inference_start_time = time.time()
-        output_data_batch = self.model(input_data_batch, return_loss=False, rescale=True)
+        self._restore_model_temporal_state(ego_id)
+        try:
+            output_data_batch = self.model(input_data_batch, return_loss=False, rescale=True)
+        finally:
+            self._capture_model_temporal_state(ego_id)
+        self._model_frame_idx_by_ego[ego_id] += 1
         inference_end_time = time.time()
 
         t_pid_start = time.time()
@@ -568,11 +627,18 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         all_out_truck =  np.cumsum(all_out_truck_d1,axis=1)
         out_truck = all_out_truck[command]
         controller = self.pidcontrollers[ego_id]
-        steer_traj, throttle_traj, brake_traj, metadata_traj = controller.control_pid(out_truck, tick_data['speed'], local_command_xy)
+        steer_traj, throttle_traj, brake_traj, metadata_traj = controller.control_pid(
+            out_truck,
+            tick_data['speed'],
+            local_command_xy,
+            tail_mode=tick_data.get('tail_mode', False),
+            tail_passed_terminal=tick_data.get('tail_passed_terminal', False),
+        )
         if brake_traj < 0.05: brake_traj = 0.0
         if throttle_traj > brake_traj: brake_traj = 0.0
         end_time = time.time()
-        print(end_time - start_time)
+        if self.debug_log and (self.step % self.log_every == 0):
+            self._log(f"[TIMING][ego={ego_id}] step_runtime_s={end_time - start_time:.4f}")
 
         control = carla.VehicleControl()
         self.pid_metadata = metadata_traj
@@ -588,16 +654,20 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         self.pid_metadata['brake_traj'] = float(brake_traj)
         self.pid_metadata['plan'] = out_truck.tolist()
         self.pid_metadata['command'] = command
+        self.pid_metadata['command_raw'] = int(command_raw)
+        self.pid_metadata['command_fallback_to_lanefollow'] = bool(command_fallback_to_lanefollow)
         self.pid_metadata['all_plan'] = all_out_truck.tolist()
         if self.debug_log and (self.step % self.log_every == 0):
             self._log(f"[CTRL][ego={ego_id}] can_pos=({can_bus[0]:.2f},{can_bus[1]:.2f}) "
                       f"theta={ego_theta:.3f} speed={tick_data['speed']:.3f} "
                       f"target_local=({local_command_xy[0]:.2f},{local_command_xy[1]:.2f}) "
+                      f"tail_mode={tick_data.get('tail_mode', False)} tail_passed_terminal={tick_data.get('tail_passed_terminal', False)} "
                       f"wp0=({out_truck[0][0]:.2f},{out_truck[0][1]:.2f}) steer={control.steer:.3f} "
                       f"throttle={control.throttle:.3f} brake={control.brake:.3f}")
 
         self.next_action_step[ego_id] = self.step + int((end_time - start_time) * 20)
-        print(self.next_action_step[ego_id])
+        if self.debug_log and (self.step % self.log_every == 0):
+            self._log(f"[NEXT_ACTION][ego={ego_id}] next_action_step={self.next_action_step[ego_id]}")
 
         if SAVE_PATH is not None and self.step % 5 == 0:
             self.save(ego_id, tick_data)
@@ -643,4 +713,5 @@ class VadAgent(autonomous_agent.AutonomousAgent):
 
     def _log(self, msg):
         """Lightweight debug logger."""
-        print(msg, flush=True)
+        if getattr(self, "debug_log", False):
+            print(msg, flush=True)

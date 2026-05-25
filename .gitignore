@@ -5,7 +5,29 @@ ChatScene/log
 ChatScene/oldlog
 ChatScene/oldexamplescenarios
 v2xpnp/Sample_Dataset
+v2xpnp/oldroutes
+v2xpnp/out_trajectory_database.bak_owned_by_guest_zhihao
+v2xpnp/short
+v2xpnp/no_twin
+v2xpnp/v2xscenariosrecovereable/
+
+# scratch clones of third-party annotation/dataset tools
+3d-bat/
+tum-traffic-dataset-dev-kit/
+
+scenarioset/interaction_deselected/
+scenarioset/v2xpnp_ego1_test/
+scenarioset/test_postnudge/
+stats/
 benchmark_runs
+
+# Result-artifact dumps (regeneratable from eval pipeline)
+figures/
+v2xpnpfixed/
+v2xpnpnew/
+
+# Alignment pipeline diagnostics (build-time, not runtime input)
+ground_alignment_report.json
 scenario_generator/log
 scenario_generator/routes
 all_videos/
@@ -13,6 +35,28 @@ all_videos.zip
 models/
 ucla_v2_0.9.12-dirty.tar.gz
 debug_runs_passed/
+eval/
+carlalogs/
+runattempt/
+repro_logs/
+rootcause_*/
+test/
+test2/
+test4/
+core.*
+nohup.out
+log.txt
+lmdrivelog.txt
+*.bak
+*.tmp
+
+# scenarioset actor-XML fix-tool backups (fix_actor_collisions.py,
+# fix_actor_yaw_reversal.py write these next to each edited XML)
+*.presnap
+*.preflip
+*.predelete
+*.pretrunc
+*.prestagger
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -200,6 +244,17 @@ simulation/data_collection/batch_run/
 birdview_v2_cache
 # simulation/leaderboard/team_code/pnp_config/
 
+# local cleanup artifacts
+/.codex
+/1
+/tmpcr2lg1ir
+/codex_snapshot_*/
+/openloop/runresults/
+/openloop/tools/testopen/
+/RiskM/
+/carla_crash_repro_0912.py
+/test_adapter_fixes.py
+
 # visualization
 visualization/results
 
@@ -249,6 +304,9 @@ pip-wheel-metadata/
 # Pyre type checker
 logs/
 *.c
+# Track the LD_PRELOAD shim source used by download_and_setup_carla.sh
+# (compiled .so stays ignored — built per-machine).
+!tools/close_ebadf_suppress.c
 
 
 # others
@@ -309,3 +367,33 @@ scenario_generator/debug_output/
 scenario_generator/legal_paths_test/
 scenario_generator/crop_map.json
 scenario_generator/crop_map_detailed.json
+
+# Claude Code project state
+.claude/
+
+# Third-party repos vendored alongside this one (git repos themselves)
+OpenCDA/
+V2Xverse/
+
+# Large generated/in-progress data not yet ready for tracking
+v2xpnp/dataset_new/
+v2xpnp/newroutes/
+scenarioset/v2xpnp_new/
+v2xpnp/map/carla_topdown_cache.jpg
+v2xpnp/map/carla_topdown_cache.json
+
+# Per-scenario caches written by the patch_editor / watchdog tools
+.grp_cache.json
+.scenario_review_state.json
+scenario_review_status.csv
+
+# Scratch result/investigation dirs
+investigation/
+colmresults/
+final/
+finalresults/
+colmoverallnow/
+poseerr/
+realtime_latency/
+newestwithfix/
+videos_highway_onramp/

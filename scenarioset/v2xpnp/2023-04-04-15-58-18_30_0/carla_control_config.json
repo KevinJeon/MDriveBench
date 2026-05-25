@@ -9,7 +9,7 @@
   "route_id": "2023-04-04-15-58-18_30_0",
   "manifest_path": "actors_manifest.json",
   "ego_count": 2,
-  "npc_count": 18,
+  "npc_count": 17,
   "walker_count": 47,
-  "static_count": 15
+  "static_count": 13
 }

@@ -14,6 +14,8 @@ from __future__ import print_function
 import math
 import os
 import re
+import csv
+import json
 import queue
 import bisect
 import xml.etree.ElementTree as ET
@@ -46,6 +48,225 @@ def _heading_from_points(points: List[carla.Location], min_dist: float = 2.0) ->
         if (dx * dx + dy * dy) >= (min_dist * min_dist):
             return math.degrees(math.atan2(dy, dx))
     return None
+
+
+def _build_passthrough_route(world, locations, yaws):
+    """Build (gps, route) directly from already-aligned dense XML waypoints.
+
+    Avoids re-running interpolate_trajectory's GRP A*, which re-snaps the route
+    and inserts spurious lane-change/back-jump artefacts on top of the smooth
+    trace produced by tools/route_alignment.align_route.
+
+    By default every dense waypoint is tagged ``RoadOption.LANEFOLLOW`` (matching
+    the original behaviour of this fast path). When ``CUSTOM_ENRICH_ROAD_OPTIONS=1``
+    is set, the dense XY trace is preserved verbatim but each waypoint is
+    re-labelled with the proper ``RoadOption`` (LEFT/RIGHT/STRAIGHT/CHANGELANE_*)
+    obtained from ``GlobalRoutePlanner.trace_route`` between adjacent input
+    locations. This restores the high-level command signal that nuScenes /
+    Bench2Drive-trained agents (UniAD, VAD) consume as a turn-anticipation
+    input. The dense XY positions and yaws produced by ``align_route`` are
+    untouched — only the discrete RoadOption tags change.
+
+    locations: list[carla.Location]   from config.trajectory (per-ego)
+    yaws:      list[float|None]|None  from config.multi_traj_yaws[i] / .trajectory_yaws
+    """
+    from leaderboard.utils.route_manipulation import _get_latlon_ref, location_route_to_gps
+
+    n = len(locations)
+    transforms = []
+    for idx, loc in enumerate(locations):
+        yaw = None
+        if yaws is not None and idx < len(yaws):
+            yaw = yaws[idx]
+        if yaw is None:
+            # Derive from heading to next point (or from previous for the last).
+            if idx + 1 < n:
+                dx = float(locations[idx + 1].x) - float(loc.x)
+                dy = float(locations[idx + 1].y) - float(loc.y)
+            else:
+                dx = float(loc.x) - float(locations[idx - 1].x)
+                dy = float(loc.y) - float(locations[idx - 1].y)
+            yaw = math.degrees(math.atan2(dy, dx)) if (dx or dy) else 0.0
+        transforms.append(carla.Transform(
+            carla.Location(x=float(loc.x), y=float(loc.y), z=float(loc.z)),
+            carla.Rotation(yaw=float(yaw)),
+        ))
+
+    options = _compute_road_options_from_lane_geom(world, transforms)
+    if options is None:
+        options = _compute_road_options_via_grp(world, transforms)
+    route = list(zip(transforms, options))
+    lat_ref, lon_ref = _get_latlon_ref(world)
+    gps = location_route_to_gps(route, lat_ref, lon_ref)
+    return gps, route
+
+
+def _compute_road_options_via_grp(world, transforms):
+    """Use CARLA's GRP (the old `interpolate_trajectory` path) to label
+    each transform with a RoadOption, but PRESERVE our dense aligned
+    positions — GRP only contributes labels.
+
+    Approach: trace GRP between EACH PAIR of consecutive aligned
+    transforms. For each pair, GRP returns a short trace with one or
+    more (waypoint, road_option) tuples. We assign the destination
+    transform's road_option as the option of the LAST step in that
+    trace (typically 1 step for short hops, more if GRP re-routes
+    around an obstacle/junction). Lane-change/turn options are
+    preserved when GRP detects them; spurious re-routing is bounded
+    because consecutive aligned waypoints are 1-2 m apart, leaving GRP
+    no room to detour.
+
+    Returns None if `world` or GRP is unavailable; the caller falls
+    back to the map-geometry detector.
+    """
+    n = len(transforms)
+    if world is None or n < 2:
+        return [RoadOption.LANEFOLLOW] * n
+    try:
+        from leaderboard.utils.route_manipulation import interpolate_trajectory
+    except Exception:
+        return None
+    try:
+        locations = [t.location for t in transforms]
+        _gps, grp_route = interpolate_trajectory(world, locations,
+                                                  hop_resolution=2.0)
+    except Exception:
+        return None
+    if not grp_route:
+        return None
+    grp_xy_opt = []
+    for entry in grp_route:
+        try:
+            wp, opt = entry
+            if isinstance(wp, carla.Transform):
+                loc = wp.location
+            elif isinstance(wp, carla.Waypoint):
+                loc = wp.transform.location
+            else:
+                loc = getattr(wp, 'location', None) or wp.transform.location
+            grp_xy_opt.append((float(loc.x), float(loc.y), opt))
+        except Exception:
+            continue
+    if not grp_xy_opt:
+        return None
+    options = []
+    grp_idx = 0
+    for tr in transforms:
+        best_d = float('inf'); best_opt = RoadOption.LANEFOLLOW
+        lo = max(0, grp_idx - 5)
+        hi = min(len(grp_xy_opt), grp_idx + 50)
+        for j in range(lo, hi):
+            x, y, opt = grp_xy_opt[j]
+            d = (x - tr.location.x) ** 2 + (y - tr.location.y) ** 2
+            if d < best_d:
+                best_d = d; best_opt = opt; grp_idx = j
+        options.append(best_opt)
+    spread_back, spread_fwd = 3, 3
+    spread = list(options)
+    for i, opt in enumerate(options):
+        if opt in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+            for j in range(max(0, i - spread_back), min(n, i + spread_fwd + 1)):
+                if spread[j] == RoadOption.LANEFOLLOW:
+                    spread[j] = opt
+    return spread
+
+
+def _compute_road_options_from_lane_geom(world, transforms,
+                                          spread_back=3, spread_fwd=3,
+                                          turn_yaw_threshold_deg=25.0):
+    """Derive RoadOption per waypoint from CARLA map lane geometry.
+
+    For each transform, query the CARLA map for the nearest driving-lane
+    waypoint. Compare against the previous distinct lane to classify:
+
+      - same road, same lane               -> LANEFOLLOW
+      - same road, ego moves to LEFT lane  -> CHANGELANELEFT
+      - same road, ego moves to RIGHT lane -> CHANGELANERIGHT
+      - different road / junction          -> turn classification by
+        signed yaw delta (LEFT / RIGHT / STRAIGHT)
+
+    Lane-change events are spread to neighboring waypoints
+    (`spread_back` before, `spread_fwd` after) so the planner sees the
+    maneuver as a sustained command, not a single transition tick.
+
+    Falls back to LANEFOLLOW everywhere if `world` or its map is
+    unavailable.
+    """
+    n = len(transforms)
+    options = [RoadOption.LANEFOLLOW] * n
+    if world is None or n < 2:
+        return options
+    try:
+        carla_map = world.get_map()
+    except Exception:
+        return options
+
+    map_wps = []
+    for tr in transforms:
+        try:
+            wp = carla_map.get_waypoint(
+                tr.location, project_to_road=True,
+                lane_type=carla.LaneType.Driving)
+        except Exception:
+            wp = None
+        map_wps.append(wp)
+
+    prev_wp = None
+    for i in range(n):
+        cw = map_wps[i]
+        if cw is None or prev_wp is None:
+            prev_wp = cw if cw is not None else prev_wp
+            continue
+        if cw.road_id == prev_wp.road_id and cw.lane_id == prev_wp.lane_id:
+            prev_wp = cw
+            continue
+        if cw.road_id == prev_wp.road_id:
+            opt = None
+            try:
+                left_lane = prev_wp.get_left_lane()
+                right_lane = prev_wp.get_right_lane()
+            except Exception:
+                left_lane = right_lane = None
+            if left_lane is not None and left_lane.lane_id == cw.lane_id:
+                opt = RoadOption.CHANGELANELEFT
+            elif right_lane is not None and right_lane.lane_id == cw.lane_id:
+                opt = RoadOption.CHANGELANERIGHT
+            else:
+                try:
+                    heading_rad = math.radians(prev_wp.transform.rotation.yaw)
+                    dx = cw.transform.location.x - prev_wp.transform.location.x
+                    dy = cw.transform.location.y - prev_wp.transform.location.y
+                    lateral = -math.sin(heading_rad) * dx + math.cos(heading_rad) * dy
+                    opt = (RoadOption.CHANGELANERIGHT if lateral > 0
+                           else RoadOption.CHANGELANELEFT)
+                except Exception:
+                    opt = RoadOption.LANEFOLLOW
+            lo = max(0, i - spread_back)
+            hi = min(n, i + spread_fwd + 1)
+            for j in range(lo, hi):
+                if options[j] == RoadOption.LANEFOLLOW:
+                    options[j] = opt
+            prev_wp = cw
+            continue
+        try:
+            cur_yaw = transforms[i].rotation.yaw
+            ref_idx = min(n - 1, i + max(1, int(spread_fwd / 2)))
+            nxt_yaw = transforms[ref_idx].rotation.yaw if ref_idx > i else cur_yaw
+            dy = nxt_yaw - transforms[max(i - 1, 0)].rotation.yaw
+            dy = ((dy + 180.0) % 360.0) - 180.0
+            if dy > turn_yaw_threshold_deg:
+                opt = RoadOption.RIGHT
+            elif dy < -turn_yaw_threshold_deg:
+                opt = RoadOption.LEFT
+            else:
+                opt = RoadOption.STRAIGHT
+        except Exception:
+            opt = RoadOption.LANEFOLLOW
+        if options[i] == RoadOption.LANEFOLLOW:
+            options[i] = opt
+        prev_wp = cw
+
+    return options
 
 
 def _resolve_ground_z(world: Optional[carla.World], location: carla.Location) -> Optional[float]:
@@ -1152,6 +1373,174 @@ def _smooth_vehicle_replay_plan(
         heading_window=yaw_follow_heading_window,
     )
     return out
+
+
+class _ResetVehicleControl(py_trees.behaviour.Behaviour):
+    """One-shot atomic that explicitly zeroes throttle/brake/hand_brake/steer
+    on an actor and returns SUCCESS.
+
+    Needed between the brake_seq and the resume WaypointFollower because
+    StopVehicle leaves brake=1.0 latched on the actor when the par(SUCCESS_ON_ONE)
+    interrupts it via follow_WF's terminate-induced SUCCESS — StopVehicle's
+    auto-clear-on-stop branch never runs in that path.
+    """
+
+    def __init__(self, actor, name="ResetVehicleControl"):
+        super(_ResetVehicleControl, self).__init__(name)
+        self._actor = actor
+
+    def update(self):
+        try:
+            if self._actor is not None and self._actor.is_alive:
+                ctl = carla.VehicleControl()
+                ctl.throttle = 0.0
+                ctl.brake = 0.0
+                ctl.hand_brake = False
+                ctl.steer = 0.0
+                ctl.reverse = False
+                ctl.manual_gear_shift = False
+                self._actor.apply_control(ctl)
+        except Exception:
+            pass
+        return py_trees.common.Status.SUCCESS
+
+
+class _DynamicForwardWaypointFollower(py_trees.behaviour.Behaviour):
+    """WaypointFollower variant that builds its global plan AT INITIALISE TIME
+    from the actor's current location forward, instead of using a pre-computed
+    plan that may have waypoints behind the actor (which makes CARLA's
+    LocalPlanner stick on brake=1.0 indefinitely).
+
+    Takes a base_plan (sequence of (carla.Waypoint, RoadOption) OR
+    carla.Location) and on first tick:
+      1. Finds the first waypoint in base_plan that is strictly ahead of the
+         actor (using forward-vector dot product).
+      2. Constructs a fresh plan from current actor position forward through
+         the remaining base_plan waypoints.
+      3. Hands that plan to an inner WaypointFollower for execution.
+    """
+
+    def __init__(self, actor, base_plan, target_speed, avoid_collision=False,
+                 name="DynamicForwardWaypointFollower"):
+        super(_DynamicForwardWaypointFollower, self).__init__(name)
+        self._actor = actor
+        self._base_plan = list(base_plan or [])
+        self._target_speed = target_speed
+        self._avoid_collision = avoid_collision
+        self._inner = None
+        self._inner_initialised = False
+
+    def _build_forward_plan(self):
+        try:
+            actor_tf = self._actor.get_transform()
+            actor_loc = actor_tf.location
+            fwd = actor_tf.get_forward_vector()
+        except Exception:
+            return None
+
+        # Reduce base_plan to entries strictly ahead of actor (>0.5m forward)
+        forward_only = []
+        for entry in self._base_plan:
+            try:
+                if hasattr(entry, "transform"):
+                    wp_loc = entry.transform.location
+                elif isinstance(entry, tuple) and hasattr(entry[0], "transform"):
+                    wp_loc = entry[0].transform.location
+                elif hasattr(entry, "x") and hasattr(entry, "y"):
+                    wp_loc = entry
+                else:
+                    continue
+                dx = wp_loc.x - actor_loc.x
+                dy = wp_loc.y - actor_loc.y
+                dot = dx * fwd.x + dy * fwd.y
+                if dot > 0.5:
+                    forward_only.append(entry)
+            except Exception:
+                continue
+
+        if not forward_only:
+            return self._base_plan if self._base_plan else None
+
+        try:
+            carla_map = CarlaDataProvider.get_map()
+        except Exception:
+            carla_map = None
+
+        # Convert anything to (Waypoint, RoadOption) tuples for LocalPlanner
+        normalized = []
+        for entry in forward_only:
+            try:
+                if isinstance(entry, tuple) and hasattr(entry[0], "transform"):
+                    normalized.append(entry)
+                elif hasattr(entry, "transform"):
+                    normalized.append((entry, RoadOption.LANEFOLLOW))
+                elif hasattr(entry, "x") and hasattr(entry, "y") and carla_map is not None:
+                    wp = carla_map.get_waypoint(entry, project_to_road=True, lane_type=carla.LaneType.Driving)
+                    if wp is not None:
+                        normalized.append((wp, RoadOption.LANEFOLLOW))
+            except Exception:
+                continue
+        return normalized if normalized else None
+
+    def initialise(self):
+        super(_DynamicForwardWaypointFollower, self).initialise()
+        forward_plan = self._build_forward_plan()
+        self._inner = WaypointFollower(
+            self._actor,
+            target_speed=self._target_speed,
+            plan=forward_plan,
+            avoid_collision=self._avoid_collision,
+            name=f"{self.name}-inner",
+        )
+        self._inner.setup(0.0)
+        self._inner.initialise()
+        self._inner_initialised = True
+        return True
+
+    def update(self):
+        if not self._inner_initialised or self._inner is None:
+            return py_trees.common.Status.RUNNING
+        return self._inner.update()
+
+    def terminate(self, new_status):
+        try:
+            if self._inner is not None:
+                self._inner.terminate(new_status)
+        except Exception:
+            pass
+        super(_DynamicForwardWaypointFollower, self).terminate(new_status)
+
+
+class _ActorMovedDistance(py_trees.behaviour.Behaviour):
+    """py_trees condition that succeeds once an actor has travelled >= min_distance
+    metres from its position when this behaviour first ticks.
+
+    Replaces a plain Idle(t) as the brake-gate so the trigger can't fire while
+    the NPC is still sitting at spawn (which would happen if TCP hasn't begun
+    driving yet and pacing=true keeps the NPC stationary).
+    """
+
+    def __init__(self, actor, min_distance=3.0, name="ActorMovedDistance"):
+        super(_ActorMovedDistance, self).__init__(name)
+        self._actor = actor
+        self._min = float(min_distance)
+        self._start_loc = None
+        self._last_log = 0
+
+    def update(self):
+        try:
+            loc = CarlaDataProvider.get_location(self._actor) or self._actor.get_location()
+        except Exception:
+            return py_trees.common.Status.RUNNING
+        if loc is None:
+            return py_trees.common.Status.RUNNING
+        if self._start_loc is None:
+            self._start_loc = loc
+            return py_trees.common.Status.RUNNING
+        d = loc.distance(self._start_loc)
+        if d >= self._min:
+            return py_trees.common.Status.SUCCESS
+        return py_trees.common.Status.RUNNING
 
 
 class StagedWaypointFollower(py_trees.behaviour.Behaviour):
@@ -2794,6 +3183,37 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
             seen.add(ego_id)
             actors.append(ego)
 
+        # NEW: optionally include all OTHER vehicles (not just egos) as
+        # "concerned-about" targets. This lets each NPC's guard see other
+        # NPCs as obstacles, so when one NPC slows for ego, the NPCs
+        # behind it also slow naturally (queue formation) instead of
+        # rear-ending the slowed NPC. Gated by env var; default OFF to
+        # preserve existing behavior for callers that don't opt in.
+        if os.environ.get(
+            "CUSTOM_LOG_REPLAY_GUARD_CONSIDER_ALL_VEHICLES", "0",
+        ).lower() in ("1", "true", "yes"):
+            try:
+                world = CarlaDataProvider.get_world()
+                if world is not None:
+                    for v in world.get_actors().filter("vehicle.*"):
+                        try:
+                            vid = int(v.id)
+                        except Exception:  # pylint: disable=broad-except
+                            continue
+                        if self_actor_id is not None and vid == self_actor_id:
+                            continue
+                        if vid in seen:
+                            continue
+                        try:
+                            if hasattr(v, "is_alive") and not bool(v.is_alive):
+                                continue
+                        except Exception:  # pylint: disable=broad-except
+                            pass
+                        seen.add(vid)
+                        actors.append(v)
+            except Exception:  # pylint: disable=broad-except
+                pass
+
         if actors:
             return actors
 
@@ -2873,6 +3293,29 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
         prev_sep = None
         prev_t = 0.0
         ego_radius = float(ego_state["radius"])
+        # Default ON: only flag this ego as a concern when its
+        # projection into the actor's body frame is INSIDE the actor's
+        # forward driving lane. Adjacent-lane traffic (large lateral
+        # offset, small along offset) doesn't actually risk a collision
+        # — the circular distance check otherwise over-fires here and
+        # causes spurious slowdowns + cascade rear-ends.
+        # Set CUSTOM_LOG_REPLAY_GUARD_REQUIRE_IN_PATH=0 to revert to the
+        # purely-circular distance check.
+        require_in_path = os.environ.get(
+            "CUSTOM_LOG_REPLAY_GUARD_REQUIRE_IN_PATH", "1",
+        ).lower() in ("1", "true", "yes")
+        try:
+            in_path_lateral_m = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_GUARD_IN_PATH_LATERAL_M", "1.6")
+            )
+        except Exception:  # pylint: disable=broad-except
+            in_path_lateral_m = 1.6
+        try:
+            in_path_behind_m = float(
+                os.environ.get("CUSTOM_LOG_REPLAY_GUARD_IN_PATH_BEHIND_M", "1.5")
+            )
+        except Exception:  # pylint: disable=broad-except
+            in_path_behind_m = 1.5
         for idx in range(steps + 1):
             t = min(float(self._guard_horizon_s), float(idx) * float(self._guard_dt_s))
             tau = float(tau_start) + float(replay_rate) * t
@@ -2884,6 +3327,23 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
             ey = float(ego_state["y"]) + float(ego_state["vy"]) * t
             dist_xy = math.hypot(ax - ex, ay - ey)
             sep = dist_xy - (float(actor_radius) + float(ego_radius) + float(self._guard_margin_m))
+            if require_in_path:
+                # Project (ego - actor) into actor's body frame
+                actor_yaw_rad = math.radians(float(actor_tf.rotation.yaw))
+                cos_y = math.cos(actor_yaw_rad)
+                sin_y = math.sin(actor_yaw_rad)
+                rel_x = ex - ax
+                rel_y = ey - ay
+                along  = rel_x * cos_y + rel_y * sin_y
+                lateral = -rel_x * sin_y + rel_y * cos_y
+                # Skip if ego is laterally far (different lane) or behind actor
+                # (actor moving away, ego won't be hit by us).
+                if abs(lateral) > in_path_lateral_m or along < -in_path_behind_m:
+                    # Skip this step; reset prev_sep so closing-rate calc in
+                    # the next non-skip iteration doesn't bridge across the gap.
+                    prev_sep = None
+                    prev_t = float(t)
+                    continue
             if sep < min_sep:
                 min_sep = float(sep)
             if sep <= 0.0 and not math.isfinite(min_ttc):
@@ -3144,23 +3604,37 @@ class LogReplayFollower(py_trees.behaviour.Behaviour):
             actor_has_priority = True
             self._priority_state = "actor_vru"
         else:
-            actor_arrival, ego_arrival, _ = self._priority_arrival_times(
-                target_ego_state,
-                float(self._tau_actual),
-            )
+            # Multi-ego priority: actor only has priority if it arrives
+            # first vs ALL egos. If ANY ego has priority, actor yields —
+            # otherwise the non-target ego gets hit while the actor races
+            # past the target ego it "won priority over".
             tie = float(self._guard_priority_tie_margin_s)
-            if float(actor_arrival) + tie < float(ego_arrival):
-                actor_has_priority = True
-            elif float(ego_arrival) + tie < float(actor_arrival):
-                actor_has_priority = False
-            else:
-                actor_has_priority = str(self._priority_state).startswith("actor")
+            actor_has_priority = True
+            for _eid, (_es, _em) in nominal_by_ego.items():
+                _actor_arrival, _ego_arrival, _ = self._priority_arrival_times(
+                    _es, float(self._tau_actual),
+                )
+                if float(_ego_arrival) + tie < float(_actor_arrival):
+                    # This ego arrives clearly first → it has priority → actor must yield.
+                    actor_has_priority = False
+                    break
+                if (not (float(_actor_arrival) + tie < float(_ego_arrival))):
+                    # Tie wrt this ego — fall back to prior state to avoid flicker.
+                    if not str(self._priority_state).startswith("actor"):
+                        actor_has_priority = False
+                        break
             self._priority_state = "actor" if actor_has_priority else "ego"
 
-        desired_risk = self._risk_state_from_metrics(
-            float(target_nominal_metrics.get("min_sep", float("inf"))),
-            float(target_nominal_metrics.get("min_ttc", float("inf"))),
-        )
+        # Multi-ego safety: risk state must reflect the WORST case across
+        # all egos, not just the target ego. Previously this used only
+        # target_nominal_metrics → an actor threatening both egos would
+        # lock onto the closer ego, ignore the farther one, and hit it.
+        worst_min_sep = float(target_nominal_metrics.get("min_sep", float("inf")))
+        worst_min_ttc = float(target_nominal_metrics.get("min_ttc", float("inf")))
+        for _eid, (_es, _em) in nominal_by_ego.items():
+            worst_min_sep = min(worst_min_sep, float(_em.get("min_sep", float("inf"))))
+            worst_min_ttc = min(worst_min_ttc, float(_em.get("min_ttc", float("inf"))))
+        desired_risk = self._risk_state_from_metrics(worst_min_sep, worst_min_ttc)
         self._update_guard_risk_state(desired_risk, float(sim_time))
 
         metrics_by_rate: Dict[float, Dict[str, float]] = {}
@@ -3643,8 +4117,10 @@ from srunner.scenariomanager.scenarioatomics.atomic_behaviors import (
     HandBrakeVehicle,
     TerminateWaypointFollower,
 )
+
+
 from srunner.scenariomanager.timer import GameTime
-from srunner.scenariomanager.scenarioatomics.atomic_trigger_conditions import InTriggerDistanceToVehicle
+from srunner.scenariomanager.scenarioatomics.atomic_trigger_conditions import AtomicCondition, InTriggerDistanceToVehicle
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenarios.basic_scenario import BasicScenario
 from srunner.scenarios.control_loss import ControlLoss
@@ -3665,7 +4141,11 @@ from srunner.scenariomanager.scenarioatomics.atomic_criteria import (CollisionTe
 from srunner.tools.scenario_helper import get_location_in_distance_from_wp
 
 from leaderboard.utils.route_parser import RouteParser, TRIGGER_THRESHOLD, TRIGGER_ANGLE_THRESHOLD, get_ego_vehicle_model
-from leaderboard.utils.route_manipulation import interpolate_trajectory
+from leaderboard.utils.route_manipulation import (
+    _get_latlon_ref,
+    interpolate_trajectory,
+    location_route_to_gps,
+)
 from leaderboard.sensors.fixed_sensors import TrafficLightSensor
 from simulation.scenario_runner.srunner.scenarios import ScenarioClassRegistry
 
@@ -3810,12 +4290,447 @@ def compare_scenarios(scenario_choice, existent_scenario):
             dy = float(pos_choice['y']) - float(pos_existent['y'])
             dz = float(pos_choice['z']) - float(pos_existent['z'])
             dist_position = math.sqrt(dx * dx + dy * dy + dz * dz)
-            dyaw = float(pos_choice['yaw']) - float(pos_choice['yaw'])
+            dyaw = float(pos_choice['yaw']) - float(pos_existent['yaw'])
             dist_angle = math.sqrt(dyaw * dyaw)
             if dist_position < TRIGGER_THRESHOLD and dist_angle < TRIGGER_ANGLE_THRESHOLD:
                 return True
 
     return False
+
+
+def _distance2d(a: carla.Location, b: carla.Location) -> float:
+    dx = float(a.x) - float(b.x)
+    dy = float(a.y) - float(b.y)
+    return math.hypot(dx, dy)
+
+
+def _normalize_xy(dx: float, dy: float) -> Tuple[float, float]:
+    norm = math.hypot(float(dx), float(dy))
+    if norm <= 1e-6:
+        return (0.0, 0.0)
+    return (float(dx) / norm, float(dy) / norm)
+
+
+def _route_points_from_entries(route_entries) -> List[carla.Location]:
+    points: List[carla.Location] = []
+    for entry in list(route_entries or []):
+        loc = None
+        try:
+            first = entry[0] if isinstance(entry, tuple) else entry
+            if hasattr(first, "location"):
+                loc = first.location
+            elif isinstance(first, carla.Location):
+                loc = first
+        except Exception:  # pylint: disable=broad-except
+            loc = None
+        if loc is None:
+            continue
+        points.append(carla.Location(x=float(loc.x), y=float(loc.y), z=float(loc.z)))
+
+    deduped: List[carla.Location] = []
+    for loc in points:
+        if deduped and _distance2d(deduped[-1], loc) < 0.05:
+            continue
+        deduped.append(loc)
+    return deduped
+
+
+def _polyline_cumulative(points: List[carla.Location]) -> List[float]:
+    if not points:
+        return []
+    cumulative = [0.0]
+    for idx in range(1, len(points)):
+        cumulative.append(cumulative[-1] + _distance2d(points[idx - 1], points[idx]))
+    return cumulative
+
+
+def _sample_polyline(points: List[carla.Location], cumulative: List[float], distance_s: float) -> Tuple[carla.Location, Tuple[float, float]]:
+    if not points:
+        return carla.Location(), (1.0, 0.0)
+    if len(points) == 1 or len(cumulative) < 2:
+        return points[0], (1.0, 0.0)
+
+    total = float(cumulative[-1])
+    s = max(0.0, min(float(distance_s), total))
+    idx = max(0, min(len(cumulative) - 2, bisect.bisect_right(cumulative, s) - 1))
+
+    while idx < len(points) - 1:
+        seg_start = points[idx]
+        seg_end = points[idx + 1]
+        seg_len = _distance2d(seg_start, seg_end)
+        if seg_len > 1e-6:
+            ratio = 0.0 if seg_len <= 1e-6 else (s - float(cumulative[idx])) / seg_len
+            ratio = max(0.0, min(1.0, float(ratio)))
+            x = float(seg_start.x) + (float(seg_end.x) - float(seg_start.x)) * ratio
+            y = float(seg_start.y) + (float(seg_end.y) - float(seg_start.y)) * ratio
+            z = float(seg_start.z) + (float(seg_end.z) - float(seg_start.z)) * ratio
+            tangent = _normalize_xy(float(seg_end.x) - float(seg_start.x), float(seg_end.y) - float(seg_start.y))
+            return carla.Location(x=x, y=y, z=z), tangent
+        idx += 1
+
+    last = points[-1]
+    prev = points[-2]
+    tangent = _normalize_xy(float(last.x) - float(prev.x), float(last.y) - float(prev.y))
+    if tangent == (0.0, 0.0):
+        tangent = (1.0, 0.0)
+    return last, tangent
+
+
+def _project_location_to_polyline(
+    location: carla.Location,
+    points: List[carla.Location],
+    cumulative: List[float],
+) -> Tuple[float, float, carla.Location, Tuple[float, float]]:
+    if not points:
+        return 0.0, float("inf"), carla.Location(), (1.0, 0.0)
+    if len(points) == 1 or len(cumulative) < 2:
+        only = points[0]
+        tangent = (1.0, 0.0)
+        return 0.0, _distance2d(location, only), only, tangent
+
+    px = float(location.x)
+    py = float(location.y)
+    best_s = 0.0
+    best_dist_sq = float("inf")
+    best_point = points[0]
+    best_tangent = (1.0, 0.0)
+    for idx in range(len(points) - 1):
+        a = points[idx]
+        b = points[idx + 1]
+        vx = float(b.x) - float(a.x)
+        vy = float(b.y) - float(a.y)
+        seg_len_sq = vx * vx + vy * vy
+        if seg_len_sq <= 1e-8:
+            continue
+        t = ((px - float(a.x)) * vx + (py - float(a.y)) * vy) / seg_len_sq
+        t = max(0.0, min(1.0, float(t)))
+        proj_x = float(a.x) + vx * t
+        proj_y = float(a.y) + vy * t
+        dx = px - proj_x
+        dy = py - proj_y
+        dist_sq = dx * dx + dy * dy
+        if dist_sq < best_dist_sq:
+            seg_len = math.sqrt(seg_len_sq)
+            best_dist_sq = dist_sq
+            best_s = float(cumulative[idx]) + float(t) * seg_len
+            best_point = carla.Location(x=proj_x, y=proj_y, z=float(a.z) + (float(b.z) - float(a.z)) * t)
+            best_tangent = _normalize_xy(vx, vy)
+
+    return best_s, math.sqrt(best_dist_sq), best_point, best_tangent
+
+
+class DynamicForwardConflictTrigger(AtomicCondition):
+
+    """
+    Trigger a pedestrian when, if it starts moving now, its authored path is predicted to
+    occupy space immediately ahead of any relevant ego route with a near-collision margin.
+    """
+
+    def __init__(
+        self,
+        actor,
+        actor_name: str,
+        actor_plan,
+        target_speed: float,
+        ego_actors,
+        ego_routes,
+        preferred_vehicle: Optional[str] = None,
+        trigger_spec: Optional[dict] = None,
+        debug_state: Optional[Dict[str, object]] = None,
+        name: str = "DynamicForwardConflictTrigger",
+    ):
+        super(DynamicForwardConflictTrigger, self).__init__(name)
+        self._actor = actor
+        self._actor_name = str(actor_name or "pedestrian")
+        self._actor_plan = list(actor_plan or [])
+        self._target_speed = max(0.1, float(target_speed or 1.5))
+        self._ego_actors = [ego for ego in list(ego_actors or []) if ego is not None]
+        self._ego_routes = list(ego_routes or [])
+        self._trigger_spec = dict(trigger_spec or {})
+        self._debug_state = debug_state if isinstance(debug_state, dict) else {}
+        self._last_selected_vehicle = None
+        self._stable_selected_ticks = 0
+        self._triggered = False
+
+        preferred_name = preferred_vehicle or self._trigger_spec.get("preferred_vehicle") or self._trigger_spec.get("vehicle")
+        self._preferred_vehicle_idx = None
+        if preferred_name:
+            match = re.search(r"(\d+)", str(preferred_name))
+            if match:
+                self._preferred_vehicle_idx = max(0, int(match.group(1)) - 1)
+
+        try:
+            self._sample_dt = float(self._trigger_spec.get("sample_dt_s", os.environ.get("CUSTOM_DYNAMIC_PED_SAMPLE_DT_S", "0.1")))
+        except Exception:  # pylint: disable=broad-except
+            self._sample_dt = 0.1
+        try:
+            self._base_horizon_s = float(self._trigger_spec.get("horizon_s", os.environ.get("CUSTOM_DYNAMIC_PED_HORIZON_S", "5.0")))
+        except Exception:  # pylint: disable=broad-except
+            self._base_horizon_s = 5.0
+        try:
+            self._max_horizon_s = float(self._trigger_spec.get("max_horizon_s", os.environ.get("CUSTOM_DYNAMIC_PED_MAX_HORIZON_S", "8.0")))
+        except Exception:  # pylint: disable=broad-except
+            self._max_horizon_s = 8.0
+        try:
+            self._min_ego_speed_mps = float(self._trigger_spec.get("min_ego_speed_mps", os.environ.get("CUSTOM_DYNAMIC_PED_MIN_EGO_SPEED_MPS", "1.0")))
+        except Exception:  # pylint: disable=broad-except
+            self._min_ego_speed_mps = 1.0
+        try:
+            self._corridor_half_width_m = float(self._trigger_spec.get("corridor_half_width_m", os.environ.get("CUSTOM_DYNAMIC_PED_CORRIDOR_HALF_WIDTH_M", "2.25")))
+        except Exception:  # pylint: disable=broad-except
+            self._corridor_half_width_m = 2.25
+        try:
+            self._rear_tolerance_m = float(self._trigger_spec.get("rear_tolerance_m", os.environ.get("CUSTOM_DYNAMIC_PED_REAR_TOLERANCE_M", "0.75")))
+        except Exception:  # pylint: disable=broad-except
+            self._rear_tolerance_m = 0.75
+        try:
+            self._front_window_m = float(self._trigger_spec.get("front_window_m", os.environ.get("CUSTOM_DYNAMIC_PED_FRONT_WINDOW_M", "4.0")))
+        except Exception:  # pylint: disable=broad-except
+            self._front_window_m = 4.0
+        try:
+            self._trigger_clearance_m = float(self._trigger_spec.get("trigger_clearance_m", os.environ.get("CUSTOM_DYNAMIC_PED_TRIGGER_CLEARANCE_M", "0.5")))
+        except Exception:  # pylint: disable=broad-except
+            self._trigger_clearance_m = 0.5
+        try:
+            self._min_conflict_time_s = float(self._trigger_spec.get("min_conflict_time_s", os.environ.get("CUSTOM_DYNAMIC_PED_MIN_CONFLICT_TIME_S", "0.25")))
+        except Exception:  # pylint: disable=broad-except
+            self._min_conflict_time_s = 0.25
+        try:
+            self._stable_ticks_required = int(self._trigger_spec.get("stable_ticks", os.environ.get("CUSTOM_DYNAMIC_PED_STABLE_TICKS", "2")))
+        except Exception:  # pylint: disable=broad-except
+            self._stable_ticks_required = 2
+        self._sample_dt = max(0.05, min(0.5, float(self._sample_dt)))
+        self._base_horizon_s = max(1.0, float(self._base_horizon_s))
+        self._max_horizon_s = max(float(self._base_horizon_s), float(self._max_horizon_s))
+        self._min_ego_speed_mps = max(0.1, float(self._min_ego_speed_mps))
+        self._corridor_half_width_m = max(0.5, float(self._corridor_half_width_m))
+        self._rear_tolerance_m = max(0.0, float(self._rear_tolerance_m))
+        self._front_window_m = max(0.5, float(self._front_window_m))
+        self._stable_ticks_required = max(1, int(self._stable_ticks_required))
+
+        self._actor_radius = self._infer_actor_radius(actor)
+        self._ego_route_cache: Dict[int, Tuple[List[carla.Location], List[float]]] = {}
+
+    @staticmethod
+    def _infer_actor_radius(actor) -> float:
+        try:
+            bbox = actor.bounding_box
+            return max(0.20, math.hypot(float(bbox.extent.x), float(bbox.extent.y)))
+        except Exception:  # pylint: disable=broad-except
+            return 0.45
+
+    @staticmethod
+    def _ego_speed(actor) -> float:
+        try:
+            velocity = actor.get_velocity()
+            return math.hypot(float(velocity.x), float(velocity.y))
+        except Exception:  # pylint: disable=broad-except
+            return 0.0
+
+    def _ped_points_from_current_state(self) -> Tuple[List[carla.Location], List[float]]:
+        actor_loc = CarlaDataProvider.get_location(self._actor)
+        if actor_loc is None:
+            try:
+                actor_loc = self._actor.get_location()
+            except Exception:  # pylint: disable=broad-except
+                actor_loc = None
+        points: List[carla.Location] = []
+        if actor_loc is not None:
+            points.append(carla.Location(x=float(actor_loc.x), y=float(actor_loc.y), z=float(actor_loc.z)))
+
+        for item in list(self._actor_plan or []):
+            loc = item[0].location if isinstance(item, tuple) and hasattr(item[0], "location") else item
+            if not isinstance(loc, carla.Location):
+                continue
+            current = carla.Location(x=float(loc.x), y=float(loc.y), z=float(loc.z))
+            if points and _distance2d(points[-1], current) < 0.05:
+                continue
+            points.append(current)
+
+        if not points and self._actor_plan:
+            first = self._actor_plan[0]
+            if isinstance(first, carla.Location):
+                points = [first]
+        return points, _polyline_cumulative(points)
+
+    def _ego_route_data(self, ego_idx: int, ego_actor) -> Tuple[List[carla.Location], List[float]]:
+        cached = self._ego_route_cache.get(int(ego_idx))
+        if cached is not None:
+            return cached
+
+        route_entries = self._ego_routes[ego_idx] if 0 <= ego_idx < len(self._ego_routes) else []
+        points = _route_points_from_entries(route_entries)
+        if len(points) < 2:
+            try:
+                tf = ego_actor.get_transform()
+                velocity = ego_actor.get_velocity()
+                speed = math.hypot(float(velocity.x), float(velocity.y))
+                yaw_rad = math.radians(float(tf.rotation.yaw))
+                ahead = carla.Location(
+                    x=float(tf.location.x) + math.cos(yaw_rad) * max(5.0, speed * 2.0),
+                    y=float(tf.location.y) + math.sin(yaw_rad) * max(5.0, speed * 2.0),
+                    z=float(tf.location.z),
+                )
+                points = [
+                    carla.Location(x=float(tf.location.x), y=float(tf.location.y), z=float(tf.location.z)),
+                    ahead,
+                ]
+            except Exception:  # pylint: disable=broad-except
+                points = []
+        cumulative = _polyline_cumulative(points)
+        self._ego_route_cache[int(ego_idx)] = (points, cumulative)
+        return points, cumulative
+
+    def _evaluate_candidate(self, ego_idx: int, ego_actor, ped_points: List[carla.Location], ped_cumulative: List[float]) -> Optional[Dict[str, float]]:
+        if ego_actor is None or len(ped_points) < 2 or len(ped_cumulative) < 2:
+            return None
+
+        ego_speed = self._ego_speed(ego_actor)
+        if ego_speed < float(self._min_ego_speed_mps):
+            return None
+
+        route_points, route_cumulative = self._ego_route_data(int(ego_idx), ego_actor)
+        if len(route_points) < 2 or len(route_cumulative) < 2:
+            return None
+
+        ego_loc = CarlaDataProvider.get_location(ego_actor)
+        if ego_loc is None:
+            try:
+                ego_loc = ego_actor.get_location()
+            except Exception:  # pylint: disable=broad-except
+                return None
+
+        ego_s, _, _, _ = _project_location_to_polyline(ego_loc, route_points, route_cumulative)
+        ped_total = float(ped_cumulative[-1])
+        horizon_s = min(float(self._max_horizon_s), max(float(self._base_horizon_s), ped_total / max(0.1, float(self._target_speed))))
+        if horizon_s <= 0.0:
+            return None
+
+        try:
+            ego_radius = max(0.20, math.hypot(float(ego_actor.bounding_box.extent.x), float(ego_actor.bounding_box.extent.y)))
+        except Exception:  # pylint: disable=broad-except
+            ego_radius = 1.45
+
+        best = None
+        step_count = max(1, int(math.ceil(horizon_s / float(self._sample_dt))))
+        for step in range(1, step_count + 1):
+            t = float(step) * float(self._sample_dt)
+            ped_s = min(ped_total, float(self._target_speed) * t)
+            ped_loc, _ = _sample_polyline(ped_points, ped_cumulative, ped_s)
+            ego_future_s = ego_s + ego_speed * t
+            ego_loc_t, ego_forward = _sample_polyline(route_points, route_cumulative, ego_future_s)
+            if ego_forward == (0.0, 0.0):
+                continue
+            rel_x = float(ped_loc.x) - float(ego_loc_t.x)
+            rel_y = float(ped_loc.y) - float(ego_loc_t.y)
+            longitudinal = rel_x * float(ego_forward[0]) + rel_y * float(ego_forward[1])
+            lateral = rel_x * (-float(ego_forward[1])) + rel_y * float(ego_forward[0])
+            center_dist = math.hypot(rel_x, rel_y)
+            clearance = center_dist - (float(ego_radius) + float(self._actor_radius))
+            front_limit = float(self._front_window_m) + float(ego_radius) + float(self._actor_radius)
+            corridor_limit = max(float(self._corridor_half_width_m), float(ego_radius) + float(self._actor_radius) + 0.35)
+
+            if longitudinal < -float(self._rear_tolerance_m):
+                continue
+            if longitudinal > front_limit:
+                continue
+            if abs(lateral) > corridor_limit:
+                continue
+
+            candidate = {
+                "ego_idx": int(ego_idx),
+                "time_to_conflict_s": float(t),
+                "clearance_m": float(clearance),
+                "longitudinal_m": float(longitudinal),
+                "lateral_m": float(lateral),
+                "ego_speed_mps": float(ego_speed),
+            }
+            if best is None or (
+                float(candidate["clearance_m"]),
+                float(candidate["time_to_conflict_s"]),
+                abs(float(candidate["lateral_m"])),
+            ) < (
+                float(best["clearance_m"]),
+                float(best["time_to_conflict_s"]),
+                abs(float(best["lateral_m"])),
+            ):
+                best = candidate
+
+        return best
+
+    def update(self):
+        if self._triggered:
+            return py_trees.common.Status.SUCCESS
+
+        ped_points, ped_cumulative = self._ped_points_from_current_state()
+        if len(ped_points) < 2 or len(ped_cumulative) < 2:
+            return py_trees.common.Status.RUNNING
+
+        candidates: List[Dict[str, float]] = []
+        for ego_idx, ego_actor in enumerate(self._ego_actors):
+            if ego_actor is None:
+                continue
+            try:
+                if hasattr(ego_actor, "is_alive") and not bool(ego_actor.is_alive):
+                    continue
+            except Exception:  # pylint: disable=broad-except
+                pass
+            candidate = self._evaluate_candidate(int(ego_idx), ego_actor, ped_points, ped_cumulative)
+            if candidate is not None:
+                candidates.append(candidate)
+
+        if not candidates:
+            self._last_selected_vehicle = None
+            self._stable_selected_ticks = 0
+            return py_trees.common.Status.RUNNING
+
+        candidates.sort(
+            key=lambda c: (
+                float(c["clearance_m"]),
+                float(c["time_to_conflict_s"]),
+                0 if self._preferred_vehicle_idx is not None and int(c["ego_idx"]) == int(self._preferred_vehicle_idx) else 1,
+            )
+        )
+        best = candidates[0]
+        selected_name = f"Vehicle {int(best['ego_idx']) + 1}"
+
+        if selected_name == self._last_selected_vehicle:
+            self._stable_selected_ticks += 1
+        else:
+            self._last_selected_vehicle = selected_name
+            self._stable_selected_ticks = 1
+
+        should_trigger = (
+            float(best["time_to_conflict_s"]) >= float(self._min_conflict_time_s)
+            and float(best["clearance_m"]) <= float(self._trigger_clearance_m)
+            and int(self._stable_selected_ticks) >= int(self._stable_ticks_required)
+        )
+
+        self._debug_state["selected_vehicle"] = selected_name
+        self._debug_state["selected_ego_idx"] = int(best["ego_idx"])
+        self._debug_state["time_to_conflict_s"] = round(float(best["time_to_conflict_s"]), 3)
+        self._debug_state["clearance_m"] = round(float(best["clearance_m"]), 3)
+        self._debug_state["longitudinal_m"] = round(float(best["longitudinal_m"]), 3)
+        self._debug_state["lateral_m"] = round(float(best["lateral_m"]), 3)
+        self._debug_state["stable_ticks"] = int(self._stable_selected_ticks)
+        self._debug_state["trigger_type"] = "dynamic_forward_conflict"
+
+        if should_trigger:
+            self._triggered = True
+            print(
+                "[TRIGGER] Dynamic forward conflict FIRED for {}: ego={} "
+                "ttc={:.2f}s clearance={:.2f}m long={:.2f}m lat={:.2f}m".format(
+                    self._actor_name,
+                    selected_name,
+                    float(best["time_to_conflict_s"]),
+                    float(best["clearance_m"]),
+                    float(best["longitudinal_m"]),
+                    float(best["lateral_m"]),
+                )
+            )
+            return py_trees.common.Status.SUCCESS
+
+        return py_trees.common.Status.RUNNING
 
 
 class RouteScenario(BasicScenario):
@@ -3827,7 +4742,18 @@ class RouteScenario(BasicScenario):
 
     category = "RouteScenario"
 
-    def __init__(self, world, config, debug_mode=0, criteria_enable=True, ego_vehicles_num=1,log_dir=None, scenario_parameter=None,trigger_distance=10):
+    def __init__(
+        self,
+        world,
+        config,
+        debug_mode=0,
+        criteria_enable=True,
+        ego_vehicles_num=1,
+        log_dir=None,
+        scenario_parameter=None,
+        trigger_distance=10,
+        route_plots_only: bool = False,
+    ):
         """
         Setup all relevant parameters and create scenarios along route
 
@@ -3848,8 +4774,19 @@ class RouteScenario(BasicScenario):
         # load or initialize params
         self.config = config
         self.route = None
+        self.route_debug = None
         self.sampled_scenarios_definitions = None
         self.ego_vehicles_num=ego_vehicles_num
+        self.requested_ego_vehicle_count = int(ego_vehicles_num)
+        self.runtime_ego_vehicle_count = int(ego_vehicles_num)
+        self.active_to_original_ego_index = list(range(int(ego_vehicles_num)))
+        self.original_to_active_ego_index = {
+            int(idx): int(idx) for idx in range(int(ego_vehicles_num))
+        }
+        self.skipped_ego_indices: List[int] = []
+        self.ego_spawn_failures: List[dict] = []
+        self.partial_ego_spawn_accepted = False
+        self._gps_route: List[list] = []
         self.new_config_trajectory=None
         self.crazy_level = 0
         self.crazy_proportion = 0
@@ -3857,6 +4794,7 @@ class RouteScenario(BasicScenario):
         self.sensor_tf_num = 0
         self.sensor_tf_list = []
         self.log_dir = log_dir
+        self._route_plots_only = bool(route_plots_only)
         
         self.scenario_parameter = scenario_parameter
         self.background_params = scenario_parameter.get('Background',{})
@@ -3887,6 +4825,15 @@ class RouteScenario(BasicScenario):
 
         # update waypoints and scenarios along the routes
         self._update_route(world, config, debug_mode>0)
+
+        if self._route_plots_only:
+            # Route-plots-only mode only needs global route interpolation + plotting artifacts.
+            # Skip ego/background/custom actor spawning and full scenario tree construction.
+            self.ego_vehicles = []
+            self.other_actors = []
+            self.list_scenarios = []
+            self.scenario = []
+            return
 
         # set traffic sensors
         for j in range(self.sensor_tf_num):
@@ -4243,14 +5190,101 @@ class RouteScenario(BasicScenario):
         """
         draw waypoints coordinates from self.route
         """
+        if not self.route:
+            return
+
+        def _extract_transform(route_entry):
+            if not isinstance(route_entry, tuple) or len(route_entry) < 1:
+                return None
+            obj = route_entry[0]
+            if hasattr(obj, 'location') and hasattr(obj, 'rotation'):
+                return obj
+            if hasattr(obj, 'transform'):
+                return obj.transform
+            return None
+
+        def _road_option_fields(road_option):
+            option_name = str(getattr(road_option, 'name', road_option))
+            option_value = getattr(road_option, 'value', None)
+            if option_value is not None:
+                try:
+                    option_value = int(option_value)
+                except Exception:  # pylint: disable=broad-except
+                    option_value = str(option_value)
+            return option_name, option_value
+
         fig = plt.figure(dpi=400)
         colors = ['tab:red','tab:blue','tab:orange', 'tab:purple','tab:green','tab:pink', 'tab:brown', 'tab:gray', 'tab:olive', 'tab:cyan']
         center_x = self.route[0][0][0].location.x
         center_y = self.route[0][0][0].location.y
+        route_debug = self.route_debug if isinstance(self.route_debug, list) else []
+        route_data = {
+            'center': {
+                'x': float(center_x),
+                'y': float(center_y),
+            },
+            'ego_routes': [],
+        }
+        per_ego_data_dir = os.path.join(self.log_dir, 'per_ego_route_data')
+        os.makedirs(per_ego_data_dir, exist_ok=True)
+        corrected_label_used = False
+        sanitized_label_used = False
+
         for i in range(len(self.route)):
+            debug_entry = route_debug[i] if i < len(route_debug) and isinstance(route_debug[i], dict) else {}
+            before_route = list(debug_entry.get('before_route', []) or [])
+            postprocess_meta = dict(debug_entry.get('postprocess_meta', {}) or {})
+            corrected_indices = sorted(
+                int(idx) for idx in postprocess_meta.get('corrected_indices', [])
+                if isinstance(idx, (int, float))
+            )
+            corrected_set = set(corrected_indices)
+            sanitized_indices = sorted(
+                int(idx) for idx in postprocess_meta.get('sanitized_indices', [])
+                if isinstance(idx, (int, float))
+            )
+            sanitized_set = set(sanitized_indices)
+
+            before_points = []
+            before_plot_x = []
+            before_plot_y = []
+            for j, route_entry in enumerate(before_route):
+                tf_before = _extract_transform(route_entry)
+                if tf_before is None:
+                    continue
+                before_x = tf_before.location.x - center_x + 1*i
+                before_y = tf_before.location.y - center_y + 1*i
+                before_plot_x.append(before_x)
+                before_plot_y.append(before_y)
+                before_points.append({
+                    'point_index': int(j),
+                    'x': float(tf_before.location.x),
+                    'y': float(tf_before.location.y),
+                    'z': float(tf_before.location.z),
+                    'yaw': float(tf_before.rotation.yaw),
+                    'pitch': float(tf_before.rotation.pitch),
+                    'roll': float(tf_before.rotation.roll),
+                    'plot_x': float(before_x),
+                    'plot_y': float(before_y),
+                })
+
+            if before_plot_x and before_plot_y:
+                plt.plot(
+                    before_plot_x,
+                    before_plot_y,
+                    linestyle='--',
+                    linewidth=1.0,
+                    alpha=0.35,
+                    color=colors[i],
+                    label='before(raw)' if i == 0 else None,
+                )
+
+            ego_points = []
             for j in range(len(self.route[i])):
-                point_x = self.route[i][j][0].location.x - center_x + 1*i
-                point_y = self.route[i][j][0].location.y - center_y + 1*i
+                transform = self.route[i][j][0]
+                road_option = self.route[i][j][1]
+                point_x = transform.location.x - center_x + 1*i
+                point_y = transform.location.y - center_y + 1*i
                 if j==0:
                     plt.scatter(point_x, point_y, s=50, c=colors[i], label='ego{}'.format(i))
                     plt.text(point_x+0.1, point_y+0.1, 'ego{} start'.format(i))
@@ -4259,8 +5293,119 @@ class RouteScenario(BasicScenario):
                     plt.text(point_x+0.1, point_y+2*(i+1), 'ego{} end'.format(i))
                 else:
                     plt.scatter(point_x, point_y, s=20, c=colors[i])
+
+                if j in sanitized_set:
+                    marker_label = None
+                    if not sanitized_label_used:
+                        marker_label = 'sanitized node'
+                        sanitized_label_used = True
+                    plt.scatter(
+                        point_x,
+                        point_y,
+                        s=95,
+                        facecolors='none',
+                        edgecolors='lime',
+                        linewidths=1.4,
+                        label=marker_label,
+                    )
+
+                if j in corrected_set:
+                    marker_label = None
+                    if not corrected_label_used:
+                        marker_label = 'corrected node'
+                        corrected_label_used = True
+                    plt.scatter(
+                        point_x,
+                        point_y,
+                        s=80,
+                        facecolors='none',
+                        edgecolors='yellow',
+                        linewidths=1.2,
+                        label=marker_label,
+                    )
+
+                option_name, option_value = _road_option_fields(road_option)
+                ego_points.append({
+                    'point_index': int(j),
+                    'is_start': bool(j == 0),
+                    'is_end': bool(j == (len(self.route[i]) - 1)),
+                    'is_corrected': bool(j in corrected_set),
+                    'is_sanitized': bool(j in sanitized_set),
+                    'x': float(transform.location.x),
+                    'y': float(transform.location.y),
+                    'z': float(transform.location.z),
+                    'yaw': float(transform.rotation.yaw),
+                    'pitch': float(transform.rotation.pitch),
+                    'roll': float(transform.rotation.roll),
+                    'plot_x': float(point_x),
+                    'plot_y': float(point_y),
+                    'road_option': option_name,
+                    'road_option_value': option_value,
+                })
+
+            route_data['ego_routes'].append({
+                'ego_index': int(i),
+                'num_points': int(len(ego_points)),
+                'num_before_points': int(len(before_points)),
+                'num_corrected_points': int(len(corrected_indices)),
+                'num_sanitized_points': int(len(sanitized_indices)),
+                'corrected_indices': corrected_indices,
+                'sanitized_indices': sanitized_indices,
+                'postprocess_meta': postprocess_meta,
+                'before_points': before_points,
+                'points': ego_points,
+            })
+
+            csv_path = os.path.join(per_ego_data_dir, 'ego{}_route_points.csv'.format(i))
+            with open(csv_path, 'w', newline='', encoding='utf-8') as csv_file:
+                writer = csv.DictWriter(
+                    csv_file,
+                    fieldnames=[
+                        'point_index',
+                        'is_start',
+                        'is_end',
+                        'is_corrected',
+                        'is_sanitized',
+                        'x',
+                        'y',
+                        'z',
+                        'yaw',
+                        'pitch',
+                        'roll',
+                        'plot_x',
+                        'plot_y',
+                        'road_option',
+                        'road_option_value',
+                    ],
+                )
+                writer.writeheader()
+                for point in ego_points:
+                    writer.writerow(point)
+
+            before_csv_path = os.path.join(per_ego_data_dir, 'ego{}_route_points_before.csv'.format(i))
+            with open(before_csv_path, 'w', newline='', encoding='utf-8') as csv_file:
+                writer = csv.DictWriter(
+                    csv_file,
+                    fieldnames=[
+                        'point_index',
+                        'x',
+                        'y',
+                        'z',
+                        'yaw',
+                        'pitch',
+                        'roll',
+                        'plot_x',
+                        'plot_y',
+                    ],
+                )
+                writer.writeheader()
+                for point in before_points:
+                    writer.writerow(point)
+
         plt.legend(loc='lower right')
         plt.savefig(os.path.join(self.log_dir,'point_coordinates.png'))
+        with open(os.path.join(self.log_dir, 'point_coordinates.json'), 'w', encoding='utf-8') as json_file:
+            json.dump(route_data, json_file, indent=2)
         plt.close()
 
     def _update_route(self, world, config, debug_mode):
@@ -4285,6 +5430,8 @@ class RouteScenario(BasicScenario):
         # road-graph segments, and its output is unused anyway.
         if self.ego_vehicles_num == 0:
             self.route = []
+            self.route_debug = []
+            self._gps_route = []
             CarlaDataProvider.set_ego_vehicle_route([])
             config.agent.set_global_plan([], [])
             self.sampled_scenarios_definitions = []
@@ -4299,12 +5446,31 @@ class RouteScenario(BasicScenario):
             self._align_start_waypoints(world, trajectory, config)
         gps_route=[]
         route=[]
+        route_debug=[]
         potential_scenarios_definitions=[]
 
         # prepare route's trajectory (interpolate and add the GPS route)
+        # When CUSTOM_USE_PRECOMPUTED_DENSE_ROUTE=1, the XML waypoints have already
+        # been replaced with the dense smooth lane-following trace produced by
+        # tools/route_alignment.align_route (via run_custom_eval --align-ego-routes).
+        # Re-running interpolate_trajectory on top of that re-snaps endpoints to
+        # other lanes and inserts spurious lane-changes / back-jumps; passthrough
+        # preserves the inspector's "grp_vis_dp_bypass_all" output verbatim.
+        use_precomputed = os.environ.get("CUSTOM_USE_PRECOMPUTED_DENSE_ROUTE") == "1"
         for i, tr in enumerate(trajectory):
             # tr is a list of waypoint, each a carla.Location object
-            gps, r = interpolate_trajectory(world, tr)
+            if use_precomputed and len(tr) >= 2:
+                yaws = None
+                if hasattr(config, "multi_traj_yaws") and config.multi_traj_yaws \
+                        and i < len(config.multi_traj_yaws):
+                    yaws = config.multi_traj_yaws[i]
+                if yaws is None:
+                    yaws = getattr(config, "trajectory_yaws", None)
+                gps, r = _build_passthrough_route(world, tr, yaws)
+                route_debug.append({"trace_source": "precomputed_dense"})
+            else:
+                gps, r = interpolate_trajectory(world, tr)
+                route_debug.append(dict(getattr(interpolate_trajectory, 'last_debug', {}) or {}))
             gps_route.append(gps)
             route.append(r)
             print('load scenarios for ego{}'.format(i))
@@ -4314,6 +5480,8 @@ class RouteScenario(BasicScenario):
         # print(potential_scenarios_definitions)
         # self.route is a list of ego_vehicles' routes
         self.route = route
+        self.route_debug = route_debug
+        self._gps_route = gps_route
         if self.log_dir is not None:
             # plot waypoints coordinates
             self.draw_route()
@@ -4390,6 +5558,122 @@ class RouteScenario(BasicScenario):
             if best.transform.location.distance(tr[0]) <= max_snap_dist:
                 tr[0] = best.transform.location
 
+    def _should_accept_partial_ego_spawn(self, failure_count: int) -> bool:
+        requested = max(0, int(self.requested_ego_vehicle_count))
+        failures = max(0, int(failure_count))
+        if requested <= 0 or failures <= 0:
+            return False
+        allow_partial = os.environ.get("CUSTOM_ALLOW_PARTIAL_EGO_SPAWN", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not allow_partial:
+            return False
+        spawned = requested - failures
+        if spawned <= 0:
+            # Nothing spawned — the scenario has no ego to evaluate at all.
+            return False
+        # Policy: accept the scenario if at least *2/3 of the requested egos*
+        # actually spawned (equivalently: failures <= floor(requested/3)).
+        # For 2-ego scenarios, where strict 2/3 would require both to spawn,
+        # fall back to "at least one ego is alive" — a single-ego run is
+        # still useful signal, and a CARLA spawn-point race is the single
+        # most common cause of transient spawn failure in multi-ego layouts.
+        if requested <= 2:
+            return spawned >= 1
+        # ceil(2/3 * requested) ≡ (2*requested + 2) // 3
+        required_spawns = (2 * requested + 2) // 3
+        return spawned >= required_spawns
+
+    def _cleanup_partially_spawned_ego_vehicles(self, ego_vehicles: List) -> None:
+        for ego_vehicle in ego_vehicles:
+            if ego_vehicle is None:
+                continue
+            try:
+                ego_id = getattr(ego_vehicle, "id", None)
+                if ego_id is not None:
+                    CarlaDataProvider.remove_actor_by_id(
+                        int(ego_id),
+                        max_retries=0,
+                        timeout_s=0.5,
+                        poll_s=0.02,
+                        direct_fallback=True,
+                        reason="route_scenario_partial_spawn_cleanup",
+                        phase="route_scenario_partial_spawn_cleanup",
+                    )
+                    continue
+            except Exception:  # pylint: disable=broad-except
+                pass
+            try:
+                ego_vehicle.destroy()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    def _apply_active_ego_filter(self, world, active_original_indices: List[int]) -> None:
+        active_original_indices = [int(idx) for idx in active_original_indices]
+        self.active_to_original_ego_index = list(active_original_indices)
+        self.original_to_active_ego_index = {
+            int(original_idx): int(active_idx)
+            for active_idx, original_idx in enumerate(active_original_indices)
+        }
+        self.skipped_ego_indices = [
+            idx
+            for idx in range(int(self.requested_ego_vehicle_count))
+            if idx not in self.original_to_active_ego_index
+        ]
+        self.runtime_ego_vehicle_count = len(active_original_indices)
+        self.ego_vehicles_num = len(active_original_indices)
+
+        if self.route is None:
+            return
+
+        if active_original_indices != list(range(len(self.route))):
+            self.route = [self.route[idx] for idx in active_original_indices if idx < len(self.route)]
+            if self.route_debug is not None:
+                self.route_debug = [
+                    self.route_debug[idx]
+                    for idx in active_original_indices
+                    if idx < len(self.route_debug)
+                ]
+            if self.sampled_scenarios_definitions is not None:
+                self.sampled_scenarios_definitions = [
+                    self.sampled_scenarios_definitions[idx]
+                    for idx in active_original_indices
+                    if idx < len(self.sampled_scenarios_definitions)
+                ]
+            if self._gps_route:
+                self._gps_route = [
+                    self._gps_route[idx]
+                    for idx in active_original_indices
+                    if idx < len(self._gps_route)
+                ]
+            self._ego_replay_transforms = [
+                self._ego_replay_transforms[idx]
+                for idx in active_original_indices
+                if idx < len(self._ego_replay_transforms)
+            ]
+            self._ego_replay_times = [
+                self._ego_replay_times[idx]
+                for idx in active_original_indices
+                if idx < len(self._ego_replay_times)
+            ]
+
+        if not self._gps_route and self.route:
+            lat_ref, lon_ref = _get_latlon_ref(world)
+            self._gps_route = [
+                location_route_to_gps(route, lat_ref, lon_ref)
+                for route in self.route
+            ]
+
+        CarlaDataProvider.set_ego_vehicle_route(
+            [convert_transform_to_location(route) for route in (self.route or [])]
+        )
+        if getattr(self.config, "agent", None) is not None:
+            self.config.agent.set_global_plan(self._gps_route, self.route or [])
+        self.timeout = self._estimate_route_timeout()
+
     def _update_ego_vehicle(self, world) -> List:
         """
         Set/Update the start position of the ego_vehicles
@@ -4397,7 +5681,9 @@ class RouteScenario(BasicScenario):
             ego_vehicles (list): list of ego_vehicles.
         """
         # move ego vehicles to correct position
-        ego_vehicles=[]
+        ego_vehicles = []
+        active_original_indices: List[int] = []
+        spawn_failures: List[dict] = []
         normalize_ego_z = os.environ.get("CUSTOM_EGO_NORMALIZE_Z", "").lower() in (
             "1",
             "true",
@@ -4408,10 +5694,16 @@ class RouteScenario(BasicScenario):
             "true",
             "yes",
         )
-        log_replay_ego = os.environ.get("CUSTOM_EGO_LOG_REPLAY", "").lower() in (
-            "1",
-            "true",
-            "yes",
+        # Ego physics disable + LogReplayFollower require BOTH env vars now.
+        # The new "frame-0 metrics + closed-loop drive" pattern sets only
+        # CUSTOM_EGO_LOG_REPLAY=1 (so per-tick prediction dump fires) but
+        # leaves CUSTOM_OPENLOOP_TELEPORT off, which kept scenario_manager's
+        # neutral-control suppression off but did NOT stop this file from
+        # disabling ego physics — the ego sat motionless under full throttle.
+        # Match scenario_manager._openloop_mode so closed-loop driving works.
+        log_replay_ego = (
+            os.environ.get("CUSTOM_EGO_LOG_REPLAY", "").lower() in ("1", "true", "yes")
+            and os.environ.get("CUSTOM_OPENLOOP_TELEPORT", "").lower() in ("1", "true", "yes")
         )
         try:
             vehicle_ground_lift = float(os.environ.get("CUSTOM_VEHICLE_GROUND_LIFT", "0.04"))
@@ -4419,7 +5711,6 @@ class RouteScenario(BasicScenario):
             vehicle_ground_lift = 0.04
         world = CarlaDataProvider.get_world()
         world_map = CarlaDataProvider.get_map()
-
 
         for j in range(self.ego_vehicles_num):
             if log_replay_ego and j < len(self._ego_replay_transforms) and self._ego_replay_transforms[j]:
@@ -4464,10 +5755,34 @@ class RouteScenario(BasicScenario):
             # Get vehicle model from manifest (for promoted NPCs) or use default
             vehicle_model = get_ego_vehicle_model(j, default='vehicle.lincoln.mkz2017')
             print("vehicle model:{}".format(vehicle_model))
-            ego_vehicle = CarlaDataProvider.request_new_actor(vehicle_model,
-                                                            spawn_tf,
-                                                            rolename='hero_{}'.format(j))
+            runtime_ego_idx = len(ego_vehicles)
+            runtime_role_name = 'hero_{}'.format(runtime_ego_idx)
+            try:
+                ego_vehicle = CarlaDataProvider.request_new_actor(
+                    vehicle_model,
+                    spawn_tf,
+                    rolename=runtime_role_name,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                failure = {
+                    "original_ego_index": int(j),
+                    "runtime_ego_index": None,
+                    "role_name": runtime_role_name,
+                    "vehicle_model": str(vehicle_model),
+                    "transform": str(spawn_tf),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                spawn_failures.append(failure)
+                print(
+                    "[WARN] Ego spawn failed: "
+                    f"requested_ego={j} role={runtime_role_name} model={vehicle_model} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+                continue
+
             ego_vehicles.append(ego_vehicle)
+            active_original_indices.append(j)
 
             if log_replay_ego and ego_vehicle is not None:
                 try:
@@ -4490,11 +5805,49 @@ class RouteScenario(BasicScenario):
                         pass
 
             # set the spectator location above the first ego vehicle
-            if j==0:
+            if len(ego_vehicles) == 1:
                 spectator = CarlaDataProvider.get_world().get_spectator()
                 ego_trans = ego_vehicle.get_transform()
                 spectator.set_transform(carla.Transform(ego_trans.location + carla.Location(z=50),
                                                             carla.Rotation(pitch=-90)))
+
+        self.ego_spawn_failures = spawn_failures
+        self.partial_ego_spawn_accepted = False
+        if spawn_failures:
+            requested = int(self.requested_ego_vehicle_count)
+            failures = len(spawn_failures)
+            spawned = len(ego_vehicles)
+            failed_original_indices = [
+                int(entry.get("original_ego_index", -1))
+                for entry in spawn_failures
+            ]
+            if self._should_accept_partial_ego_spawn(failures) and spawned > 0:
+                self.partial_ego_spawn_accepted = True
+                print(
+                    "[WARN] Accepting partial ego spawn: "
+                    f"spawned={spawned}/{requested}, failed={failures}, "
+                    f"failed_original_egos={failed_original_indices}"
+                )
+                for failure in spawn_failures:
+                    print(
+                        "[WARN] Partial ego spawn detail: "
+                        f"requested_ego={failure['original_ego_index']} "
+                        f"role={failure['role_name']} model={failure['vehicle_model']} "
+                        f"transform={failure['transform']} "
+                        f"error={failure['error_type']}: {failure['error']}"
+                    )
+            else:
+                self._cleanup_partially_spawned_ego_vehicles(ego_vehicles)
+                failure_lines = "; ".join(
+                    f"ego{entry['original_ego_index']} {entry['error_type']}: {entry['error']}"
+                    for entry in spawn_failures
+                )
+                raise RuntimeError(
+                    "Error: Unable to spawn enough ego vehicles "
+                    f"(spawned={spawned}/{requested}, failed={failures}). {failure_lines}"
+                )
+
+        self._apply_active_ego_filter(world, active_original_indices)
         return ego_vehicles
 
     def _estimate_route_timeout(self):
@@ -4549,6 +5902,24 @@ class RouteScenario(BasicScenario):
                     max_route_length = float(route_length)
             if has_valid_route:
                 timeout = int(SECONDS_GIVEN_PER_METERS * max_route_length + INITIAL_SECONDS_DELAY)
+                # Hard ceiling: data shows 99.6% of completed scenarios finish
+                # under 300 sim sec (p99=189s, p95=82s).  For long-route v2xpnp
+                # scenarios the per-meter formula can give 800s+, which lets a
+                # single stuck ego with active-ticking-but-zero-progress burn
+                # the entire timeout.  Cap at 360s (1.9x p99 of completed) to
+                # catch these clear outliers.  Override via env var.
+                try:
+                    _max_timeout = int(os.environ.get("CARLA_SCENARIO_MAX_SIM_S", "360"))
+                except Exception:
+                    _max_timeout = 360
+                if _max_timeout > 0 and timeout > _max_timeout:
+                    print(
+                        "[RouteScenario] Capping route timeout: per-route={}s -> hard cap={}s "
+                        "(route_length={:.2f}m, override via CARLA_SCENARIO_MAX_SIM_S)".format(
+                            timeout, _max_timeout, float(max_route_length),
+                        )
+                    )
+                    timeout = _max_timeout
                 if self.ego_vehicles_num > 1:
                     print(
                         "[RouteScenario] Multi-ego timeout: {}s (max route length={:.2f}m across {} egos)".format(
@@ -5765,15 +7136,35 @@ class RouteScenario(BasicScenario):
         match = re.search(r"(\d+)", name)
         if not match:
             return None
-        idx = int(match.group(1)) - 1
-        if idx < 0 or idx >= len(self.ego_vehicles):
+        original_idx = int(match.group(1)) - 1
+        active_idx = self.original_to_active_ego_index.get(original_idx)
+        if active_idx is None or active_idx < 0 or active_idx >= len(self.ego_vehicles):
             return None
-        return self.ego_vehicles[idx]
+        return self.ego_vehicles[active_idx]
 
-    def _build_trigger_condition(self, trigger_spec: dict, actor):
+    def _build_trigger_condition(self, trigger_spec: dict, actor_plan: dict):
         if not isinstance(trigger_spec, dict):
             return None
+        actor = actor_plan.get("actor")
+        if actor is None:
+            return None
+
+        role = str(actor_plan.get("role", "")).strip().lower()
+        is_walker_like = role in ("pedestrian", "walker")
         ttype = str(trigger_spec.get("type", "")).strip()
+        if is_walker_like and ttype in ("distance_to_vehicle", "dynamic_forward_conflict"):
+            return DynamicForwardConflictTrigger(
+                actor=actor,
+                actor_name=str(actor_plan.get("name") or "pedestrian"),
+                actor_plan=actor_plan.get("plan"),
+                target_speed=float(actor_plan.get("target_speed") or 1.5),
+                ego_actors=self.ego_vehicles,
+                ego_routes=self.route,
+                preferred_vehicle=trigger_spec.get("preferred_vehicle") or trigger_spec.get("vehicle"),
+                trigger_spec=trigger_spec,
+                debug_state=actor_plan.setdefault("trigger_state", {}),
+            )
+
         if ttype != "distance_to_vehicle":
             return None
         ego_name = trigger_spec.get("vehicle")
@@ -5837,7 +7228,7 @@ class RouteScenario(BasicScenario):
         ego_actor = None
         trigger_distance = None
         if isinstance(trigger_spec, dict):
-            trigger_cond = self._build_trigger_condition(trigger_spec, actor)
+            trigger_cond = self._build_trigger_condition(trigger_spec, actor_plan)
             if os.environ.get('DEBUG_FINISH', '').lower() in ('1', 'true', 'yes'):
                 print(f"[DEBUG FINISH] _build_custom_actor_behavior: trigger_cond={trigger_cond}")
             # Get ego actor and trigger distance for smart speed calculation
@@ -5867,10 +7258,22 @@ class RouteScenario(BasicScenario):
         
         is_vehicle = self._is_vehicle_actor(actor_plan)
         has_distance_trigger = (
-            isinstance(trigger_spec, dict) and 
+            isinstance(trigger_spec, dict) and
             trigger_spec.get("type") == "distance_to_vehicle"
         )
-        needs_catchup = is_vehicle and has_distance_trigger and action_type != "start_motion"
+        # By default we add a speed_callback that paces the NPC to <= 0.98*ego
+        # so it can't outrun the ego before the trigger fires. Scenarios that
+        # need the NPC to drive at a fixed speed regardless of ego (and avoid
+        # the "both stop at trigger+epsilon" deadlock when TCP-like agents
+        # brake on close approach) can set action.pacing=false in
+        # actors_behavior.json.
+        pacing_enabled = True
+        try:
+            if isinstance(action_spec, dict) and action_spec.get("pacing") is False:
+                pacing_enabled = False
+        except Exception:
+            pass
+        needs_catchup = is_vehicle and has_distance_trigger and action_type != "start_motion" and pacing_enabled
         
         effective_speed = target_speed if target_speed is not None else 8.0
         if needs_catchup and ego_actor is not None and actor is not None:
@@ -5947,8 +7350,12 @@ class RouteScenario(BasicScenario):
         resume_plan = plan
         if needs_catchup and has_distance_trigger:
             # Avoid short plans ending before the trigger fires.
+            # NOTE: only nuke follow_plan — the parallel uses SUCCESS_ON_ONE and
+            # would otherwise complete before the trigger if the plan is short.
+            # resume_plan MUST stay populated; with plan=None the resume
+            # WaypointFollower's LocalPlanner never gets set_global_plan and
+            # the actor sits motionless after the 2s handbrake.
             follow_plan = None
-            resume_plan = None
 
         if action_type == "start_motion":
             if trigger_cond is None:
@@ -5987,24 +7394,31 @@ class RouteScenario(BasicScenario):
                 speed_callback=speed_callback,
                 name=f"FollowWaypoints-{actor_plan.get('name')}",
             )
-            
+
             # Brake sequence: wait for combined trigger -> terminate follower -> brake -> handbrake
             brake_seq = py_trees.composites.Sequence(name=f"TriggerBrake-{actor_plan.get('name')}")
             
             if trigger_cond is not None and needs_catchup:
-                # Combined trigger: BOTH minimum drive time AND distance trigger must be satisfied
-                # This prevents immediate triggering if NPC spawns within trigger distance
+                # Combined trigger: NPC must have actually moved >=min_drive_distance
+                # AND the distance trigger condition must be satisfied. Using a
+                # distance-traveled gate instead of a wall-time Idle prevents the
+                # brake from firing at spawn if the ego (and thus the paced NPC)
+                # hasn't actually started driving yet.
                 combined_trigger = py_trees.composites.Parallel(
                     name=f"CombinedTrigger-{actor_plan.get('name')}",
                     policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ALL,
                 )
-                combined_trigger.add_child(Idle(duration=min_drive_time, name=f"MinDriveTime-{actor_plan.get('name')}"))
+                try:
+                    min_drive_distance = float(action_spec.get("min_drive_distance_m", 3.0))
+                except Exception:
+                    min_drive_distance = 3.0
+                combined_trigger.add_child(_ActorMovedDistance(actor, min_distance=min_drive_distance, name=f"NpcMoved-{actor_plan.get('name')}"))
                 combined_trigger.add_child(trigger_cond)
                 brake_seq.add_child(combined_trigger)
             elif trigger_cond is not None:
                 brake_seq.add_child(trigger_cond)
             # else: no trigger, brake immediately
-            
+
             brake_seq.add_child(TerminateWaypointFollower(actor))
             brake_seq.add_child(StopVehicle(actor, brake_value=1.0))
             brake_seq.add_child(HandBrakeVehicle(actor, hand_brake_value=1.0))
@@ -6021,17 +7435,44 @@ class RouteScenario(BasicScenario):
             # Main sequence: parallel (drive+brake) -> wait -> release -> resume driving
             main_seq = py_trees.composites.Sequence(name=f"HardBrakeBehavior-{actor_plan.get('name')}")
             main_seq.add_child(par)
-            # Wait 2 seconds while stopped
-            main_seq.add_child(Idle(duration=2.0, name=f"BrakeWait-{actor_plan.get('name')}"))
-            # Release handbrake
-            main_seq.add_child(HandBrakeVehicle(actor, hand_brake_value=0.0))
-            # Resume driving with a fresh follower so the actor doesn't remain stationary.
-            resume_speed = target_speed if target_speed is not None else effective_speed
+            # Brake hold duration — defaults to 2s, can be overridden via actors_behavior.json
+            # action_spec key "brake_hold_s" (e.g. for hard_brake-then-flee patterns).
+            try:
+                brake_hold_s = float(action_spec.get("brake_hold_s", 2.0))
+            except Exception:
+                brake_hold_s = 2.0
+            main_seq.add_child(Idle(duration=brake_hold_s, name=f"BrakeWait-{actor_plan.get('name')}"))
+            # Release handbrake: do NOT use HandBrakeVehicle(0) here. Its apply_control
+            # mysteriously HANGS after the brake_seq path (StopVehicle ran), causing a
+            # 10s CARLA RPC timeout and scenario crash. _ResetVehicleControl below uses
+            # a FRESH carla.VehicleControl() per tick, which doesn't reproduce the hang.
+            # CRITICAL: explicitly reset brake to 0 before resume. StopVehicle's
+            # auto-clear-brake-on-stop branch is bypassed when par succeeds via
+            # follow_WF's terminate-induced SUCCESS, so br=1.0 stays latched on
+            # the actor. Without this, the resume WaypointFollower's first apply
+            # would have to overcome a stuck brake.
+            main_seq.add_child(_ResetVehicleControl(actor, name=f"BrakeReset-{actor_plan.get('name')}"))
+            # Resume target speed defaults to actor target_speed; override via action_spec
+            # key "resume_speed_mps" (lets NPC sprint away after a brief hard brake so
+            # downstream planners regain forward perception clearance).
+            try:
+                _resume_override = action_spec.get("resume_speed_mps")
+                resume_speed = float(_resume_override) if _resume_override is not None else (target_speed if target_speed is not None else effective_speed)
+            except Exception:
+                resume_speed = target_speed if target_speed is not None else effective_speed
+            # CRITICAL: dynamically build the resume plan from the NPC's actual
+            # position at resume time. Using the original `plan` here causes
+            # CARLA's LocalPlanner to target the FIRST plan waypoint, which is
+            # usually BEHIND the NPC (because the NPC has driven through it
+            # before braking). When the PID target is behind the vehicle, the
+            # LocalPlanner outputs brake=1.0 indefinitely and the NPC never
+            # moves again. _DynamicForwardWaypointFollower waits until first
+            # tick, then builds a new plan starting from current+min_lookahead.
             main_seq.add_child(
-                WaypointFollower(
-                    actor,
+                _DynamicForwardWaypointFollower(
+                    actor=actor,
+                    base_plan=resume_plan,
                     target_speed=resume_speed,
-                    plan=resume_plan,
                     avoid_collision=avoid_collision,
                     name=f"FollowWaypoints-{actor_plan.get('name')}-resume",
                 )
@@ -6116,10 +7557,12 @@ class RouteScenario(BasicScenario):
         """
         scenario_trigger_distance = 1.5  # Max trigger distance between route and scenario
         behavior = []
-        log_replay_ego = os.environ.get("CUSTOM_EGO_LOG_REPLAY", "").lower() in (
-            "1",
-            "true",
-            "yes",
+        # Same gate as line 5423 — both env vars required so the LogReplayFollower
+        # behavior tree only fires for true full-trajectory openloop, not the
+        # frame-0-metrics + closed-loop-drive pattern.
+        log_replay_ego = (
+            os.environ.get("CUSTOM_EGO_LOG_REPLAY", "").lower() in ("1", "true", "yes")
+            and os.environ.get("CUSTOM_OPENLOOP_TELEPORT", "").lower() in ("1", "true", "yes")
         )
         normalize_ego_z = os.environ.get("CUSTOM_EGO_NORMALIZE_Z", "").lower() in (
             "1",
@@ -6345,6 +7788,14 @@ class RouteScenario(BasicScenario):
                         )
 
                     subbehavior.add_child(custom_behavior)
+                    # If the action behavior asked for a persistent NPC
+                    # kinematics logger, plant it as a sibling here so it
+                    # runs in parallel with the action throughout the entire
+                    # scenario (subbehavior never SUCCESSES — has an Idle()
+                    # sentinel — so logger is alive until scenario shutdown).
+                    _npc_logger = actor_plan.pop("_npc_kinematics_logger", None)
+                    if _npc_logger is not None:
+                        subbehavior.add_child(_npc_logger)
 
             scenario_behaviors = []
             blackboard_list = []
@@ -6390,12 +7841,27 @@ class RouteScenario(BasicScenario):
         """
         """
         criteria_all = []
-        log_replay_ego = os.environ.get("CUSTOM_EGO_LOG_REPLAY", "").lower() in (
-            "1",
-            "true",
-            "yes",
+        # Same gate as line 5423 — criteria's terminate_on_failure flag should
+        # match the actual ego control mode (closed-loop in the new frame-0
+        # pattern, replay-only in legacy full-trajectory openloop).
+        log_replay_ego = (
+            os.environ.get("CUSTOM_EGO_LOG_REPLAY", "").lower() in ("1", "true", "yes")
+            and os.environ.get("CUSTOM_OPENLOOP_TELEPORT", "").lower() in ("1", "true", "yes")
         )
         for ego_vehicle_id in range(len(self.list_scenarios)):
+            # GUARD: skip ego_vehicle_id if its actor reference is missing,
+            # or if attaching the collision sensor raises "parent actor not
+            # found" (CARLA `is_alive` lies after world reloads — only the
+            # spawn_actor call surfaces the truth). Without this guard, a
+            # 2nd-pass init after partial teardown crashes the whole route
+            # and the pool misclassifies it as
+            # deterministic:scenario_data:alignment_failed.
+            if ego_vehicle_id >= len(self.ego_vehicles):
+                print(f"[_create_test_criteria] skip ego_vehicle_id={ego_vehicle_id}: "
+                      f"index out of range (have {len(self.ego_vehicles)} ego refs)")
+                criteria_all.append([])
+                continue
+            _ego_ref = self.ego_vehicles[ego_vehicle_id]
             criteria = []
             route = convert_transform_to_location(self.route[ego_vehicle_id])
             if log_replay_ego and ego_vehicle_id < len(self._ego_replay_transforms):
@@ -6409,24 +7875,51 @@ class RouteScenario(BasicScenario):
                         replay_route.append((carla.Location(x=loc.x, y=loc.y, z=loc.z), RoadOption.LANEFOLLOW))
                     if len(replay_route) >= 2:
                         route = replay_route
-            collision_criterion = CollisionTest(self.ego_vehicles[ego_vehicle_id], terminate_on_failure=False)
+            try:
+                collision_criterion = CollisionTest(self.ego_vehicles[ego_vehicle_id], terminate_on_failure=False)
 
-            route_criterion = InRouteTest(self.ego_vehicles[ego_vehicle_id],
-                                        route=route,
-                                        offroad_max=30,
-                                        terminate_on_failure=not log_replay_ego)
-                                        
-            completion_criterion = RouteCompletionTest(self.ego_vehicles[ego_vehicle_id], route=route)
+                route_criterion = InRouteTest(self.ego_vehicles[ego_vehicle_id],
+                                            route=route,
+                                            offroad_max=30,
+                                            terminate_on_failure=not log_replay_ego)
 
-            outsidelane_criterion = OutsideRouteLanesTest(self.ego_vehicles[ego_vehicle_id], route=route)
+                completion_criterion = RouteCompletionTest(self.ego_vehicles[ego_vehicle_id], route=route)
 
-            red_light_criterion = RunningRedLightTest(self.ego_vehicles[ego_vehicle_id])
+                outsidelane_criterion = OutsideRouteLanesTest(self.ego_vehicles[ego_vehicle_id], route=route)
 
-            stop_criterion = RunningStopTest(self.ego_vehicles[ego_vehicle_id])
+                red_light_criterion = RunningRedLightTest(self.ego_vehicles[ego_vehicle_id])
 
+                stop_criterion = RunningStopTest(self.ego_vehicles[ego_vehicle_id])
+            except RuntimeError as _e:
+                # "unable to attach actor: parent actor not found" or similar
+                # CARLA-side error means this ego's actor is already gone.
+                # Skip its criteria — the route loop will still run for other
+                # egos. Without this guard the whole route is mislabelled
+                # deterministic:scenario_data:alignment_failed.
+                print(f"[_create_test_criteria] skip ego_vehicle_id={ego_vehicle_id}: "
+                      f"criteria attach failed ({_e}); ego_id="
+                      f"{getattr(_ego_ref,'id','?')}")
+                criteria_all.append([])
+                continue
+
+            # Default kept at 30.0s — lower values false-positive on yielding
+            # scenarios (Roundabout_Navigation, Unprotected_Left_Turn,
+            # Major_Minor_Unsignalized_Entry, Construction_Zone) where 75.7%
+            # of completed runs had >15s extra sim time and median ego speed
+            # was 3.0 m/s (well below the 8 m/s expected baseline).  These
+            # scenarios alternate stop-and-go near the 0.5 m/s blocked
+            # threshold; lowering the timer to 15s would block them before
+            # they recover.  Override via CARLA_AGENT_BLOCKED_TIMEOUT_S for
+            # A/B if you want to validate empirically.  Floor 5s.
+            try:
+                _blocked_timeout = float(os.environ.get("CARLA_AGENT_BLOCKED_TIMEOUT_S", "30.0"))
+                if _blocked_timeout < 5.0:
+                    _blocked_timeout = 30.0
+            except Exception:
+                _blocked_timeout = 30.0
             blocked_criterion = ActorSpeedAboveThresholdTest(self.ego_vehicles[ego_vehicle_id],
                                                             speed_threshold=0.5,
-                                                            below_threshold_max_time=30.0,
+                                                            below_threshold_max_time=_blocked_timeout,
                                                             terminate_on_failure=True,
                                                             name="AgentBlockedTest")
 

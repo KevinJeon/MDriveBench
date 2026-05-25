@@ -49,6 +49,22 @@ class RoutePlanner(object):
 
         self.debug = Plotter(debug_size)
 
+    def _safe_ahead_trigger_threshold(self):
+        """Distance at which the safe_ahead guard fires (route[1] within
+        this distance of ego, including past it). Default mirrors the
+        prior inline literal so non-overriding callers see no behaviour
+        change. Subclasses may override to widen the trigger zone."""
+        return max(1.0, 0.5 * self.min_distance)
+
+    def _compute_safe_ahead_target(self, vehicle_num, gps, seg_dir, safe_ahead):
+        """Hook returning the target_point when the safe_ahead guard fires.
+
+        Default: simple linear projection along the current segment
+        (`gps + seg_dir * safe_ahead`) so existing agents see no change.
+        Subclasses may override to use a different lookahead strategy
+        (e.g. polyline-based cumulative lookahead in CoLMRoutePlanner)."""
+        return gps + seg_dir * safe_ahead
+
     def set_route(self, global_plan, gps=False):
         self.route.clear()
         route_num = len(global_plan)
@@ -101,6 +117,46 @@ class RoutePlanner(object):
         self.debug.dot(gps, self.route[vehicle_num][1][0], (255, 0, 0))
         self.debug.dot(gps, gps, (0, 0, 255))
         self.debug.show()
+
+        # Projection-based advancement: pop any waypoints the ego has already
+        # passed along the route segment, regardless of perpendicular distance.
+        # The position-based loop above can miss waypoints when the ego tunnels
+        # through the min_distance window between planner ticks (downsampled
+        # routes + skip_frames>1). Without this, the safe_ahead guard below
+        # would fire indefinitely with route[1] pinned to a passed waypoint,
+        # leaving target_point stuck at safe_ahead m forward (OOD-close for
+        # the model). With this, route[1] always points to the next unpassed
+        # waypoint along the route, restoring the model's expected target
+        # distribution (~min_distance to ~hop spacing forward).
+        while len(self.route[vehicle_num]) > 2:
+            seg_vec = self.route[vehicle_num][1][0] - self.route[vehicle_num][0][0]
+            seg_norm = np.linalg.norm(seg_vec)
+            if seg_norm < 1e-6:
+                break
+            seg_dir = seg_vec / seg_norm
+            remaining = float(np.dot(self.route[vehicle_num][1][0] - gps, seg_dir))
+            if remaining > 0:
+                break
+            self.route[vehicle_num].popleft()
+
+        # Guard: whenever route[1] is within safe_ahead of ego (including past
+        # it), return a projected forward point.  Fires in tail mode AND
+        # mid-route on tight geometry (roundabout curves, dense on-ramp
+        # waypoints at high speed). Mirrors the guard in planner.py and
+        # planner_b2d.py; without it, downsample_route + skip_frames lets the
+        # ego tunnel past route[1] mid-route, leaving target_point pointing
+        # behind the ego for the remainder of the run.
+        route = self.route[vehicle_num]
+        seg_vec = route[1][0] - route[0][0]
+        seg_norm = np.linalg.norm(seg_vec)
+        if seg_norm > 1e-6:
+            seg_dir = seg_vec / seg_norm
+            safe_ahead = self._safe_ahead_trigger_threshold()
+            remaining = float(np.dot(route[1][0] - gps, seg_dir))
+            if remaining <= safe_ahead:
+                safe_pos = self._compute_safe_ahead_target(
+                    vehicle_num, gps, seg_dir, safe_ahead)
+                return (safe_pos, route[1][1])
 
         return self.route[vehicle_num][1]
 

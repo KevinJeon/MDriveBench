@@ -16,7 +16,7 @@
       "town": "ucla_v2",
       "name": "0",
       "kind": "npc",
-      "model": "vehicle.mini.cooper_s",
+      "model": "vehicle.ford.crown",
       "control_mode": "replay"
     },
     {
@@ -25,7 +25,7 @@
       "town": "ucla_v2",
       "name": "10",
       "kind": "npc",
-      "model": "vehicle.lincoln.mkz_2017",
+      "model": "vehicle.mercedes.coupe",
       "control_mode": "replay"
     },
     {
@@ -34,7 +34,7 @@
       "town": "ucla_v2",
       "name": "11",
       "kind": "npc",
-      "model": "vehicle.dodge.charger_2020",
+      "model": "vehicle.seat.leon",
       "control_mode": "replay"
     },
     {
@@ -43,7 +43,7 @@
       "town": "ucla_v2",
       "name": "14",
       "kind": "npc",
-      "model": "vehicle.audi.a2",
+      "model": "vehicle.citroen.c3",
       "control_mode": "replay"
     },
     {
@@ -52,7 +52,7 @@
       "town": "ucla_v2",
       "name": "21",
       "kind": "npc",
-      "model": "vehicle.chevrolet.impala",
+      "model": "vehicle.nissan.micra",
       "control_mode": "replay"
     },
     {
@@ -61,7 +61,7 @@
       "town": "ucla_v2",
       "name": "22",
       "kind": "npc",
-      "model": "vehicle.dodge.charger_2020",
+      "model": "vehicle.lincoln.mkz_2017",
       "control_mode": "replay"
     },
     {
@@ -70,7 +70,7 @@
       "town": "ucla_v2",
       "name": "23",
       "kind": "npc",
-      "model": "vehicle.tesla.model3",
+      "model": "vehicle.dodge.charger_2020",
       "control_mode": "replay"
     }
   ],
@@ -81,7 +81,7 @@
       "town": "ucla_v2",
       "name": "1",
       "kind": "static",
-      "model": "vehicle.audi.etron",
+      "model": "vehicle.mercedes.coupe_2020",
       "control_mode": "replay"
     },
     {
@@ -90,7 +90,7 @@
       "town": "ucla_v2",
       "name": "2",
       "kind": "static",
-      "model": "vehicle.bmw.grandtourer",
+      "model": "vehicle.audi.a2",
       "control_mode": "replay"
     },
     {
@@ -99,7 +99,16 @@
       "town": "ucla_v2",
       "name": "3",
       "kind": "static",
-      "model": "vehicle.dodge.charger_2020",
+      "model": "vehicle.mini.cooper_s",
+      "control_mode": "replay"
+    },
+    {
+      "file": "actors/static/ucla_v2_custom_Vehicle_4_static.xml",
+      "route_id": "2023-04-04-14-04-53_21_1",
+      "town": "ucla_v2",
+      "name": "4",
+      "kind": "static",
+      "model": "vehicle.mercedes.coupe",
       "control_mode": "replay"
     },
     {
@@ -108,7 +117,7 @@
       "town": "ucla_v2",
       "name": "5",
       "kind": "static",
-      "model": "vehicle.mercedes.coupe_2020",
+      "model": "vehicle.mini.cooper_s",
       "control_mode": "replay"
     },
     {
@@ -117,7 +126,7 @@
       "town": "ucla_v2",
       "name": "6",
       "kind": "static",
-      "model": "vehicle.ford.crown",
+      "model": "vehicle.audi.tt",
       "control_mode": "replay"
     },
     {
@@ -126,7 +135,7 @@
       "town": "ucla_v2",
       "name": "8",
       "kind": "static",
-      "model": "vehicle.volkswagen.t2",
+      "model": "vehicle.mitsubishi.fusorosa",
       "control_mode": "replay"
     },
     {
@@ -135,7 +144,7 @@
       "town": "ucla_v2",
       "name": "9",
       "kind": "static",
-      "model": "vehicle.seat.leon",
+      "model": "vehicle.citroen.c3",
       "control_mode": "replay"
     },
     {
@@ -144,7 +153,7 @@
       "town": "ucla_v2",
       "name": "12",
       "kind": "static",
-      "model": "vehicle.toyota.prius",
+      "model": "vehicle.mini.cooper_s",
       "control_mode": "replay"
     },
     {
@@ -162,7 +171,7 @@
       "town": "ucla_v2",
       "name": "17",
       "kind": "static",
-      "model": "vehicle.audi.etron",
+      "model": "vehicle.bmw.grandtourer",
       "control_mode": "replay"
     },
     {
@@ -172,6 +181,24 @@
       "name": "18",
       "kind": "static",
       "model": "vehicle.carlamotors.carlacola",
+      "control_mode": "replay"
+    },
+    {
+      "file": "actors/static/ucla_v2_custom_Vehicle_19_static.xml",
+      "route_id": "2023-04-04-14-04-53_21_1",
+      "town": "ucla_v2",
+      "name": "19",
+      "kind": "static",
+      "model": "vehicle.seat.leon",
+      "control_mode": "replay"
+    },
+    {
+      "file": "actors/static/ucla_v2_custom_Vehicle_20_static.xml",
+      "route_id": "2023-04-04-14-04-53_21_1",
+      "town": "ucla_v2",
+      "name": "20",
+      "kind": "static",
+      "model": "vehicle.mercedes.sprinter",
       "control_mode": "replay"
     },
     {
@@ -207,7 +234,7 @@
       "town": "ucla_v2",
       "name": "27",
       "kind": "static",
-      "model": "vehicle.tesla.model3",
+      "model": "vehicle.citroen.c3",
       "control_mode": "replay"
     }
   ],
@@ -218,7 +245,7 @@
       "town": "ucla_v2",
       "name": "13",
       "kind": "cyclist",
-      "model": "vehicle.diamondback.century",
+      "model": "vehicle.bh.crossbike",
       "control_mode": "replay"
     },
     {
@@ -227,7 +254,7 @@
       "town": "ucla_v2",
       "name": "15",
       "kind": "cyclist",
-      "model": "vehicle.diamondback.century",
+      "model": "vehicle.bh.crossbike",
       "control_mode": "replay"
     }
   ]

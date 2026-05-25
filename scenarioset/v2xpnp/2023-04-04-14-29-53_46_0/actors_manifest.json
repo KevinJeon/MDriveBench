@@ -24,7 +24,7 @@
       "town": "ucla_v2",
       "name": "0",
       "kind": "npc",
-      "model": "vehicle.mini.cooper_s_2021",
+      "model": "vehicle.mini.cooper_s",
       "control_mode": "replay"
     },
     {
@@ -33,7 +33,7 @@
       "town": "ucla_v2",
       "name": "3",
       "kind": "npc",
-      "model": "vehicle.nissan.micra",
+      "model": "vehicle.ford.crown",
       "control_mode": "replay"
     },
     {
@@ -42,7 +42,7 @@
       "town": "ucla_v2",
       "name": "6",
       "kind": "npc",
-      "model": "vehicle.chevrolet.impala",
+      "model": "vehicle.volkswagen.t2",
       "control_mode": "replay"
     },
     {
@@ -51,7 +51,7 @@
       "town": "ucla_v2",
       "name": "8",
       "kind": "npc",
-      "model": "vehicle.ford.crown",
+      "model": "vehicle.citroen.c3",
       "control_mode": "replay"
     },
     {
@@ -60,7 +60,16 @@
       "town": "ucla_v2",
       "name": "10",
       "kind": "npc",
-      "model": "vehicle.toyota.prius",
+      "model": "vehicle.seat.leon",
+      "control_mode": "replay"
+    },
+    {
+      "file": "actors/npc/ucla_v2_custom_Vehicle_15_npc.xml",
+      "route_id": "2023-04-04-14-29-53_46_0",
+      "town": "ucla_v2",
+      "name": "15",
+      "kind": "npc",
+      "model": "vehicle.citroen.c3",
       "control_mode": "replay"
     },
     {
@@ -69,7 +78,7 @@
       "town": "ucla_v2",
       "name": "17",
       "kind": "npc",
-      "model": "vehicle.mercedes.coupe",
+      "model": "vehicle.volkswagen.t2",
       "control_mode": "replay"
     },
     {
@@ -78,7 +87,7 @@
       "town": "ucla_v2",
       "name": "21",
       "kind": "npc",
-      "model": "vehicle.chevrolet.impala",
+      "model": "vehicle.ford.mustang",
       "control_mode": "replay"
     },
     {
@@ -87,7 +96,7 @@
       "town": "ucla_v2",
       "name": "22",
       "kind": "npc",
-      "model": "vehicle.ford.crown",
+      "model": "vehicle.audi.a2",
       "control_mode": "replay"
     },
     {
@@ -96,7 +105,7 @@
       "town": "ucla_v2",
       "name": "26",
       "kind": "npc",
-      "model": "vehicle.bmw.grandtourer",
+      "model": "vehicle.mini.cooper_s",
       "control_mode": "replay"
     },
     {
@@ -105,7 +114,7 @@
       "town": "ucla_v2",
       "name": "313",
       "kind": "npc",
-      "model": "vehicle.chevrolet.impala",
+      "model": "vehicle.tesla.model3",
       "control_mode": "replay"
     },
     {
@@ -114,7 +123,7 @@
       "town": "ucla_v2",
       "name": "29",
       "kind": "npc",
-      "model": "vehicle.bmw.grandtourer",
+      "model": "vehicle.toyota.prius",
       "control_mode": "replay"
     },
     {
@@ -123,7 +132,7 @@
       "town": "ucla_v2",
       "name": "30",
       "kind": "npc",
-      "model": "vehicle.ford.crown",
+      "model": "vehicle.mini.cooper_s_2021",
       "control_mode": "replay"
     },
     {
@@ -132,7 +141,7 @@
       "town": "ucla_v2",
       "name": "319",
       "kind": "npc",
-      "model": "vehicle.volkswagen.t2",
+      "model": "vehicle.tesla.model3",
       "control_mode": "replay"
     },
     {
@@ -141,7 +150,7 @@
       "town": "ucla_v2",
       "name": "37",
       "kind": "npc",
-      "model": "vehicle.chevrolet.impala",
+      "model": "vehicle.citroen.c3",
       "control_mode": "replay"
     },
     {
@@ -159,7 +168,7 @@
       "town": "ucla_v2",
       "name": "43",
       "kind": "npc",
-      "model": "vehicle.nissan.micra",
+      "model": "vehicle.toyota.prius",
       "control_mode": "replay"
     },
     {
@@ -168,7 +177,7 @@
       "town": "ucla_v2",
       "name": "44",
       "kind": "npc",
-      "model": "vehicle.lincoln.mkz_2017",
+      "model": "vehicle.audi.tt",
       "control_mode": "replay"
     },
     {
@@ -177,7 +186,7 @@
       "town": "ucla_v2",
       "name": "47",
       "kind": "npc",
-      "model": "vehicle.audi.a2",
+      "model": "vehicle.toyota.prius",
       "control_mode": "replay"
     },
     {
@@ -186,7 +195,7 @@
       "town": "ucla_v2",
       "name": "168",
       "kind": "npc",
-      "model": "vehicle.ford.mustang",
+      "model": "vehicle.volkswagen.t2",
       "control_mode": "replay"
     }
   ],
@@ -197,7 +206,7 @@
       "town": "ucla_v2",
       "name": "38",
       "kind": "static",
-      "model": "vehicle.volkswagen.t2",
+      "model": "vehicle.mercedes.sprinter",
       "control_mode": "replay"
     },
     {
@@ -206,7 +215,7 @@
       "town": "ucla_v2",
       "name": "57",
       "kind": "static",
-      "model": "vehicle.mercedes.coupe",
+      "model": "vehicle.lincoln.mkz_2017",
       "control_mode": "replay"
     },
     {
@@ -215,25 +224,7 @@
       "town": "ucla_v2",
       "name": "301",
       "kind": "static",
-      "model": "vehicle.dodge.charger_2020",
-      "control_mode": "replay"
-    },
-    {
-      "file": "actors/static/ucla_v2_custom_Vehicle_1_static.xml",
-      "route_id": "2023-04-04-14-29-53_46_0",
-      "town": "ucla_v2",
-      "name": "1",
-      "kind": "static",
-      "model": "vehicle.bmw.grandtourer",
-      "control_mode": "replay"
-    },
-    {
-      "file": "actors/static/ucla_v2_custom_Vehicle_4_static.xml",
-      "route_id": "2023-04-04-14-29-53_46_0",
-      "town": "ucla_v2",
-      "name": "4",
-      "kind": "static",
-      "model": "vehicle.chevrolet.impala",
+      "model": "vehicle.audi.etron",
       "control_mode": "replay"
     },
     {
@@ -242,7 +233,7 @@
       "town": "ucla_v2",
       "name": "7",
       "kind": "static",
-      "model": "vehicle.nissan.micra",
+      "model": "vehicle.mercedes.coupe",
       "control_mode": "replay"
     },
     {
@@ -251,7 +242,7 @@
       "town": "ucla_v2",
       "name": "9",
       "kind": "static",
-      "model": "vehicle.mitsubishi.fusorosa",
+      "model": "vehicle.volkswagen.t2",
       "control_mode": "replay"
     },
     {
@@ -260,7 +251,7 @@
       "town": "ucla_v2",
       "name": "11",
       "kind": "static",
-      "model": "vehicle.volkswagen.t2",
+      "model": "vehicle.mitsubishi.fusorosa",
       "control_mode": "replay"
     },
     {
@@ -269,16 +260,7 @@
       "town": "ucla_v2",
       "name": "12",
       "kind": "static",
-      "model": "vehicle.toyota.prius",
-      "control_mode": "replay"
-    },
-    {
-      "file": "actors/static/ucla_v2_custom_Vehicle_14_static.xml",
-      "route_id": "2023-04-04-14-29-53_46_0",
-      "town": "ucla_v2",
-      "name": "14",
-      "kind": "static",
-      "model": "vehicle.audi.a2",
+      "model": "vehicle.audi.tt",
       "control_mode": "replay"
     },
     {
@@ -287,7 +269,16 @@
       "town": "ucla_v2",
       "name": "16",
       "kind": "static",
-      "model": "vehicle.volkswagen.t2",
+      "model": "vehicle.chevrolet.impala",
+      "control_mode": "replay"
+    },
+    {
+      "file": "actors/static/ucla_v2_custom_Vehicle_18_static.xml",
+      "route_id": "2023-04-04-14-29-53_46_0",
+      "town": "ucla_v2",
+      "name": "18",
+      "kind": "static",
+      "model": "vehicle.carlamotors.carlacola",
       "control_mode": "replay"
     },
     {
@@ -300,21 +291,12 @@
       "control_mode": "replay"
     },
     {
-      "file": "actors/static/ucla_v2_custom_Vehicle_23_static.xml",
-      "route_id": "2023-04-04-14-29-53_46_0",
-      "town": "ucla_v2",
-      "name": "23",
-      "kind": "static",
-      "model": "vehicle.carlamotors.carlacola",
-      "control_mode": "replay"
-    },
-    {
       "file": "actors/static/ucla_v2_custom_Vehicle_24_static.xml",
       "route_id": "2023-04-04-14-29-53_46_0",
       "town": "ucla_v2",
       "name": "24",
       "kind": "static",
-      "model": "vehicle.chevrolet.impala",
+      "model": "vehicle.bmw.grandtourer",
       "control_mode": "replay"
     },
     {
@@ -323,7 +305,7 @@
       "town": "ucla_v2",
       "name": "25",
       "kind": "static",
-      "model": "vehicle.mini.cooper_s_2021",
+      "model": "vehicle.bmw.grandtourer",
       "control_mode": "replay"
     },
     {
@@ -332,7 +314,7 @@
       "town": "ucla_v2",
       "name": "27",
       "kind": "static",
-      "model": "vehicle.ford.crown",
+      "model": "vehicle.mini.cooper_s_2021",
       "control_mode": "replay"
     },
     {
@@ -341,7 +323,7 @@
       "town": "ucla_v2",
       "name": "32",
       "kind": "static",
-      "model": "vehicle.mercedes.coupe_2020",
+      "model": "vehicle.toyota.prius",
       "control_mode": "replay"
     },
     {
@@ -349,15 +331,6 @@
       "route_id": "2023-04-04-14-29-53_46_0",
       "town": "ucla_v2",
       "name": "34",
-      "kind": "static",
-      "model": "vehicle.mercedes.sprinter",
-      "control_mode": "replay"
-    },
-    {
-      "file": "actors/static/ucla_v2_custom_Vehicle_36_static.xml",
-      "route_id": "2023-04-04-14-29-53_46_0",
-      "town": "ucla_v2",
-      "name": "36",
       "kind": "static",
       "model": "vehicle.volkswagen.t2",
       "control_mode": "replay"
@@ -368,7 +341,7 @@
       "town": "ucla_v2",
       "name": "39",
       "kind": "static",
-      "model": "vehicle.chevrolet.impala",
+      "model": "vehicle.seat.leon",
       "control_mode": "replay"
     },
     {
@@ -377,7 +350,7 @@
       "town": "ucla_v2",
       "name": "46",
       "kind": "static",
-      "model": "vehicle.nissan.micra",
+      "model": "vehicle.lincoln.mkz_2017",
       "control_mode": "replay"
     },
     {
@@ -386,7 +359,7 @@
       "town": "ucla_v2",
       "name": "51",
       "kind": "static",
-      "model": "vehicle.mini.cooper_s",
+      "model": "vehicle.ford.crown",
       "control_mode": "replay"
     }
   ],
@@ -415,7 +388,7 @@
       "town": "ucla_v2",
       "name": "66",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -424,7 +397,7 @@
       "town": "ucla_v2",
       "name": "71",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -433,7 +406,7 @@
       "town": "ucla_v2",
       "name": "73",
       "kind": "walker",
-      "model": "walker.pedestrian.0004",
+      "model": "walker.pedestrian.0006",
       "control_mode": "replay"
     },
     {
@@ -442,7 +415,7 @@
       "town": "ucla_v2",
       "name": "76",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0002",
       "control_mode": "replay"
     },
     {
@@ -460,7 +433,7 @@
       "town": "ucla_v2",
       "name": "84",
       "kind": "walker",
-      "model": "walker.pedestrian.0008",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -469,7 +442,7 @@
       "town": "ucla_v2",
       "name": "85",
       "kind": "walker",
-      "model": "walker.pedestrian.0003",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -478,7 +451,7 @@
       "town": "ucla_v2",
       "name": "100",
       "kind": "walker",
-      "model": "walker.pedestrian.0003",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -487,7 +460,7 @@
       "town": "ucla_v2",
       "name": "106",
       "kind": "walker",
-      "model": "walker.pedestrian.0007",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -505,7 +478,7 @@
       "town": "ucla_v2",
       "name": "108",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0002",
       "control_mode": "replay"
     },
     {
@@ -514,7 +487,7 @@
       "town": "ucla_v2",
       "name": "109",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -523,7 +496,7 @@
       "town": "ucla_v2",
       "name": "331",
       "kind": "walker",
-      "model": "walker.pedestrian.0008",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -532,7 +505,7 @@
       "town": "ucla_v2",
       "name": "111",
       "kind": "walker",
-      "model": "walker.pedestrian.0007",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -541,7 +514,7 @@
       "town": "ucla_v2",
       "name": "332",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -550,7 +523,7 @@
       "town": "ucla_v2",
       "name": "112",
       "kind": "walker",
-      "model": "walker.pedestrian.0004",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -559,7 +532,7 @@
       "town": "ucla_v2",
       "name": "113",
       "kind": "walker",
-      "model": "walker.pedestrian.0008",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -568,7 +541,7 @@
       "town": "ucla_v2",
       "name": "114",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0002",
       "control_mode": "replay"
     },
     {
@@ -577,7 +550,7 @@
       "town": "ucla_v2",
       "name": "117",
       "kind": "walker",
-      "model": "walker.pedestrian.0008",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -595,7 +568,7 @@
       "town": "ucla_v2",
       "name": "335",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0008",
       "control_mode": "replay"
     },
     {
@@ -604,7 +577,7 @@
       "town": "ucla_v2",
       "name": "121",
       "kind": "walker",
-      "model": "walker.pedestrian.0003",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -640,7 +613,7 @@
       "town": "ucla_v2",
       "name": "140",
       "kind": "walker",
-      "model": "walker.pedestrian.0004",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -649,7 +622,7 @@
       "town": "ucla_v2",
       "name": "337",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -658,7 +631,7 @@
       "town": "ucla_v2",
       "name": "154",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -667,7 +640,7 @@
       "town": "ucla_v2",
       "name": "180",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0002",
       "control_mode": "replay"
     },
     {
@@ -676,7 +649,7 @@
       "town": "ucla_v2",
       "name": "186",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0002",
       "control_mode": "replay"
     },
     {
@@ -685,7 +658,7 @@
       "town": "ucla_v2",
       "name": "218",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0002",
       "control_mode": "replay"
     },
     {
@@ -694,7 +667,7 @@
       "town": "ucla_v2",
       "name": "221",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0002",
       "control_mode": "replay"
     },
     {
@@ -703,7 +676,7 @@
       "town": "ucla_v2",
       "name": "41",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -712,7 +685,7 @@
       "town": "ucla_v2",
       "name": "42",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -721,7 +694,7 @@
       "town": "ucla_v2",
       "name": "45",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -730,7 +703,7 @@
       "town": "ucla_v2",
       "name": "48",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -739,7 +712,7 @@
       "town": "ucla_v2",
       "name": "49",
       "kind": "walker",
-      "model": "walker.pedestrian.0008",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -748,7 +721,7 @@
       "town": "ucla_v2",
       "name": "50",
       "kind": "walker",
-      "model": "walker.pedestrian.0008",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -766,7 +739,7 @@
       "town": "ucla_v2",
       "name": "53",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0008",
       "control_mode": "replay"
     },
     {
@@ -775,7 +748,7 @@
       "town": "ucla_v2",
       "name": "54",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -784,7 +757,7 @@
       "town": "ucla_v2",
       "name": "55",
       "kind": "walker",
-      "model": "walker.pedestrian.0003",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -793,7 +766,7 @@
       "town": "ucla_v2",
       "name": "56",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -802,7 +775,7 @@
       "town": "ucla_v2",
       "name": "59",
       "kind": "walker",
-      "model": "walker.pedestrian.0004",
+      "model": "walker.pedestrian.0006",
       "control_mode": "replay"
     },
     {
@@ -811,7 +784,7 @@
       "town": "ucla_v2",
       "name": "61",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -829,7 +802,7 @@
       "town": "ucla_v2",
       "name": "75",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -838,7 +811,7 @@
       "town": "ucla_v2",
       "name": "80",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0008",
       "control_mode": "replay"
     },
     {
@@ -847,7 +820,7 @@
       "town": "ucla_v2",
       "name": "82",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0002",
       "control_mode": "replay"
     },
     {
@@ -865,7 +838,7 @@
       "town": "ucla_v2",
       "name": "90",
       "kind": "walker",
-      "model": "walker.pedestrian.0004",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -883,7 +856,7 @@
       "town": "ucla_v2",
       "name": "92",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -892,7 +865,7 @@
       "town": "ucla_v2",
       "name": "94",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -901,7 +874,7 @@
       "town": "ucla_v2",
       "name": "96",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -910,7 +883,7 @@
       "town": "ucla_v2",
       "name": "99",
       "kind": "walker",
-      "model": "walker.pedestrian.0007",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -919,7 +892,7 @@
       "town": "ucla_v2",
       "name": "101",
       "kind": "walker",
-      "model": "walker.pedestrian.0004",
+      "model": "walker.pedestrian.0008",
       "control_mode": "replay"
     },
     {
@@ -928,7 +901,7 @@
       "town": "ucla_v2",
       "name": "102",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -937,7 +910,7 @@
       "town": "ucla_v2",
       "name": "104",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -946,7 +919,7 @@
       "town": "ucla_v2",
       "name": "130",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -955,7 +928,7 @@
       "town": "ucla_v2",
       "name": "132",
       "kind": "walker",
-      "model": "walker.pedestrian.0003",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -964,7 +937,7 @@
       "town": "ucla_v2",
       "name": "141",
       "kind": "walker",
-      "model": "walker.pedestrian.0004",
+      "model": "walker.pedestrian.0008",
       "control_mode": "replay"
     },
     {
@@ -973,7 +946,7 @@
       "town": "ucla_v2",
       "name": "143",
       "kind": "walker",
-      "model": "walker.pedestrian.0003",
+      "model": "walker.pedestrian.0006",
       "control_mode": "replay"
     },
     {
@@ -982,7 +955,7 @@
       "town": "ucla_v2",
       "name": "147",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -991,7 +964,7 @@
       "town": "ucla_v2",
       "name": "149",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -1000,7 +973,7 @@
       "town": "ucla_v2",
       "name": "155",
       "kind": "walker",
-      "model": "walker.pedestrian.0007",
+      "model": "walker.pedestrian.0002",
       "control_mode": "replay"
     },
     {
@@ -1009,7 +982,7 @@
       "town": "ucla_v2",
       "name": "161",
       "kind": "walker",
-      "model": "walker.pedestrian.0008",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -1027,7 +1000,7 @@
       "town": "ucla_v2",
       "name": "167",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -1054,7 +1027,7 @@
       "town": "ucla_v2",
       "name": "179",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -1063,7 +1036,7 @@
       "town": "ucla_v2",
       "name": "189",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -1072,7 +1045,7 @@
       "town": "ucla_v2",
       "name": "191",
       "kind": "walker",
-      "model": "walker.pedestrian.0003",
+      "model": "walker.pedestrian.0006",
       "control_mode": "replay"
     },
     {
@@ -1081,7 +1054,7 @@
       "town": "ucla_v2",
       "name": "193",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -1108,7 +1081,7 @@
       "town": "ucla_v2",
       "name": "197",
       "kind": "walker",
-      "model": "walker.pedestrian.0007",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -1117,7 +1090,7 @@
       "town": "ucla_v2",
       "name": "198",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0006",
       "control_mode": "replay"
     },
     {
@@ -1126,7 +1099,7 @@
       "town": "ucla_v2",
       "name": "206",
       "kind": "walker",
-      "model": "walker.pedestrian.0007",
+      "model": "walker.pedestrian.0005",
       "control_mode": "replay"
     },
     {
@@ -1135,7 +1108,7 @@
       "town": "ucla_v2",
       "name": "215",
       "kind": "walker",
-      "model": "walker.pedestrian.0005",
+      "model": "walker.pedestrian.0007",
       "control_mode": "replay"
     },
     {
@@ -1144,7 +1117,7 @@
       "town": "ucla_v2",
       "name": "220",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0004",
       "control_mode": "replay"
     },
     {
@@ -1153,7 +1126,7 @@
       "town": "ucla_v2",
       "name": "329",
       "kind": "walker",
-      "model": "walker.pedestrian.0006",
+      "model": "walker.pedestrian.0003",
       "control_mode": "replay"
     },
     {
@@ -1162,7 +1135,7 @@
       "town": "ucla_v2",
       "name": "336",
       "kind": "walker",
-      "model": "walker.pedestrian.0002",
+      "model": "walker.pedestrian.0008",
       "control_mode": "replay"
     }
   ],
@@ -1173,7 +1146,7 @@
       "town": "ucla_v2",
       "name": "65",
       "kind": "cyclist",
-      "model": "vehicle.diamondback.century",
+      "model": "vehicle.bh.crossbike",
       "control_mode": "replay"
     },
     {
@@ -1182,7 +1155,7 @@
       "town": "ucla_v2",
       "name": "181",
       "kind": "cyclist",
-      "model": "vehicle.gazelle.omafiets",
+      "model": "vehicle.bh.crossbike",
       "control_mode": "replay"
     }
   ]
